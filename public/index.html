@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vehicle Live Feed Dashboard</title>
+
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: Arial, sans-serif; background: #f5f5f5; }
+        .header { background: #2c3e50; color: white; padding: 20px; text-align: center; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+        .vehicles-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px; margin-bottom: 30px; }
+        .vehicle-card { background: white; border-radius: 8px; padding: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        .vehicle-name { font-size: 18px; font-weight: bold; margin-bottom: 10px; color: #2c3e50; }
+        .vehicle-info { color: #666; margin-bottom: 15px; }
+        .view-btn { background: #3498db; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; width: 100%; }
+        .view-btn:hover { background: #2980b9; }
+        .video-section { background: white; border-radius: 8px; padding: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        .video-container { display: none; }
+        .video-js { width: 100%; height: 400px; }
+        .loading { text-align: center; padding: 20px; color: #666; }
+        .error { color: #e74c3c; text-align: center; padding: 20px; }
+        .channels { display: flex; gap: 10px; margin-top: 10px; }
+        .channel-btn { background: #95a5a6; color: white; border: none; padding: 5px 10px; border-radius: 3px; cursor: pointer; }
+        .channel-btn.active { background: #e67e22; }
+        .search-section { background: white; border-radius: 8px; padding: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); margin-bottom: 20px; }
+        .search-input { width: 70%; padding: 10px; border: 2px solid #ddd; border-radius: 5px; font-size: 16px; }
+        .search-btn { width: 25%; padding: 10px; background: #e67e22; color: white; border: none; border-radius: 5px; cursor: pointer; margin-left: 10px; }
+        .search-btn:hover { background: #d35400; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🚗 Vehicle Live Feed Dashboard</h1>
+        <p>Monitor your fleet in real-time</p>
+    </div>
+
+    <div class="container">
+        <div id="loading" class="loading">Loading vehicles...</div>
+        <div id="error" class="error" style="display: none;"></div>
+        
+        <div id="vehicles-container" style="display: none;">
+            <div class="search-section">
+                <h3>🔍 Search Vehicle by Plate/Name</h3>
+                <div style="margin-top: 15px;">
+                    <input type="text" id="search-input" class="search-input" placeholder="Enter plate number (e.g., JY54WJGP)" />
+                    <button id="search-btn" class="search-btn">Search & Stream</button>
+                </div>
+            </div>
+            <div class="vehicles-grid" id="vehicles-grid"></div>
+            
+            <div class="video-section">
+                <h3 id="video-title">Select a vehicle to view live feed</h3>
+                <div id="video-container" class="video-container">
+                    <div id="live-video" style="min-height: 200px; border: 2px dashed #ddd; border-radius: 8px; display: flex; align-items: center; justify-content: center; color: #666;">
+                        Click "View Live Feed" to get stream URL
+                    </div>
+                    <div class="channels" id="channels"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let vehicles = [];
+        let currentPlayer = null;
+        let currentDevice = null;
+
+        document.addEventListener('DOMContentLoaded', function() {
+            loadVehicles();
+            setupSearch();
+        });
+
+        function setupSearch() {
+            const searchBtn = document.getElementById('search-btn');
+            const searchInput = document.getElementById('search-input');
+            
+            searchBtn.addEventListener('click', searchVehicle);
+            searchInput.addEventListener('keypress', function(e) {
+                if (e.key === 'Enter') {
+                    searchVehicle();
+                }
+            });
+        }
+
+        async function searchVehicle() {
+            const plateName = document.getElementById('search-input').value.trim();
+            if (!plateName) {
+                alert('Please enter a plate number');
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/stream/live/plate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ 
+                        plateName: plateName,
+                        channelId: 1,
+                        bitstreamType: 1
+                    })
+                });
+
+                const data = await response.json();
+                if (data.success) {
+                    // Show the vehicle and start streaming
+                    currentDevice = { 
+                        id: data.data.deviceId, 
+                        name: data.data.plateName, 
+                        camCount: data.data.camCount 
+                    };
+                    
+                    document.getElementById('video-title').textContent = `Live Feed - ${data.data.plateName}`;
+                    document.getElementById('video-container').style.display = 'block';
+                    
+                    // Create channel buttons
+                    const channelsDiv = document.getElementById('channels');
+                    channelsDiv.innerHTML = '';
+                    for (let i = 1; i <= data.data.camCount; i++) {
+                        const btn = document.createElement('button');
+                        btn.className = `channel-btn ${i === 1 ? 'active' : ''}`;
+                        btn.textContent = `Camera ${i}`;
+                        btn.setAttribute('data-channel', i);
+                        btn.addEventListener('click', function() {
+                            const channelId = parseInt(this.getAttribute('data-channel'));
+                            switchChannel(channelId);
+                        });
+                        channelsDiv.appendChild(btn);
+                    }
+                    
+                    // Display stream URL
+                    const videoContainer = document.getElementById('live-video');
+                    videoContainer.innerHTML = `
+                        <div style="padding: 20px; text-align: center; background: #f8f9fa; border-radius: 8px;">
+                            <h4>🎥 Live Stream Ready - ${data.data.plateName}</h4>
+                            <p style="margin: 10px 0; word-break: break-all;"><strong>Stream URL:</strong><br>${data.data.streamUrl}</p>
+                            <div style="margin: 15px 0;">
+                                <a href="${data.data.streamUrl}" target="_blank" style="background: #27ae60; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; margin: 5px;">📱 Open in VLC</a>
+                                <button onclick="copyToClipboard('${data.data.streamUrl}')" style="background: #3498db; color: white; padding: 10px 20px; border: none; border-radius: 5px; margin: 5px; cursor: pointer;">📋 Copy URL</button>
+                            </div>
+                            <p style="font-size: 12px; color: #666;">Copy the URL and paste it into VLC Media Player → Open Network Stream</p>
+                        </div>
+                    `;
+                } else {
+                    showError(`Vehicle not found: ${data.message}`);
+                }
+            } catch (error) {
+                showError(`Search error: ${error.message}`);
+            }
+        }
+
+        async function loadVehicles() {
+            try {
+                const response = await fetch('/api/stream/devices', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ pageIndex: 1 })
+                });
+
+                const data = await response.json();
+                if (data.success) {
+                    vehicles = data.data.records;
+                    displayVehicles();
+                } else {
+                    showError('Failed to load vehicles: ' + data.message);
+                }
+            } catch (error) {
+                showError('Error loading vehicles: ' + error.message);
+            }
+        }
+
+        function displayVehicles() {
+            const grid = document.getElementById('vehicles-grid');
+            const loading = document.getElementById('loading');
+            const container = document.getElementById('vehicles-container');
+
+            loading.style.display = 'none';
+            container.style.display = 'block';
+
+            grid.innerHTML = vehicles.map((vehicle, index) => `
+                <div class="vehicle-card">
+                    <div class="vehicle-name">🚗 ${vehicle.deviceName}</div>
+                    <div class="vehicle-info">
+                        <div>ID: ${vehicle.id}</div>
+                        <div>Type: ${vehicle.deviceType}</div>
+                        <div>Cameras: ${vehicle.camCount}</div>
+                        <div>Last Active: ${vehicle.activeTime}</div>
+                    </div>
+                    <button class="view-btn" data-device-id="${vehicle.id}" data-device-name="${vehicle.deviceName}" data-cam-count="${vehicle.camCount}">
+                        📹 View Live Feed
+                    </button>
+                </div>
+            `).join('');
+            
+            // Add event listeners to all view buttons
+            document.querySelectorAll('.view-btn').forEach(btn => {
+                btn.addEventListener('click', function() {
+                    const deviceId = this.getAttribute('data-device-id');
+                    const deviceName = this.getAttribute('data-device-name');
+                    const camCount = parseInt(this.getAttribute('data-cam-count'));
+                    viewVehicle(deviceId, deviceName, camCount);
+                });
+            });
+        }
+
+        async function viewVehicle(deviceId, deviceName, camCount) {
+            currentDevice = { id: deviceId, name: deviceName, camCount };
+            
+            document.getElementById('video-title').textContent = `Live Feed - ${deviceName}`;
+            document.getElementById('video-container').style.display = 'block';
+            
+            const channelsDiv = document.getElementById('channels');
+            channelsDiv.innerHTML = '';
+            for (let i = 1; i <= camCount; i++) {
+                const btn = document.createElement('button');
+                btn.className = `channel-btn ${i === 1 ? 'active' : ''}`;
+                btn.textContent = `Camera ${i}`;
+                btn.setAttribute('data-channel', i);
+                btn.addEventListener('click', function() {
+                    const channelId = parseInt(this.getAttribute('data-channel'));
+                    switchChannel(channelId);
+                });
+                channelsDiv.appendChild(btn);
+            }
+
+            await loadStream(deviceId, 1);
+        }
+
+        async function switchChannel(channelId) {
+            document.querySelectorAll('.channel-btn').forEach(btn => btn.classList.remove('active'));
+            document.querySelector(`[data-channel="${channelId}"]`).classList.add('active');
+            await loadStream(currentDevice.id, channelId);
+        }
+
+        async function loadStream(deviceId, channelId) {
+            try {
+                const response = await fetch('/api/stream/live', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        deviceId: deviceId,
+                        channelId: channelId,
+                        bitstreamType: 1
+                    })
+                });
+
+                const data = await response.json();
+                if (data.success) {
+                    const videoContainer = document.getElementById('live-video');
+                    videoContainer.innerHTML = `
+                        <div style="padding: 20px; text-align: center; background: #f8f9fa; border-radius: 8px;">
+                            <h4>🎥 Live Stream Ready</h4>
+                            <p style="margin: 10px 0; word-break: break-all;"><strong>Stream URL:</strong><br>${data.data.streamUrl}</p>
+                            <div style="margin: 15px 0;">
+                                <a href="${data.data.streamUrl}" target="_blank" style="background: #27ae60; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; margin: 5px;">📱 Open in VLC</a>
+                                <button onclick="copyToClipboard('${data.data.streamUrl}')" style="background: #3498db; color: white; padding: 10px 20px; border: none; border-radius: 5px; margin: 5px; cursor: pointer;">📋 Copy URL</button>
+                            </div>
+                            <p style="font-size: 12px; color: #666;">Copy the URL and paste it into VLC Media Player → Open Network Stream</p>
+                        </div>
+                    `;
+                } else {
+                    showError(`Failed to load stream: ${data.message}`);
+                }
+            } catch (error) {
+                showError(`Error loading stream: ${error.message}`);
+            }
+        }
+
+        function copyToClipboard(text) {
+            navigator.clipboard.writeText(text).then(() => {
+                alert('Stream URL copied to clipboard!');
+            }).catch(() => {
+                prompt('Copy this URL:', text);
+            });
+        }
+
+        function showError(message) {
+            const errorDiv = document.getElementById('error');
+            errorDiv.textContent = message;
+            errorDiv.style.display = 'block';
+            document.getElementById('loading').style.display = 'none';
+        }
+    </script>
+</body>
+</html>
