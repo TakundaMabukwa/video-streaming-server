@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Live Stream Player</title>
+    <style>
+        body { font-family: Arial; margin: 20px; }
+        #videoContainer { width: 100%; max-width: 800px; }
+        video { width: 100%; background: #000; }
+        .controls { margin: 20px 0; }
+        input { padding: 8px; width: 400px; }
+        button { padding: 8px 15px; cursor: pointer; margin-right: 5px; }
+        .vehicles { margin-top: 20px; }
+        .vehicle-btn { display: block; margin: 5px 0; padding: 10px; background: #007bff; color: white; border: none; cursor: pointer; width: 200px; }
+        .vehicle-btn:hover { background: #0056b3; }
+    </style>
+</head>
+<body>
+    <h1>Live Stream Player</h1>
+    
+    <div class="controls">
+        <input type="text" id="streamUrl" placeholder="Enter stream URL" value="https://m1.mettaxiot.com/mettax/video/628074834085_1.live.flv">
+        <button id="playBtn">Play</button>
+        <button id="stopBtn">Stop</button>
+    </div>
+
+    <div id="videoContainer">
+        <video id="videoElement" controls></video>
+    </div>
+
+    <div class="vehicles">
+        <h3>Online Vehicles (Live Now)</h3>
+        <button class="vehicle-btn" data-url="https://m1.mettaxiot.com/mettax/video/628074834085_1.live.flv">JF74YXGP</button>
+        <button class="vehicle-btn" data-url="https://m1.mettaxiot.com/mettax/video/628074811877_1.live.flv">HY87GLGP</button>
+        <button class="vehicle-btn" data-url="https://m1.mettaxiot.com/mettax/video/628074815068_1.live.flv">JL65CPGP</button>
+    </div>
+
+    <script>
+        function playStream() {
+            const url = document.getElementById('streamUrl').value;
+            if (!url) {
+                alert('Please enter a stream URL');
+                return;
+            }
+            const video = document.getElementById('videoElement');
+            const proxyUrl = '/api/stream/proxy?url=' + encodeURIComponent(url);
+            video.src = proxyUrl;
+            video.play();
+        }
+
+        function stopStream() {
+            const video = document.getElementById('videoElement');
+            video.pause();
+            video.src = '';
+        }
+
+        document.getElementById('playBtn').addEventListener('click', playStream);
+        document.getElementById('stopBtn').addEventListener('click', stopStream);
+
+        document.querySelectorAll('.vehicle-btn').forEach(btn => {
+            btn.addEventListener('click', function() {
+                const url = this.getAttribute('data-url');
+                document.getElementById('streamUrl').value = url;
+                playStream();
+            });
+        });
+    </script>
+</body>
+</html>

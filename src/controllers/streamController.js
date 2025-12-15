@@ -24,7 +24,7 @@ const getDevices = async (req, res) => {
 
 const getLiveStream = async (req, res) => {
   try {
-    const { deviceId, channelId = 1, bitstreamType = 1, nodeValue } = req.body;
+    const { deviceId, channelId = 1, bitstreamType = 1, nodeValue = null } = req.body;
 
     if (!deviceId) {
       return sendError(res, 'Device ID is required', 400);
@@ -158,6 +158,9 @@ const getStreamByPlate = async (req, res) => {
     });
 
     if (deviceResponse.code !== 0) {
+      if (deviceResponse.msg && deviceResponse.msg.includes('call count exceeds')) {
+        return sendError(res, 'API rate limit exceeded. Please try again in a few minutes.', 429);
+      }
       return sendError(res, 'Failed to find device', 400);
     }
 
@@ -170,7 +173,8 @@ const getStreamByPlate = async (req, res) => {
     const streamResponse = await apiClient.makeRequest('/video/live', {
       deviceId: device.id,
       channelId,
-      bitstreamType
+      bitstreamType,
+      nodeValue: null
     });
 
     if (streamResponse.code === 0) {
@@ -181,9 +185,15 @@ const getStreamByPlate = async (req, res) => {
         camCount: device.camCount
       }, 'Stream URL retrieved by plate');
     } else {
+      if (streamResponse.msg && streamResponse.msg.includes('call count exceeds')) {
+        return sendError(res, 'API rate limit exceeded. Please try again in a few minutes.', 429);
+      }
       sendError(res, streamResponse.msg || 'Failed to get stream', 400);
     }
   } catch (error) {
+    if (error.message.includes('call count exceeds')) {
+      return sendError(res, 'API rate limit exceeded. Please try again in a few minutes.', 429);
+    }
     sendError(res, error.message, 500);
   }
 };
@@ -239,6 +249,166 @@ const getAllDevicesNetwork = async (req, res) => {
   }
 };
 
+const getOnlineDevices = async (req, res) => {
+  try {
+    const { customerId } = req.body;
+
+    // Get device shadow data to check online status
+    const shadowResponse = await apiClient.makeRequest('/device/shadow/customer', {
+      customerId: customerId || null
+    });
+
+    if (shadowResponse.code !== 0) {
+      return sendError(res, 'Failed to get device status', 400);
+    }
+
+    // Filter only online devices
+    const onlineDevices = shadowResponse.data.filter(device => device.online === true);
+
+    const result = {
+      totalOnline: onlineDevices.length,
+      devices: onlineDevices.map(device => ({
+        plateName: device.deviceName,
+        deviceId: device.deviceId,
+        online: device.online,
+        lastSeen: device.lastActiveTime,
+        cameras: device.camCount || 0
+      }))
+    };
+
+    sendSuccess(res, result, 'Online devices retrieved successfully');
+  } catch (error) {
+    sendError(res, error.message, 500);
+  }
+};
+
+const getAllVehiclesWithStreams = async (req, res) => {
+  try {
+    const { bitstreamType = 1, timeout = 5000, onlineOnly = false, allChannels = false } = req.body;
+
+    // Get all devices
+    const allDevices = [];
+    let pageIndex = 1;
+    let hasMore = true;
+
+    while (hasMore) {
+      const response = await apiClient.makeRequest('/device/page', {
+        pageIndex,
+        pageSize: 100,
+        subsumption: true
+      });
+
+      if (response.code === 0 && response.data.records.length > 0) {
+        allDevices.push(...response.data.records);
+        pageIndex++;
+        hasMore = response.data.records.length === 100;
+      } else {
+        hasMore = false;
+      }
+    }
+
+    // Process all devices
+    const vehiclesWithStreams = await Promise.allSettled(
+      allDevices.map(async (device) => {
+        if (allChannels) {
+          // Get streams for all channels
+          const channels = [];
+          for (let channelId = 1; channelId <= device.camCount; channelId++) {
+            try {
+              const timeoutPromise = new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('timeout')), timeout)
+              );
+              
+              const streamPromise = apiClient.makeRequest('/video/live', {
+                deviceId: device.id,
+                channelId,
+                bitstreamType,
+                nodeValue: null
+              });
+
+              const streamResponse = await Promise.race([streamPromise, timeoutPromise]);
+              if (streamResponse.code === 0 && streamResponse.data) {
+                channels.push({
+                  channelId,
+                  streamUrl: streamResponse.data
+                });
+              }
+            } catch (error) {
+              // Skip failed channels
+            }
+          }
+          
+          const vehicle = {
+            plateName: device.deviceName,
+            deviceId: device.id,
+            channels,
+            cameras: device.camCount,
+            deviceType: device.deviceType,
+            customerName: device.customerName
+          };
+          
+          if (onlineOnly && channels.length === 0) return null;
+          return vehicle;
+        } else {
+          // Get only first channel (original behavior)
+          const timeoutPromise = new Promise((_, reject) => 
+            setTimeout(() => reject(new Error('timeout')), timeout)
+          );
+          
+          const streamPromise = apiClient.makeRequest('/video/live', {
+            deviceId: device.id,
+            channelId: 1,
+            bitstreamType,
+            nodeValue: null
+          });
+
+          try {
+            const streamResponse = await Promise.race([streamPromise, timeoutPromise]);
+            const hasStream = streamResponse.code === 0 && streamResponse.data;
+            
+            const vehicle = {
+              plateName: device.deviceName,
+              deviceId: device.id,
+              streamUrl: hasStream ? streamResponse.data : null,
+              cameras: device.camCount,
+              deviceType: device.deviceType,
+              customerName: device.customerName
+            };
+            
+            if (onlineOnly && !hasStream) return null;
+            return vehicle;
+          } catch (error) {
+            const vehicle = {
+              plateName: device.deviceName,
+              deviceId: device.id,
+              streamUrl: null,
+              cameras: device.camCount,
+              deviceType: device.deviceType,
+              customerName: device.customerName
+            };
+            
+            if (onlineOnly) return null;
+            return vehicle;
+          }
+        }
+      })
+    );
+
+    const validVehicles = vehiclesWithStreams
+      .map(result => result.status === 'fulfilled' ? result.value : null)
+      .filter(vehicle => vehicle !== null);
+
+    const result = {
+      totalVehicles: validVehicles.length,
+      vehicles: validVehicles
+    };
+
+    sendSuccess(res, result, 'All vehicles with streams retrieved successfully');
+  } catch (error) {
+    sendError(res, error.message, 500);
+  }
+};
+
 module.exports = {
   getDevices,
   getLiveStream,
@@ -247,5 +417,7 @@ module.exports = {
   getDeviceShadow,
   getDeviceByName,
   getStreamByPlate,
-  getAllDevicesNetwork
+  getAllDevicesNetwork,
+  getOnlineDevices,
+  getAllVehiclesWithStreams
 };

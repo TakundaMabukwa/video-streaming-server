@@ -9,15 +9,7 @@ const app = express();
 
 // Security middleware
 app.use(helmet({
-  contentSecurityPolicy: {
-    directives: {
-      defaultSrc: ["'self'"],
-      scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-hashes'"],
-      styleSrc: ["'self'", "'unsafe-inline'"],
-      imgSrc: ["'self'", "data:", "https:"],
-      mediaSrc: ["'self'", "https:", "blob:"]
-    }
-  }
+  contentSecurityPolicy: false
 }));
 app.use(cors());
 
@@ -27,6 +19,7 @@ app.use(express.urlencoded({ extended: true }));
 
 // Static files
 app.use(express.static('public'));
+app.use('/js', express.static('node_modules'));
 
 // Routes
 app.use('/api', routes);
