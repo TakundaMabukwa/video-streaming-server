@@ -15,13 +15,12 @@
         .stream-info { color: #666; margin-bottom: 15px; }
         .video-container { position: relative; width: 100%; height: 250px; background: #000; border-radius: 4px; }
         video { width: 100%; height: 100%; border-radius: 4px; }
-        .loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: white; }
+        .loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: white; font-size: 14px; }
         .refresh-btn { background: #007bff; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; margin-bottom: 20px; }
         .refresh-btn:hover { background: #0056b3; }
         .status { padding: 10px; border-radius: 4px; margin-bottom: 20px; }
         .status.success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
         .status.error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
-        .stream-url { font-size: 12px; color: #666; word-break: break-all; margin-top: 10px; }
     </style>
 </head>
 <body>
@@ -40,34 +39,28 @@
             const statusDiv = document.getElementById('status');
             const container = document.getElementById('streams-container');
             
-            statusDiv.innerHTML = '<div class="status">🔍 Loading live streams...</div>';
+            statusDiv.innerHTML = '<div class="status">🔍 Loading vehicles...</div>';
             container.innerHTML = '';
             
             try {
-                const response = await fetch('/api/stream/vehicles/streams', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ onlineOnly: true, timeout: 5000, allChannels: true })
-                });
-                
+                const response = await fetch('/api/stream/network');
                 const data = await response.json();
                 
                 if (data.success) {
-                    const vehicles = data.data.vehicles;
+                    const vehicles = data.data.devices;
                     
                     if (vehicles.length === 0) {
-                        statusDiv.innerHTML = '<div class="status error">❌ No live streams found</div>';
+                        statusDiv.innerHTML = '<div class="status error">❌ No vehicles found</div>';
                         return;
                     }
                     
-                    statusDiv.innerHTML = `<div class="status success">✅ Found ${vehicles.length} live streams</div>`;
+                    statusDiv.innerHTML = `<div class="status success">✅ Found ${vehicles.length} vehicles - Loading streams...</div>`;
                     
-                    vehicles.forEach(vehicle => {
-                        if (vehicle.channels && vehicle.channels.length > 0) {
-                            const streamCard = createStreamCard(vehicle);
-                            container.appendChild(streamCard);
-                        }
-                    });
+                    for (const vehicle of vehicles) {
+                        const streamCard = createStreamCard(vehicle);
+                        container.appendChild(streamCard);
+                        await fetchAndPlayChannels(vehicle);
+                    }
                 } else {
                     statusDiv.innerHTML = `<div class="status error">❌ Error: ${data.message}</div>`;
                 }
@@ -79,40 +72,62 @@
         function createStreamCard(vehicle) {
             const card = document.createElement('div');
             card.className = 'stream-card';
-            
-            let videosHtml = '';
-            vehicle.channels.forEach((channel, index) => {
-                const videoId = `video-${vehicle.plateName}-${channel.channelId}`;
-                videosHtml += `
-                    <div style="margin-bottom: 15px;">
-                        <div style="font-weight: bold; margin-bottom: 5px;">Camera ${channel.channelId}</div>
-                        <div class="video-container" style="height: 200px;">
-                            <video id="${videoId}" controls muted width="100%" height="100%"></video>
-                        </div>
-                    </div>
-                `;
-            });
+            card.id = `card-${vehicle.deviceId}`;
             
             card.innerHTML = `
                 <div class="stream-title">🚗 ${vehicle.plateName}</div>
                 <div class="stream-info">
-                    📹 ${vehicle.channels.length}/${vehicle.cameras} cameras online | 🏢 ${vehicle.customerName || 'N/A'}
+                    📹 ${vehicle.cameras} cameras | 🏢 ${vehicle.customerName || 'N/A'}
                 </div>
-                ${videosHtml}
+                <div id="channels-${vehicle.deviceId}"><div class="loading">Loading channels...</div></div>
             `;
             
-            // Initialize FLV players after card is added to DOM
-            setTimeout(() => {
-                vehicle.channels.forEach(channel => {
-                    const videoId = `video-${vehicle.plateName}-${channel.channelId}`;
-                    const videoElement = document.getElementById(videoId);
-                    if (flvjs.isSupported() && videoElement) {
-                        createPersistentPlayer(videoElement, channel.streamUrl, `${vehicle.plateName}-${channel.channelId}`);
-                    }
-                });
-            }, 100);
-            
             return card;
+        }
+        
+        async function fetchAndPlayChannels(vehicle) {
+            try {
+                const response = await fetch('/api/stream/debug/vehicle', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ deviceId: vehicle.deviceId })
+                });
+                
+                const data = await response.json();
+                const channelsDiv = document.getElementById(`channels-${vehicle.deviceId}`);
+                
+                if (data.success && data.data.channels.length > 0) {
+                    let videosHtml = '';
+                    data.data.channels.forEach(channel => {
+                        const videoId = `video-${vehicle.plateName}-${channel.channelId}`;
+                        videosHtml += `
+                            <div style="margin-bottom: 15px;">
+                                <div style="font-weight: bold; margin-bottom: 5px;">Camera ${channel.channelId}</div>
+                                <div class="video-container" style="height: 200px;">
+                                    <video id="${videoId}" controls muted width="100%" height="100%"></video>
+                                </div>
+                            </div>
+                        `;
+                    });
+                    
+                    channelsDiv.innerHTML = videosHtml;
+                    
+                    setTimeout(() => {
+                        data.data.channels.forEach(channel => {
+                            const videoId = `video-${vehicle.plateName}-${channel.channelId}`;
+                            const videoElement = document.getElementById(videoId);
+                            if (flvjs.isSupported() && videoElement) {
+                                createPersistentPlayer(videoElement, channel.streamUrl, `${vehicle.plateName}-${channel.channelId}`);
+                            }
+                        });
+                    }, 100);
+                } else {
+                    channelsDiv.innerHTML = '<div style="color: #999; padding: 20px; text-align: center;">❌ No active channels</div>';
+                }
+            } catch (error) {
+                const channelsDiv = document.getElementById(`channels-${vehicle.deviceId}`);
+                channelsDiv.innerHTML = '<div style="color: #999; padding: 20px; text-align: center;">Error loading channels</div>';
+            }
         }
         
         function createPersistentPlayer(videoElement, streamUrl, playerId) {
@@ -163,7 +178,6 @@
             
             connect();
             
-            // Keep-alive mechanism
             setInterval(() => {
                 if (flvPlayer && videoElement.paused) {
                     flvPlayer.play().catch(() => {});
@@ -171,7 +185,6 @@
             }, 10000);
         }
         
-        // Check FLV support and load streams
         if (!flvjs.isSupported()) {
             document.getElementById('status').innerHTML = '<div class="status error">❌ Your browser does not support FLV playback</div>';
         } else {

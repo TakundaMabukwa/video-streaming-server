@@ -149,7 +149,6 @@ const getStreamByPlate = async (req, res) => {
       return sendError(res, 'Plate name is required', 400);
     }
 
-    // First find device by plate name
     const deviceResponse = await apiClient.makeRequest('/device/page', {
       pageIndex: 1,
       pageSize: 100,
@@ -169,7 +168,6 @@ const getStreamByPlate = async (req, res) => {
       return sendError(res, 'Vehicle with plate not found', 404);
     }
 
-    // Get stream for the device
     const streamResponse = await apiClient.makeRequest('/video/live', {
       deviceId: device.id,
       channelId,
@@ -200,7 +198,6 @@ const getStreamByPlate = async (req, res) => {
 
 const getAllDevicesNetwork = async (req, res) => {
   try {
-    // Get all devices with pagination
     const allDevices = [];
     let pageIndex = 1;
     let hasMore = true;
@@ -221,7 +218,6 @@ const getAllDevicesNetwork = async (req, res) => {
       }
     }
 
-    // Get customer info
     const customerResponse = await apiClient.makeRequest('/customer/tree', {
       customerId: null
     });
@@ -253,7 +249,6 @@ const getOnlineDevices = async (req, res) => {
   try {
     const { customerId } = req.body;
 
-    // Get device shadow data to check online status
     const shadowResponse = await apiClient.makeRequest('/device/shadow/customer', {
       customerId: customerId || null
     });
@@ -262,7 +257,6 @@ const getOnlineDevices = async (req, res) => {
       return sendError(res, 'Failed to get device status', 400);
     }
 
-    // Filter only online devices
     const onlineDevices = shadowResponse.data.filter(device => device.online === true);
 
     const result = {
@@ -284,9 +278,8 @@ const getOnlineDevices = async (req, res) => {
 
 const getAllVehiclesWithStreams = async (req, res) => {
   try {
-    const { bitstreamType = 1, timeout = 5000, onlineOnly = false, allChannels = false } = req.body;
+    const { bitstreamType = 1, timeout = 10000, onlineOnly = false, allChannels = true, includeOffline = true } = req.body;
 
-    // Get all devices
     const allDevices = [];
     let pageIndex = 1;
     let hasMore = true;
@@ -307,26 +300,20 @@ const getAllVehiclesWithStreams = async (req, res) => {
       }
     }
 
-    // Process all devices
     const vehiclesWithStreams = await Promise.allSettled(
       allDevices.map(async (device) => {
         if (allChannels) {
-          // Get streams for all channels
           const channels = [];
+          
           for (let channelId = 1; channelId <= device.camCount; channelId++) {
             try {
-              const timeoutPromise = new Promise((_, reject) => 
-                setTimeout(() => reject(new Error('timeout')), timeout)
-              );
-              
-              const streamPromise = apiClient.makeRequest('/video/live', {
+              const streamResponse = await apiClient.makeRequest('/video/live', {
                 deviceId: device.id,
                 channelId,
                 bitstreamType,
                 nodeValue: null
               });
 
-              const streamResponse = await Promise.race([streamPromise, timeoutPromise]);
               if (streamResponse.code === 0 && streamResponse.data) {
                 channels.push({
                   channelId,
@@ -334,7 +321,7 @@ const getAllVehiclesWithStreams = async (req, res) => {
                 });
               }
             } catch (error) {
-              // Skip failed channels
+              // Continue to next channel
             }
           }
           
@@ -343,27 +330,23 @@ const getAllVehiclesWithStreams = async (req, res) => {
             deviceId: device.id,
             channels,
             cameras: device.camCount,
+            availableChannels: channels.length,
             deviceType: device.deviceType,
             customerName: device.customerName
           };
           
           if (onlineOnly && channels.length === 0) return null;
+          if (!includeOffline && channels.length === 0) return null;
           return vehicle;
         } else {
-          // Get only first channel (original behavior)
-          const timeoutPromise = new Promise((_, reject) => 
-            setTimeout(() => reject(new Error('timeout')), timeout)
-          );
-          
-          const streamPromise = apiClient.makeRequest('/video/live', {
-            deviceId: device.id,
-            channelId: 1,
-            bitstreamType,
-            nodeValue: null
-          });
-
           try {
-            const streamResponse = await Promise.race([streamPromise, timeoutPromise]);
+            const streamResponse = await apiClient.makeRequest('/video/live', {
+              deviceId: device.id,
+              channelId: 1,
+              bitstreamType,
+              nodeValue: null
+            });
+            
             const hasStream = streamResponse.code === 0 && streamResponse.data;
             
             const vehicle = {

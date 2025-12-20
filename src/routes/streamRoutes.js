@@ -1,6 +1,7 @@
 const express = require('express');
 const axios = require('axios');
 const { getDevices, getLiveStream, controlStream, getCustomerTree, getDeviceShadow, getDeviceByName, getStreamByPlate, getAllDevicesNetwork, getOnlineDevices, getAllVehiclesWithStreams } = require('../controllers/streamController');
+const { debugVehicleStreams } = require('../controllers/debugController');
 const { sendSuccess, sendError } = require('../helpers/response');
 
 const router = express.Router();
@@ -15,6 +16,7 @@ router.post('/live/plate', getStreamByPlate);
 router.get('/network', getAllDevicesNetwork);
 router.post('/online', getOnlineDevices);
 router.post('/vehicles/streams', getAllVehiclesWithStreams);
+router.post('/debug/vehicle', debugVehicleStreams);
 
 const activeStreams = new Map();
 
