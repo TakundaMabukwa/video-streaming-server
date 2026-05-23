@@ -303,28 +303,23 @@ const getAllVehiclesWithStreams = async (req, res) => {
     const vehiclesWithStreams = await Promise.allSettled(
       allDevices.map(async (device) => {
         if (allChannels) {
-          const channels = [];
-          
+          const channelPromises = [];
           for (let channelId = 1; channelId <= device.camCount; channelId++) {
-            try {
-              const streamResponse = await apiClient.makeRequest('/video/live', {
+            channelPromises.push(
+              apiClient.makeRequest('/video/live', {
                 deviceId: device.id,
                 channelId,
                 bitstreamType,
                 nodeValue: null
-              });
-
-              if (streamResponse.code === 0 && streamResponse.data) {
-                channels.push({
-                  channelId,
-                  streamUrl: streamResponse.data
-                });
-              }
-            } catch (error) {
-              // Continue to next channel
-            }
+              }).then(r => ({
+                channelId,
+                streamUrl: (r.code === 0 && r.data) ? r.data : null
+              })).catch(() => ({ channelId, streamUrl: null }))
+            );
           }
-          
+          const channelResults = await Promise.all(channelPromises);
+          const channels = channelResults.filter(ch => ch.streamUrl !== null);
+
           const vehicle = {
             plateName: device.deviceName,
             deviceId: device.id,
@@ -392,6 +387,62 @@ const getAllVehiclesWithStreams = async (req, res) => {
   }
 };
 
+const getNodes = async (req, res) => {
+  try {
+    const response = await apiClient.makeRequest('/video/nodes', {});
+    if (response.code === 0) {
+      sendSuccess(res, response.data, 'Video nodes retrieved');
+    } else {
+      sendError(res, response.msg || 'Failed to get nodes', 400);
+    }
+  } catch (error) {
+    sendError(res, error.message, 500);
+  }
+};
+
+const getAudioTalk = async (req, res) => {
+  try {
+    const { deviceId, channelId = 1, nodeValue = null } = req.body;
+    if (!deviceId) {
+      return sendError(res, 'Device ID is required', 400);
+    }
+    const response = await apiClient.makeRequest('/audio/talk/plus', {
+      deviceId,
+      channelId,
+      nodeValue
+    });
+    if (response.code === 0) {
+      sendSuccess(res, response.data, 'Audio talk URL retrieved');
+    } else {
+      sendError(res, response.msg || 'Failed to get audio talk URL', 400);
+    }
+  } catch (error) {
+    sendError(res, error.message, 500);
+  }
+};
+
+const getCustomerPage = async (req, res) => {
+  try {
+    const { pageIndex = 1, pageSize = 100, customerName, customerType, status, customerId, subsumption } = req.body;
+    const response = await apiClient.makeRequest('/customer/page', {
+      pageIndex,
+      pageSize,
+      customerName,
+      customerType,
+      status,
+      customerId,
+      subsumption: subsumption || false
+    });
+    if (response.code === 0) {
+      sendSuccess(res, response.data, 'Customers retrieved');
+    } else {
+      sendError(res, response.msg || 'Failed to get customers', 400);
+    }
+  } catch (error) {
+    sendError(res, error.message, 500);
+  }
+};
+
 module.exports = {
   getDevices,
   getLiveStream,
@@ -402,5 +453,8 @@ module.exports = {
   getStreamByPlate,
   getAllDevicesNetwork,
   getOnlineDevices,
-  getAllVehiclesWithStreams
+  getAllVehiclesWithStreams,
+  getNodes,
+  getAudioTalk,
+  getCustomerPage
 };
