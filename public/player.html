@@ -11,22 +11,25 @@
         .panel { background: white; border-radius: 8px; padding: 15px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); margin-bottom: 20px; }
         .panel h3 { margin-bottom: 10px; color: #333; }
         .vehicle-list { display: flex; flex-wrap: wrap; gap: 8px; }
-        .vehicle-btn { padding: 10px 15px; background: #3498db; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 14px; display: flex; align-items: center; gap: 8px; }
-        .vehicle-btn:hover { background: #2980b9; }
+        .vehicle-btn { padding: 10px 15px; background: #28a745; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 14px; display: flex; align-items: center; gap: 8px; }
+        .vehicle-btn:hover { background: #218838; }
         .vehicle-btn.active { background: #e74c3c; }
-        .vehicle-btn .dot { width: 8px; height: 8px; border-radius: 50%; background: #28a745; display: inline-block; }
+        .vehicle-btn .dot { width: 8px; height: 8px; border-radius: 50%; background: white; display: inline-block; }
         .vehicle-btn.loading { background: #f39c12; }
-        .streams-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(400px, 1fr)); gap: 15px; }
+        .streams-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(500px, 1fr)); gap: 15px; }
         .stream-card { background: white; border-radius: 8px; padding: 15px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
         .stream-title { font-weight: bold; margin-bottom: 8px; color: #333; display: flex; justify-content: space-between; align-items: center; }
-        .video-wrapper { position: relative; width: 100%; height: 220px; background: #000; border-radius: 4px; overflow: hidden; }
+        .video-wrapper { position: relative; width: 100%; height: 280px; background: #000; border-radius: 4px; overflow: hidden; }
         video { width: 100%; height: 100%; }
-        .overlay { position: absolute; top: 0; left: 0; right: 0; bottom: 0; display: flex; align-items: center; justify-content: center; color: white; background: rgba(0,0,0,0.4); font-size: 13px; }
+        .overlay { position: absolute; top: 0; left: 0; right: 0; bottom: 0; display: flex; align-items: center; justify-content: center; color: white; background: rgba(0,0,0,0.5); font-size: 14px; text-align: center; padding: 10px; }
         .overlay.error { background: rgba(231,76,60,0.7); }
-        .controls { margin-top: 10px; display: flex; gap: 8px; align-items: center; }
-        .ctrl-btn { padding: 5px 12px; border: none; border-radius: 3px; cursor: pointer; font-size: 12px; }
+        .controls { margin-top: 10px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+        .ctrl-btn { padding: 6px 14px; border: none; border-radius: 3px; cursor: pointer; font-size: 12px; }
         .ctrl-btn.audio-off { background: #6c757d; color: white; }
         .ctrl-btn.audio-on { background: #28a745; color: white; }
+        .ctrl-btn.channel { background: #3498db; color: white; }
+        .ctrl-btn.channel:hover { background: #2980b9; }
+        .ctrl-btn.channel.active { background: #e67e22; }
         .loading { text-align: center; padding: 40px; color: #666; }
         .status { padding: 12px; border-radius: 5px; margin-bottom: 15px; }
         .status.info { background: #d1ecf1; color: #0c5460; }
@@ -37,12 +40,12 @@
 <body>
     <div class="container">
         <div class="header">
-            <h1>Live Stream Player with Audio</h1>
-            <div><span id="vehicle-count">0</span> vehicles</div>
+            <h1>Live Stream Player</h1>
+            <div><span id="vehicle-count">0</span> online</div>
         </div>
 
         <div class="panel">
-            <h3>Vehicles <span style="font-weight:normal;font-size:13px;color:#666;">— click to play all cameras</span></h3>
+            <h3>Online Vehicles <span style="font-weight:normal;font-size:13px;color:#666;">— click to stream camera 1</span></h3>
             <div class="vehicle-list" id="vehicle-list"></div>
         </div>
 
@@ -108,88 +111,83 @@
             Object.keys(flvP).forEach(k => { try { flvP[k].pause(); flvP[k].unload(); flvP[k].detachMediaElement(); flvP[k].destroy(); } catch(e) {} delete flvP[k]; });
         }
 
-        async function selectVehicle(deviceId) {
-            const v = vehicleData[deviceId];
-            if (!v) return;
+        async function loadStream(deviceId, plateName, channelId, btn) {
             destroyAll();
             document.querySelectorAll('.vehicle-btn').forEach(b => b.classList.remove('active', 'loading'));
-            const btn = document.querySelector(`[data-id="${deviceId}"]`);
             if (btn) { btn.classList.add('loading'); btn.textContent = 'Loading...'; }
 
-            document.getElementById('streams-container').innerHTML = '<div class="loading">Loading streams...</div>';
+            const container = document.getElementById('streams-container');
+            const vid = `pv-${deviceId}-${channelId}`;
+            container.innerHTML = `
+                <div class="stream-card">
+                    <div class="stream-title"><span>${plateName} — Camera ${channelId}</span></div>
+                    <div class="video-wrapper">
+                        <video id="${vid}" controls muted playsinline></video>
+                        <div class="overlay">Requesting stream...</div>
+                    </div>
+                    <div class="controls">
+                        <button class="ctrl-btn audio-off" onclick="toggleAudio('${deviceId}', this)">Audio Off</button>
+                    </div>
+                </div>
+            `;
 
             try {
-                const promises = [];
-                for (let ch = 1; ch <= (v.cameras || 1); ch++) {
-                    promises.push(
-                        fetch('/api/stream/live', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({deviceId, channelId:ch, bitstreamType:1}) }).then(r => r.json())
-                    );
+                const r = await fetch('/api/stream/live', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({deviceId, channelId, bitstreamType:1})});
+                const d = await r.json();
+                if (d.success && d.data.streamUrl) {
+                    const ov = document.querySelector(`#${CSS.escape(vid)}`).parentElement.querySelector('.overlay');
+                    if (ov) ov.textContent = 'Starting stream...';
+                    if (btn) { btn.classList.remove('loading'); btn.classList.add('active'); btn.textContent = `${plateName} — Camera ${channelId}`; }
+                    setTimeout(() => createPlayer(document.getElementById(vid), d.data.streamUrl, `${deviceId}-${channelId}`), 100);
+                } else {
+                    const msg = d.message || 'No stream available';
+                    const ov = document.querySelector(`#${CSS.escape(vid)}`).parentElement.querySelector('.overlay');
+                    if (ov) { ov.textContent = msg; ov.className = 'overlay error'; }
+                    if (btn) { btn.classList.remove('loading'); btn.textContent = `${plateName} — No stream`; }
                 }
-                const results = await Promise.all(promises);
-
-                if (btn) { btn.classList.remove('loading'); btn.classList.add('active'); btn.textContent = `${v.plateName} (${results.filter(r => r.success).length}/${results.length})`; }
-
-                const container = document.getElementById('streams-container');
-                container.innerHTML = '';
-
-                let hasAny = false;
-                results.forEach((r, i) => {
-                    const ch = i + 1;
-                    const vid = `pv-${deviceId}-${ch}`;
-                    const card = document.createElement('div');
-                    card.className = 'stream-card';
-                    const streamOk = r.success && r.data.streamUrl;
-                    card.innerHTML = `
-                        <div class="stream-title"><span>Camera ${ch}</span></div>
-                        <div class="video-wrapper">
-                            <video id="${vid}" controls muted playsinline></video>
-                            <div class="overlay ${streamOk ? '' : 'error'}">${streamOk ? 'Starting...' : 'No stream'}</div>
-                        </div>
-                        <div class="controls">
-                            <button class="ctrl-btn audio-off" onclick="toggleAudio('${deviceId}', this)">Audio Off</button>
-                            ${streamOk ? '' : '<span style="color:#999;font-size:12px;">Stream unavailable</span>'}
-                        </div>
-                    `;
-                    container.appendChild(card);
-                    if (streamOk) {
-                        hasAny = true;
-                        setTimeout(() => createPlayer(document.getElementById(vid), r.data.streamUrl, `${deviceId}-${ch}`), 100);
-                    }
-                });
-                if (!hasAny) container.innerHTML = '<div class="status err">No streams available for this vehicle</div>';
             } catch(e) {
-                document.getElementById('streams-container').innerHTML = `<div class="status err">Error: ${e.message}</div>`;
-                if (btn) { btn.classList.remove('loading'); btn.textContent = `${v.plateName} - Error`; btn.classList.add('active'); }
+                const ov = document.querySelector(`#${CSS.escape(vid)}`).parentElement.querySelector('.overlay');
+                if (ov) { ov.textContent = 'Error: ' + e.message; ov.className = 'overlay error'; }
+                if (btn) { btn.classList.remove('loading'); btn.textContent = `${plateName} — Error`; }
             }
         }
 
-        async function loadVehicles() {
+        async function selectVehicle(deviceId, btn) {
+            const v = vehicleData[deviceId];
+            if (!v) return;
+            await loadStream(deviceId, v.plateName, 1, btn);
+        }
+
+        async function loadOnlineVehicles() {
             const status = document.getElementById('status');
             const listDiv = document.getElementById('vehicle-list');
-            status.innerHTML = '<div class="status info">Loading vehicles...</div>';
+            status.innerHTML = '<div class="status info">Checking online vehicles...</div>';
 
             try {
-                const res = await fetch('/api/stream/network');
+                const res = await fetch('/api/stream/online', { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}' });
                 const data = await res.json();
                 if (!data.success) throw new Error(data.message);
                 const devices = data.data.devices || [];
                 document.getElementById('vehicle-count').textContent = devices.length;
 
-                if (devices.length === 0) { status.innerHTML = '<div class="status info">No vehicles found</div>'; return; }
+                if (devices.length === 0) { status.innerHTML = '<div class="status info">No vehicles currently online</div>'; return; }
 
                 vehicleData = {};
                 devices.forEach(d => { vehicleData[d.deviceId] = d; });
 
-                listDiv.innerHTML = devices.map(d => `<button class="vehicle-btn" onclick="selectVehicle('${d.deviceId}')" data-id="${d.deviceId}"><span class="dot"></span>${d.plateName} (${d.cameras || '?'} cams)</button>`).join('');
-                status.innerHTML = `<div class="status ok">${devices.length} vehicles loaded. Click one to start streaming.</div>`;
+                listDiv.innerHTML = devices.map(d =>
+                    `<button class="vehicle-btn" onclick="selectVehicle('${d.deviceId}', this)" data-id="${d.deviceId}"><span class="dot"></span>${d.plateName}</button>`
+                ).join('');
+
+                status.innerHTML = `<div class="status ok">${devices.length} vehicles online. Click one to stream camera 1.</div>`;
             } catch(e) {
-                status.innerHTML = `<div class="status err">Error: ${e.message}</div>`;
+                status.innerHTML = `<div class="status err">${e.message}</div>`;
             }
         }
 
         document.addEventListener('DOMContentLoaded', function() {
             if (!flvjs.isSupported()) { document.getElementById('status').innerHTML = '<div class="status err">FLV not supported</div>'; return; }
-            loadVehicles();
+            loadOnlineVehicles();
         });
     </script>
 </body>

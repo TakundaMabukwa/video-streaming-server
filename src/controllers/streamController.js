@@ -39,6 +39,8 @@ const getLiveStream = async (req, res) => {
 
     if (response.code === 0) {
       sendSuccess(res, { streamUrl: response.data }, 'Live stream URL retrieved');
+    } else if (response.code === 63001 || (response.msg && response.msg.includes('call count exceeds'))) {
+      sendError(res, 'API rate limit exceeded. Please try again in a few minutes.', 429);
     } else {
       sendError(res, response.msg || 'Failed to get live stream', 400);
     }
@@ -247,27 +249,34 @@ const getAllDevicesNetwork = async (req, res) => {
 
 const getOnlineDevices = async (req, res) => {
   try {
-    const { customerId } = req.body;
+    let { customerId } = req.body;
 
-    const shadowResponse = await apiClient.makeRequest('/device/shadow/customer', {
-      customerId: customerId || null
-    });
-
-    if (shadowResponse.code !== 0) {
-      return sendError(res, 'Failed to get device status', 400);
+    if (!customerId) {
+      const treeResponse = await apiClient.makeRequest('/customer/tree', { customerId: null });
+      if (treeResponse.code === 0 && treeResponse.data && treeResponse.data.length > 0) {
+        customerId = treeResponse.data[0].id;
+      } else {
+        return sendError(res, 'No customer found', 404);
+      }
     }
 
-    const onlineDevices = shadowResponse.data.filter(device => device.online === true);
+    const shadowResponse = await apiClient.makeRequest('/device/shadow/customer', { customerId });
+
+    if (shadowResponse.code !== 0) {
+      return sendError(res, shadowResponse.msg || 'Failed to get device status', 400);
+    }
+
+    const onlineDevices = shadowResponse.data.filter(device => device.expand && device.expand.status === true);
 
     const result = {
       totalOnline: onlineDevices.length,
       devices: onlineDevices.map(device => ({
-        plateName: device.deviceName,
-        deviceId: device.deviceId,
-        online: device.online,
-        lastSeen: device.lastActiveTime,
-        cameras: device.camCount || 0
-      }))
+        plateName: device.deviceData ? device.deviceData.deviceName : 'Unknown',
+        deviceId: device.deviceData ? device.deviceData.deviceId : null,
+        online: device.expand.status,
+        lastSeen: device.expand.activeTime,
+        cameras: 2
+      })).filter(d => d.deviceId)
     };
 
     sendSuccess(res, result, 'Online devices retrieved successfully');
@@ -300,13 +309,42 @@ const getAllVehiclesWithStreams = async (req, res) => {
       }
     }
 
+    const concurrencyLimit = 5;
+    const queue = [];
+    let activeCount = 0;
+    let queueIndex = 0;
+
+    function enqueue(fn) {
+      return new Promise((resolve, reject) => {
+        queue.push({ fn, resolve, reject });
+        processQueue();
+      });
+    }
+
+    function processQueue() {
+      while (activeCount < concurrencyLimit && queueIndex < queue.length) {
+        const item = queue[queueIndex++];
+        if (!item) break;
+        activeCount++;
+        item.fn().then(result => {
+          activeCount--;
+          item.resolve(result);
+          processQueue();
+        }).catch(err => {
+          activeCount--;
+          item.reject(err);
+          processQueue();
+        });
+      }
+    }
+
     const vehiclesWithStreams = await Promise.allSettled(
       allDevices.map(async (device) => {
         if (allChannels) {
           const channelPromises = [];
           for (let channelId = 1; channelId <= device.camCount; channelId++) {
             channelPromises.push(
-              apiClient.makeRequest('/video/live', {
+              enqueue(() => apiClient.makeRequest('/video/live', {
                 deviceId: device.id,
                 channelId,
                 bitstreamType,
@@ -314,7 +352,7 @@ const getAllVehiclesWithStreams = async (req, res) => {
               }).then(r => ({
                 channelId,
                 streamUrl: (r.code === 0 && r.data) ? r.data : null
-              })).catch(() => ({ channelId, streamUrl: null }))
+              })).catch(() => ({ channelId, streamUrl: null })))
             );
           }
           const channelResults = await Promise.all(channelPromises);
@@ -335,12 +373,12 @@ const getAllVehiclesWithStreams = async (req, res) => {
           return vehicle;
         } else {
           try {
-            const streamResponse = await apiClient.makeRequest('/video/live', {
+            const streamResponse = await enqueue(() => apiClient.makeRequest('/video/live', {
               deviceId: device.id,
               channelId: 1,
               bitstreamType,
               nodeValue: null
-            });
+            }));
             
             const hasStream = streamResponse.code === 0 && streamResponse.data;
             

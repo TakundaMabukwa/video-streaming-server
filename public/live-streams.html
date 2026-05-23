@@ -6,37 +6,48 @@
     <title>Live Streams</title>
     <script src="/js/flv.js/dist/flv.min.js"></script>
     <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
         body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
         .container { max-width: 1200px; margin: 0 auto; }
-        .header { text-align: center; margin-bottom: 30px; }
-        .streams-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 20px; }
-        .stream-card { background: white; border-radius: 8px; padding: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-        .stream-title { font-size: 18px; font-weight: bold; margin-bottom: 10px; color: #333; display: flex; align-items: center; gap: 8px; }
-        .stream-info { color: #666; margin-bottom: 15px; }
-        .video-container { position: relative; width: 100%; height: 250px; background: #000; border-radius: 4px; }
-        video { width: 100%; height: 100%; border-radius: 4px; }
-        .overlay { position: absolute; top: 0; left: 0; right: 0; bottom: 0; display: flex; align-items: center; justify-content: center; color: white; background: rgba(0,0,0,0.4); font-size: 14px; }
+        .header { background: #2c3e50; color: white; padding: 15px 20px; border-radius: 8px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; }
+        .panel { background: white; border-radius: 8px; padding: 15px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); margin-bottom: 20px; }
+        .panel h3 { margin-bottom: 10px; color: #333; }
+        .vehicle-list { display: flex; flex-wrap: wrap; gap: 8px; }
+        .vehicle-btn { padding: 10px 15px; background: #28a745; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 14px; display: flex; align-items: center; gap: 8px; }
+        .vehicle-btn:hover { background: #218838; }
+        .vehicle-btn.active { background: #e74c3c; }
+        .vehicle-btn.loading { background: #f39c12; }
+        .vehicle-btn .dot { width: 8px; height: 8px; border-radius: 50%; background: white; display: inline-block; }
+        .streams-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(500px, 1fr)); gap: 15px; }
+        .stream-card { background: white; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        .card-header { padding: 12px 15px; background: #34495e; color: white; font-weight: bold; display: flex; justify-content: space-between; }
+        .video-wrapper { position: relative; width: 100%; height: 280px; background: #000; }
+        video { width: 100%; height: 100%; }
+        .overlay { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: white; background: rgba(0,0,0,0.5); font-size: 14px; text-align: center; padding: 10px; }
         .overlay.error { background: rgba(231,76,60,0.7); }
-        .refresh-btn { background: #007bff; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; margin-bottom: 20px; }
-        .refresh-btn:hover { background: #0056b3; }
-        .status { padding: 10px; border-radius: 4px; margin-bottom: 20px; }
-        .status.success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
-        .status.error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
-        .status.info { background: #d1ecf1; color: #0c5460; border: 1px solid #bee5eb; }
-        .play-btn { background: #28a745; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-size: 13px; margin-top: 10px; }
-        .play-btn:hover { background: #218838; }
-        .play-btn.loading { background: #f39c12; }
-        .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
-        .dot.on { background: #28a745; }
-        .dot.off { background: #dc3545; }
+        .controls { padding: 10px 15px; display: flex; gap: 6px; flex-wrap: wrap; }
+        .ctrl-btn { padding: 5px 12px; border: none; border-radius: 3px; cursor: pointer; font-size: 12px; }
+        .ctrl-btn.audio-off { background: #6c757d; color: white; }
+        .ctrl-btn.audio-on { background: #28a745; color: white; }
+        .ctrl-btn.channel { background: #3498db; color: white; cursor: default; }
+        .status { padding: 12px; border-radius: 5px; margin-bottom: 15px; }
+        .status.info { background: #d1ecf1; color: #0c5460; }
+        .status.err { background: #f8d7da; color: #721c24; }
+        .status.ok { background: #d4edda; color: #155724; }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>Live Vehicle Streams</h1>
-            <button class="refresh-btn" onclick="location.reload()">Refresh</button>
+            <h1>Live Streams</h1>
+            <div><span id="vehicle-count">0</span> online</div>
         </div>
+
+        <div class="panel">
+            <h3>Online Vehicles <span style="font-weight:normal;font-size:13px;color:#666;">— click to stream camera 1</span></h3>
+            <div class="vehicle-list" id="vehicle-list"></div>
+        </div>
+
         <div id="status"></div>
         <div id="streams-container" class="streams-grid"></div>
     </div>
@@ -44,6 +55,7 @@
     <script>
         const flvP = {};
         const audioCtxMap = {};
+        let vehicleData = {};
 
         function decodeALaw(b) { b = b ^ 0x55; const s = b & 0x80, seg = (b >> 4) & 7, m = b & 0xF; let v = seg ? ((m << 4) + 0x100) << (seg - 1) : (m << 4) + 8; return s ? v : -v; }
 
@@ -51,7 +63,7 @@
             if (audioCtxMap[deviceId]) {
                 audioCtxMap[deviceId].socket.close(); audioCtxMap[deviceId].ctx.close();
                 delete audioCtxMap[deviceId];
-                btn.textContent = 'Audio Off'; btn.classList.remove('on');
+                btn.textContent = 'Audio Off'; btn.className = 'ctrl-btn audio-off';
                 return;
             }
             try {
@@ -77,7 +89,7 @@
                     }
                 };
                 audioCtxMap[deviceId] = { socket: ws, ctx };
-                btn.textContent = 'Audio On'; btn.classList.add('on');
+                btn.textContent = 'Audio On'; btn.className = 'ctrl-btn audio-on';
             } catch(e) { console.log('Audio err:', deviceId, e.message); }
         }
 
@@ -94,103 +106,88 @@
             } catch(e) { console.log('Player err', key, e); const ov = videoEl.parentElement.querySelector('.overlay'); if (ov) { ov.textContent = 'Player error'; ov.className = 'overlay error'; } }
         }
 
-        async function loadStreams() {
-            const status = document.getElementById('status');
+        function destroyAll() {
+            Object.keys(flvP).forEach(k => { try { flvP[k].pause(); flvP[k].unload(); flvP[k].detachMediaElement(); flvP[k].destroy(); } catch(e) {} delete flvP[k]; });
+        }
+
+        async function loadStream(deviceId, plateName, channelId, btn) {
+            destroyAll();
+            document.querySelectorAll('.vehicle-btn').forEach(b => b.classList.remove('active', 'loading'));
+            if (btn) { btn.classList.add('loading'); btn.textContent = 'Loading...'; }
+
             const container = document.getElementById('streams-container');
-            status.innerHTML = '<div class="status info">Loading vehicles...</div>';
-            container.innerHTML = '';
+            const vid = `ls-${deviceId}-${channelId}`;
+            container.innerHTML = `
+                <div class="stream-card">
+                    <div class="card-header"><span>${plateName} — Camera ${channelId}</span></div>
+                    <div class="video-wrapper">
+                        <video id="${vid}" controls muted playsinline></video>
+                        <div class="overlay">Requesting stream...</div>
+                    </div>
+                    <div class="controls">
+                        <button class="ctrl-btn audio-off" onclick="toggleAudio('${deviceId}', this)">Audio Off</button>
+                    </div>
+                </div>
+            `;
 
             try {
-                const res = await fetch('/api/stream/network');
+                const r = await fetch('/api/stream/live', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({deviceId, channelId, bitstreamType:1})});
+                const d = await r.json();
+                if (d.success && d.data.streamUrl) {
+                    if (btn) { btn.classList.remove('loading'); btn.classList.add('active'); btn.textContent = `Streaming ${plateName}`; }
+                    const ov = document.querySelector(`#${CSS.escape(vid)}`).parentElement.querySelector('.overlay');
+                    if (ov) ov.textContent = 'Starting...';
+                    setTimeout(() => createPlayer(document.getElementById(vid), d.data.streamUrl, `${deviceId}-${channelId}`), 100);
+                } else {
+                    const msg = d.message || 'No stream available';
+                    const ov = document.querySelector(`#${CSS.escape(vid)}`).parentElement.querySelector('.overlay');
+                    if (ov) { ov.textContent = msg; ov.className = 'overlay error'; }
+                    if (btn) { btn.classList.remove('loading'); btn.textContent = `${plateName} — No stream`; }
+                }
+            } catch(e) {
+                const ov = document.querySelector(`#${CSS.escape(vid)}`).parentElement.querySelector('.overlay');
+                if (ov) { ov.textContent = 'Error: ' + e.message; ov.className = 'overlay error'; }
+                if (btn) { btn.classList.remove('loading'); btn.textContent = `${plateName} — Error`; }
+            }
+        }
+
+        async function selectVehicle(deviceId, btn) {
+            const v = vehicleData[deviceId];
+            if (!v) return;
+            await loadStream(deviceId, v.plateName, 1, btn);
+        }
+
+        async function loadOnlineVehicles() {
+            const status = document.getElementById('status');
+            const listDiv = document.getElementById('vehicle-list');
+            status.innerHTML = '<div class="status info">Checking online vehicles...</div>';
+
+            try {
+                const res = await fetch('/api/stream/online', { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}' });
                 const data = await res.json();
-                if (!data.success) { status.innerHTML = `<div class="status error">${data.message}</div>`; return; }
-
+                if (!data.success) throw new Error(data.message);
                 const devices = data.data.devices || [];
-                if (devices.length === 0) { status.innerHTML = '<div class="status error">No vehicles found</div>'; return; }
-                status.innerHTML = `<div class="status success">${devices.length} vehicles loaded. Click play to start streaming.</div>`;
+                document.getElementById('vehicle-count').textContent = devices.length;
 
-                devices.forEach(d => {
-                    const card = document.createElement('div');
-                    card.className = 'stream-card';
-                    card.id = `card-${d.deviceId}`;
-                    card.innerHTML = `
-                        <div class="stream-title"><span class="dot on"></span>${d.plateName}</div>
-                        <div class="stream-info">${d.cameras || '?'} cameras · ${d.customerName || 'N/A'} · ${d.deviceType || ''}</div>
-                        <button class="play-btn" onclick="playVehicle('${d.deviceId}', ${d.cameras || 1}, this)">Show Cameras</button>
-                        <div id="ch-${d.deviceId}" style="margin-top:10px;"></div>
-                    `;
-                    container.appendChild(card);
-                });
+                if (devices.length === 0) { status.innerHTML = '<div class="status info">No vehicles currently online</div>'; return; }
+
+                vehicleData = {};
+                devices.forEach(d => { vehicleData[d.deviceId] = d; });
+
+                listDiv.innerHTML = devices.map(d =>
+                    `<button class="vehicle-btn" onclick="selectVehicle('${d.deviceId}', this)" data-id="${d.deviceId}"><span class="dot"></span>${d.plateName}</button>`
+                ).join('');
+
+                status.innerHTML = `<div class="status ok">${devices.length} vehicles online. Click one to stream camera 1.</div>`;
             } catch(e) {
-                status.innerHTML = `<div class="status error">${e.message}</div>`;
+                status.innerHTML = `<div class="status err">${e.message}</div>`;
             }
         }
 
-        async function playVehicle(deviceId, camCount, btn) {
-            const wrap = document.getElementById(`ch-${deviceId}`);
-            if (wrap.dataset.loaded === '1') {
-                wrap.style.display = wrap.style.display === 'none' ? 'block' : 'none';
-                btn.textContent = wrap.style.display === 'none' ? 'Show Cameras' : 'Hide Cameras';
-                return;
-            }
-            btn.textContent = 'Loading...'; btn.className = 'play-btn loading';
-
-            for (let i = 1; i <= camCount; i++) {
-                const div = document.createElement('div');
-                div.style.marginBottom = '10px';
-                div.innerHTML = `<div style="font-weight:bold;margin-bottom:4px;">Camera ${i}</div>
-                    <div class="video-container" style="height:200px;">
-                        <video id="lv-${deviceId}-${i}" controls muted playsinline></video>
-                        <div class="overlay">Loading stream URL...</div>
-                    </div>`;
-                wrap.appendChild(div);
-            }
-
-            try {
-                const promises = [];
-                for (let ch = 1; ch <= camCount; ch++) {
-                    promises.push(
-                        fetch('/api/stream/live', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({deviceId, channelId:ch, bitstreamType:1}) }).then(r => r.json())
-                    );
-                }
-                const results = await Promise.all(promises);
-                btn.textContent = 'Hide Cameras'; btn.className = 'play-btn';
-                wrap.dataset.loaded = '1';
-                wrap.style.display = 'block';
-
-                let audioBtn = wrap.parentElement.querySelector('.audio-btn');
-                if (!audioBtn) {
-                    audioBtn = document.createElement('button');
-                    audioBtn.className = 'play-btn';
-                    audioBtn.style.cssText = 'background:#6c757d;margin-left:8px;';
-                    audioBtn.textContent = 'Audio Off';
-                    audioBtn.onclick = function() { toggleAudio(deviceId, this); };
-                    wrap.parentElement.querySelector('.stream-title').after(audioBtn);
-                }
-
-                results.forEach((r, i) => {
-                    const ch = i + 1;
-                    const el = document.getElementById(`lv-${deviceId}-${ch}`);
-                    const ov = el.parentElement.querySelector('.overlay');
-                    if (r.success && r.data.streamUrl) {
-                        if (ov) ov.textContent = 'Starting stream...';
-                        setTimeout(() => createPlayer(el, r.data.streamUrl, `lv-${deviceId}-${ch}`), 100);
-                    } else {
-                        if (ov) { ov.textContent = 'No stream'; ov.className = 'overlay error'; }
-                    }
-                });
-            } catch(e) {
-                btn.textContent = 'Error - Retry'; btn.className = 'play-btn error';
-                const ov = wrap.querySelector('.overlay');
-                if (ov) { ov.textContent = 'Failed: ' + e.message; ov.className = 'overlay error'; }
-            }
-        }
-
-        if (!flvjs.isSupported()) {
-            document.getElementById('status').innerHTML = '<div class="status error">FLV not supported</div>';
-        } else {
-            loadStreams();
-        }
+        document.addEventListener('DOMContentLoaded', function() {
+            if (!flvjs.isSupported()) { document.getElementById('status').innerHTML = '<div class="status err">FLV not supported</div>'; return; }
+            loadOnlineVehicles();
+        });
     </script>
 </body>
 </html>
