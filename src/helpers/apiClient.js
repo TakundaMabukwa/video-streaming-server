@@ -62,19 +62,17 @@ class ApiClient {
   }
 
   async tryNodesForStream(deviceId, channelId, bitstreamType = 1) {
-    // First try default (null)
-    let result = await this.makeRequest('/video/live', {
-      deviceId, channelId, bitstreamType, nodeValue: null
-    });
+    // First try without nodeValue (API uses default when omitted)
+    let body = { deviceId, channelId, bitstreamType };
+    let result = await this.makeRequest('/video/live', body);
     if (result.code === 0 && result.data) return result;
 
     // Default failed — try each available node
     const nodes = await this.getLiveNodes();
     for (const node of nodes) {
       if (!node.nodeValue) continue;
-      result = await this.makeRequest('/video/live', {
-        deviceId, channelId, bitstreamType, nodeValue: node.nodeValue
-      });
+      body = { deviceId, channelId, bitstreamType, nodeValue: node.nodeValue };
+      result = await this.makeRequest('/video/live', body);
       if (result.code === 0 && result.data) return result;
     }
     return result; // return last failure
