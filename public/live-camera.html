@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Live Camera Feeds</title>
+  <script src="/js/flv.js/dist/flv.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: Arial, sans-serif; background: #f5f5f5; }
+    .header { background: #2c3e50; color: white; padding: 12px 20px; display: flex; align-items: center; justify-content: space-between; }
+    .header h1 { font-size: 18px; }
+    .header .sub { font-size: 12px; color: #aaa; }
+    .back-btn { background: none; border: 1px solid rgba(255,255,255,.3); color: white; padding: 6px 14px; border-radius: 4px; cursor: pointer; font-size: 13px; }
+    .back-btn:hover { background: rgba(255,255,255,.1); }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; height: calc(100vh - 52px); }
+    .cam-card { position: relative; background: #000; overflow: hidden; }
+    .cam-card video { width: 100%; height: 100%; object-fit: contain; }
+    .cam-overlay { position: absolute; bottom: 0; left: 0; right: 0; background: linear-gradient(transparent, rgba(0,0,0,.8)); padding: 30px 14px 10px; color: white; font-size: 13px; display: flex; align-items: center; gap: 8px; }
+    .cam-overlay .live-dot { width: 7px; height: 7px; border-radius: 50%; background: #e74c3c; display: inline-block; animation: pulse 1.5s infinite; }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .4; } }
+    .loader { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: #111; color: #888; font-size: 14px; flex-direction: column; gap: 12px; }
+    .spinner { width: 32px; height: 32px; border: 3px solid #333; border-top-color: #3498db; border-radius: 50%; animation: spin .8s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .error-state { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: #111; color: #e74c3c; font-size: 13px; flex-direction: column; gap: 8px; }
+    .loading-page { display: flex; align-items: center; justify-content: center; height: 100vh; background: #f5f5f5; flex-direction: column; gap: 16px; color: #555; }
+    .loading-page .spinner-lg { width: 48px; height: 48px; border: 4px solid #ddd; border-top-color: #3498db; border-radius: 50%; animation: spin .8s linear infinite; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <button class="back-btn" onclick="history.back()">← Back</button>
+    <div>
+      <h1 id="title">Live Camera Feeds</h1>
+      <div class="sub" id="subtitle">Loading...</div>
+    </div>
+    <div style="color:#aaa;font-size:12px">EPS Tracking</div>
+  </div>
+  <div class="grid" id="cam-grid"></div>
+
+  <script>
+    (async function() {
+      const params = new URLSearchParams(location.search);
+      const vehiclePlate = params.get('vehicle') || '';
+      const driverName = params.get('driver') || 'Unassigned';
+
+      if (!vehiclePlate) {
+        document.getElementById('subtitle').textContent = 'No vehicle specified';
+        return;
+      }
+
+      document.getElementById('subtitle').textContent = `${driverName} · ${vehiclePlate}`;
+      document.getElementById('title').textContent = `Live Camera Feeds — ${vehiclePlate}`;
+
+      if (!flvjs.isSupported()) {
+        document.getElementById('cam-grid').innerHTML = '<div style="grid-column:1/-1;display:flex;align-items:center;justify-content:center;color:#e74c3c">FLV not supported in this browser</div>';
+        return;
+      }
+
+      const players = {};
+      const grid = document.getElementById('cam-grid');
+
+      function renderChannel(ch, plateName) {
+        const card = document.createElement('div');
+        card.className = 'cam-card';
+        card.innerHTML = `
+          <video muted playsinline></video>
+          <div class="loader"><div class="spinner"></div><span>Loading stream...</span></div>
+          <div class="cam-overlay"><span class="live-dot"></span> Camera ${ch.channelId} · ${plateName}</div>
+        `;
+        grid.appendChild(card);
+        return card;
+      }
+
+      function destroyAllPlayers() {
+        Object.keys(players).forEach(k => {
+          try { players[k].pause(); players[k].unload(); players[k].detachMediaElement(); players[k].destroy(); } catch(e) {}
+          delete players[k];
+        });
+      }
+
+      async function startChannel(card, channel, plateName) {
+        const video = card.querySelector('video');
+        const loader = card.querySelector('.loader');
+
+        try {
+          let streamUrl = channel.streamUrl;
+          if (!streamUrl) throw new Error('No stream URL');
+
+          const proxyUrl = `/api/stream/stream/proxy?url=${encodeURIComponent(streamUrl)}`;
+          const p = flvjs.createPlayer({ type: 'flv', url: proxyUrl, isLive: true, hasAudio: false, cors: true });
+
+          p.attachMediaElement(video);
+          p.on(flvjs.Events.ERROR, function() { if (loader) { loader.innerHTML = '<span style="color:#e74c3c">Stream error</span>'; } });
+          p.on(flvjs.Events.PLAYING, function() { if (loader) loader.style.display = 'none'; });
+          p.load();
+          p.play().catch(function() {});
+          players[channel.channelId] = p;
+        } catch (e) {
+          if (loader) loader.innerHTML = `<span style="color:#e74c3c">${e.message}</span>`;
+        }
+      }
+
+      try {
+        // Step 1: Get all vehicles from /api/stream/network
+        const netRes = await fetch('/api/stream/network');
+        const netData = await netRes.json();
+        if (!netData.success) throw new Error(netData.message || 'Failed to fetch vehicles');
+
+        const vehicles = netData.data.devices || [];
+        const vehicle = vehicles.find(v => v.plateName.toLowerCase() === vehiclePlate.toLowerCase());
+        if (!vehicle) throw new Error(`Vehicle "${vehiclePlate}" not found`);
+
+        document.getElementById('subtitle').textContent = `${driverName} · ${vehicle.plateName} (${vehicle.cameras || '?'} cameras)`;
+
+        // Step 2: Get channels for this vehicle
+        const chRes = await fetch('/api/stream/debug/vehicle', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ deviceId: vehicle.deviceId })
+        });
+        const chData = await chRes.json();
+        if (!chData.success) throw new Error(chData.message || 'Failed to fetch channels');
+
+        const channels = (chData.data ? chData.data.channels || chData.channels : chData.channels || []).filter(ch => ch.streamUrl || ch.success);
+
+        if (channels.length === 0) {
+          grid.innerHTML = '<div style="grid-column:1/-1;display:flex;align-items:center;justify-content:center;color:#888">No streams available</div>';
+          return;
+        }
+
+        // Step 3: Render each channel
+        channels.forEach(ch => {
+          const card = renderChannel(ch, vehicle.plateName);
+          if (ch.success && ch.streamUrl) {
+            startChannel(card, ch, vehicle.plateName);
+          } else {
+            const loader = card.querySelector('.loader');
+            if (loader) loader.innerHTML = '<span style="color:#e74c3c">No stream</span>';
+          }
+        });
+      } catch (err) {
+        grid.innerHTML = `<div style="grid-column:1/-1;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:12px;color:#e74c3c">
+          <div>${err.message}</div>
+          <button onclick="location.reload()" style="padding:8px 20px;border:1px solid #ccc;border-radius:4px;cursor:pointer;background:white">Retry</button>
+        </div>`;
+      }
+
+      // Cleanup on unload
+      window.addEventListener('beforeunload', destroyAllPlayers);
+    })();
+  </script>
+</body>
+</html>

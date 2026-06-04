@@ -1,0 +1,14 @@
+node_modules
+.git
+*.md
+*.log
+npm-debug.log*
+.env
+.env.local
+.env.production
+.gitignore
+*.txt
+*.js
+!src/
+!package*.json
+!node_modules/.package-lock.json

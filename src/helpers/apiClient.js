@@ -47,6 +47,38 @@ class ApiClient {
       throw new Error(`API request failed: ${error.message}`);
     }
   }
+
+  async getLiveNodes() {
+    if (this._cachedNodes && Date.now() < this._nodesCacheExpiry) {
+      return this._cachedNodes;
+    }
+    const response = await this.makeRequest('/video/nodes', {});
+    if (response.code === 0 && response.data?.liveNodes?.length > 0) {
+      this._cachedNodes = response.data.liveNodes;
+      this._nodesCacheExpiry = Date.now() + 10 * 60 * 1000; // cache 10 min
+      return this._cachedNodes;
+    }
+    return [];
+  }
+
+  async tryNodesForStream(deviceId, channelId, bitstreamType = 1) {
+    // First try default (null)
+    let result = await this.makeRequest('/video/live', {
+      deviceId, channelId, bitstreamType, nodeValue: null
+    });
+    if (result.code === 0 && result.data) return result;
+
+    // Default failed — try each available node
+    const nodes = await this.getLiveNodes();
+    for (const node of nodes) {
+      if (!node.nodeValue) continue;
+      result = await this.makeRequest('/video/live', {
+        deviceId, channelId, bitstreamType, nodeValue: node.nodeValue
+      });
+      if (result.code === 0 && result.data) return result;
+    }
+    return result; // return last failure
+  }
 }
 
 module.exports = new ApiClient();

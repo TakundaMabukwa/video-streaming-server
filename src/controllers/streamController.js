@@ -168,12 +168,7 @@ const getStreamByPlate = async (req, res) => {
       return sendError(res, 'Vehicle with plate not found', 404);
     }
 
-    const streamResponse = await apiClient.makeRequest('/video/live', {
-      deviceId: device.id,
-      channelId,
-      bitstreamType,
-      nodeValue: null
-    });
+    const streamResponse = await apiClient.tryNodesForStream(device.id, channelId, bitstreamType);
 
     if (streamResponse.code === 0) {
       sendSuccess(res, {
@@ -247,30 +242,36 @@ const getAllDevicesNetwork = async (req, res) => {
 
 const getOnlineDevices = async (req, res) => {
   try {
-    const { customerId } = req.body;
+    let { customerId } = req.body;
 
-    const shadowResponse = await apiClient.makeRequest('/device/shadow/customer', {
-      customerId: customerId || null
-    });
+    if (!customerId) {
+      const customerRes = await apiClient.makeRequest('/customer/tree', { customerId: null });
+      if (customerRes.code === 0 && customerRes.data?.length > 0) {
+        customerId = customerRes.data[0].id;
+      }
+    }
+
+    if (!customerId) {
+      return sendError(res, 'Unable to determine customer ID', 400);
+    }
+
+    const shadowResponse = await apiClient.makeRequest('/device/shadow/customer', { customerId });
 
     if (shadowResponse.code !== 0) {
       return sendError(res, 'Failed to get device status', 400);
     }
 
-    const onlineDevices = shadowResponse.data.filter(device => device.online === true);
+    const devices = (shadowResponse.data || []).map(d => ({
+      plateName: d.deviceData?.deviceName || '',
+      deviceId: d.deviceData?.deviceId || '',
+      online: d.expand?.status === true,
+      lastSeen: d.expand?.reportTime || d.expand?.activeTime || '',
+      cameras: 0,
+    }));
 
-    const result = {
-      totalOnline: onlineDevices.length,
-      devices: onlineDevices.map(device => ({
-        plateName: device.deviceName,
-        deviceId: device.deviceId,
-        online: device.online,
-        lastSeen: device.lastActiveTime,
-        cameras: device.camCount || 0
-      }))
-    };
+    const onlineDevices = devices.filter(d => d.online);
 
-    sendSuccess(res, result, 'Online devices retrieved successfully');
+    sendSuccess(res, { totalOnline: onlineDevices.length, devices }, 'Online devices retrieved successfully');
   } catch (error) {
     sendError(res, error.message, 500);
   }
@@ -307,12 +308,7 @@ const getAllVehiclesWithStreams = async (req, res) => {
           
           for (let channelId = 1; channelId <= device.camCount; channelId++) {
             try {
-              const streamResponse = await apiClient.makeRequest('/video/live', {
-                deviceId: device.id,
-                channelId,
-                bitstreamType,
-                nodeValue: null
-              });
+              const streamResponse = await apiClient.tryNodesForStream(device.id, channelId, bitstreamType);
 
               if (streamResponse.code === 0 && streamResponse.data) {
                 channels.push({
@@ -340,12 +336,7 @@ const getAllVehiclesWithStreams = async (req, res) => {
           return vehicle;
         } else {
           try {
-            const streamResponse = await apiClient.makeRequest('/video/live', {
-              deviceId: device.id,
-              channelId: 1,
-              bitstreamType,
-              nodeValue: null
-            });
+            const streamResponse = await apiClient.tryNodesForStream(device.id, 1, bitstreamType);
             
             const hasStream = streamResponse.code === 0 && streamResponse.data;
             

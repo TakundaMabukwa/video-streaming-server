@@ -32,16 +32,11 @@ const debugVehicleStreams = async (req, res) => {
       return sendError(res, 'Device not found', 404);
     }
 
-    // Test each channel
+    // Test each channel — try default node, then fallback to others
     const channelTests = [];
     for (let channelId = 1; channelId <= device.camCount; channelId++) {
       try {
-        const streamResponse = await apiClient.makeRequest('/video/live', {
-          deviceId: device.id,
-          channelId,
-          bitstreamType: 1,
-          nodeValue: null
-        });
+        const streamResponse = await apiClient.tryNodesForStream(device.id, channelId, 1);
 
         channelTests.push({
           channelId,

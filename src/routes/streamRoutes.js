@@ -1,5 +1,6 @@
 const express = require('express');
 const axios = require('axios');
+const apiClient = require('../helpers/apiClient');
 const { getDevices, getLiveStream, controlStream, getCustomerTree, getDeviceShadow, getDeviceByName, getStreamByPlate, getAllDevicesNetwork, getOnlineDevices, getAllVehiclesWithStreams } = require('../controllers/streamController');
 const { debugVehicleStreams } = require('../controllers/debugController');
 const { sendSuccess, sendError } = require('../helpers/response');
@@ -18,7 +19,24 @@ router.post('/online', getOnlineDevices);
 router.post('/vehicles/streams', getAllVehiclesWithStreams);
 router.post('/debug/vehicle', debugVehicleStreams);
 
+router.get('/nodes', async (req, res) => {
+  try {
+    const nodes = await apiClient.getLiveNodes();
+    sendSuccess(res, { nodes }, 'Live nodes retrieved');
+  } catch (error) {
+    sendError(res, error.message, 500);
+  }
+});
+
 const activeStreams = new Map();
+
+const MIME_MAP = {
+  '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+  '.png': 'image/png', '.gif': 'image/gif', '.webp': 'image/webp',
+  '.mp4': 'video/mp4', '.flv': 'video/x-flv',
+  '.avi': 'video/x-msvideo', '.mov': 'video/quicktime',
+  '.webm': 'video/webm',
+};
 
 router.get('/stream/proxy', async (req, res) => {
   try {
@@ -27,43 +45,51 @@ router.get('/stream/proxy', async (req, res) => {
       return sendError(res, 'Stream URL required', 400);
     }
 
-    // Set headers for persistent connection
-    res.setHeader('Content-Type', 'video/x-flv');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    
-    const streamKey = Buffer.from(url).toString('base64');
-    
-    // Reuse existing stream if available
-    if (activeStreams.has(streamKey)) {
-      const existingStream = activeStreams.get(streamKey);
-      existingStream.pipe(res);
-      return;
-    }
+    const ext = (url.match(/\.(\w+)(?:\?|$)/) || [])[0]?.toLowerCase() || '';
+    const mime = MIME_MAP[ext] || 'application/octet-stream';
+    const isStream = mime === 'video/x-flv';
 
-    const response = await axios.get(url, {
-      responseType: 'stream',
-      timeout: 30000,
-      headers: {
-        'Connection': 'keep-alive',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    if (isStream) {
+      res.setHeader('Content-Type', 'video/x-flv');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+
+      const streamKey = Buffer.from(url).toString('base64');
+
+      if (activeStreams.has(streamKey)) {
+        const existingStream = activeStreams.get(streamKey);
+        existingStream.pipe(res);
+        return;
       }
-    });
 
-    // Store stream for reuse
-    activeStreams.set(streamKey, response.data);
-    
-    response.data.pipe(res);
-    
-    // Clean up on stream end
-    response.data.on('end', () => {
-      activeStreams.delete(streamKey);
-    });
-    
-    response.data.on('error', () => {
-      activeStreams.delete(streamKey);
-    });
-    
+      const response = await axios.get(url, {
+        responseType: 'stream',
+        timeout: 30000,
+        headers: {
+          'Connection': 'keep-alive',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+      });
+
+      activeStreams.set(streamKey, response.data);
+      response.data.pipe(res);
+      response.data.on('end', () => activeStreams.delete(streamKey));
+      response.data.on('error', () => activeStreams.delete(streamKey));
+    } else {
+      res.setHeader('Content-Type', mime);
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+
+      const response = await axios.get(url, {
+        responseType: 'stream',
+        timeout: 15000,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+      });
+
+      response.data.pipe(res);
+    }
   } catch (error) {
     sendError(res, 'Failed to stream: ' + error.message, 500);
   }

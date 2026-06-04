@@ -1,40 +1,104 @@
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
+const compression = require('compression');
+const rateLimit = require('express-rate-limit');
 const config = require('./config/config');
 const routes = require('./routes');
 const { sendError } = require('./helpers/response');
+const db = require('./db');
+const syncService = require('./services/syncService');
 
 const app = express();
 
-// Security middleware
+app.use(compression());
+
 app.use(helmet({
-  contentSecurityPolicy: false
+  contentSecurityPolicy: false,
+  crossOriginResourcePolicy: false,
 }));
 app.use(cors());
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true, limit: '1mb' }));
+app.use(express.static('public', { maxAge: '1d' }));
 
-// Body parsing middleware
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many requests, please try again later.' },
+});
+app.use('/api', apiLimiter, routes);
 
-// Static files
-app.use(express.static('public'));
-app.use('/js', express.static('node_modules'));
+const fileUpload = require('express-fileupload');
+app.use('/api/alerts', (req, res, next) => {
+  if (req.method === 'POST' && req.path.match(/\/[^/]+\/documents$/)) {
+    fileUpload({ limits: { fileSize: 10 * 1024 * 1024 }, abortOnLimit: true })(req, res, next);
+  } else {
+    next();
+  }
+});
 
-// Routes
-app.use('/api', routes);
-
-// 404 handler
 app.use('*', (req, res) => {
   sendError(res, 'Route not found', 404);
 });
 
-// Global error handler
 app.use((err, req, res, next) => {
+  if (err.type === 'entity.too.large') {
+    return sendError(res, 'Request body too large', 413);
+  }
   console.error(err.stack);
   sendError(res, 'Something went wrong!', 500);
 });
 
-app.listen(config.port, () => {
-  console.log(`Server running on port ${config.port} in ${config.nodeEnv} mode`);
-});
+async function waitForDb(retries = 30, delay = 2000) {
+  for (let i = 1; i <= retries; i++) {
+    try {
+      await db.initializeDatabase();
+      console.log('[DB] Database ready');
+      return;
+    } catch (err) {
+      if (i < retries) {
+        console.log(`[DB] Connection attempt ${i}/${retries} failed: ${err.message}. Retrying in ${delay}ms...`);
+        await new Promise((r) => setTimeout(r, delay));
+      } else {
+        throw err;
+      }
+    }
+  }
+}
+
+async function shutdown(signal) {
+  console.log(`[SERVER] Received ${signal}, shutting down gracefully...`);
+  syncService.stopAutoSync();
+  server.close(async () => {
+    await db.closePool();
+    console.log('[SERVER] Shutdown complete');
+    process.exit(0);
+  });
+  setTimeout(() => {
+    console.error('[SERVER] Forced shutdown after timeout');
+    process.exit(1);
+  }, 10000).unref();
+}
+
+let server;
+async function start() {
+  try {
+    await waitForDb();
+    server = app.listen(config.port, () => {
+      console.log(`Server running on port ${config.port} in ${config.nodeEnv} mode`);
+    });
+    server.setTimeout(30000);
+    syncService.startAutoSync(30000);
+  } catch (err) {
+    console.error(`Startup failed: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
+start();
