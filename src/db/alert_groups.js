@@ -89,9 +89,10 @@ async function getActiveAlertGroupsWithMedia({ limit = 2000 } = {}) {
               'file_size', m.file_size, 'created_at', m.created_at
             )) FILTER (WHERE m.id IS NOT NULL) AS media
      FROM alert_groups g
-     LEFT JOIN alert_media m ON m.alert_id = g.last_alert_id
+     INNER JOIN alert_media m ON m.alert_id = g.last_alert_id
      WHERE g.resolved = FALSE
      GROUP BY g.id
+     HAVING COUNT(m.id) > 0
      ORDER BY g.last_alert_ts DESC NULLS LAST
      LIMIT $1`,
     [limit]

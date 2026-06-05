@@ -118,6 +118,10 @@ async function getAlertById(req, res) {
       alert.media = media || [];
     }
 
+    if (!alert.media || alert.media.length === 0) {
+      return res.status(404).json({ success: false, message: `Alert ${id} has no media` });
+    }
+
     const transformed = transformDbAlert(alert);
     transformed.count = alert.count || 1;
     transformed.screenshots = (alert.media || []).map((m, i) => ({
