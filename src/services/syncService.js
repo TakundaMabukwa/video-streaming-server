@@ -120,6 +120,28 @@ async function syncAlerts(deviceIds, startTime, endTime) {
         alarmExtension: r.alarmExtension ? JSON.stringify(r.alarmExtension) : null,
       })));
 
+      // Group by (device_id, alarm_type) and upsert into alert_groups
+      const groupMap = {};
+      for (const r of newRecords) {
+        const key = `${r.deviceId}:${r.alarmType}`.toLowerCase();
+        if (!groupMap[key] || new Date(r.alarmTs || 0) > new Date(groupMap[key].alarmTs || 0)) {
+          groupMap[key] = r;
+        }
+      }
+      const groupEntries = Object.values(groupMap).map(r => ({
+        deviceId: r.deviceId,
+        deviceName: r.deviceName,
+        alarmType: r.alarmType,
+        alarmText: r.alarmText,
+        alertId: r.id,
+        alarmTs: r.alarmTs ? new Date(r.alarmTs) : null,
+        lat: r.lat,
+        lon: r.lon,
+      }));
+      if (groupEntries.length > 0) {
+        await db.batchUpsertAlertGroups(groupEntries);
+      }
+
       const alarmTypeMap = {};
       for (const r of newRecords) { alarmTypeMap[r.id] = r.alarmType; }
 

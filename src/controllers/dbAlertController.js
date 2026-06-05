@@ -46,7 +46,8 @@ async function getSyncStatus(req, res) {
   try {
     const status = syncService.getStatus();
     const stats = await db.getStats();
-    sendSuccess(res, { ...status, stats }, 'Sync status retrieved');
+    const groupStats = await db.getAlertGroupStats();
+    sendSuccess(res, { ...status, stats: { ...stats, ...groupStats } }, 'Sync status retrieved');
   } catch (error) {
     sendError(res, error.message, 500);
   }
@@ -55,9 +56,9 @@ async function getSyncStatus(req, res) {
 async function getDevices(req, res) {
   try {
     const result = await db.query(
-      `SELECT device_id, device_name, COUNT(*) as alert_count,
-       MAX(alarm_ts) as last_alert_ts
-       FROM alerts
+      `SELECT device_id, device_name, SUM(count) as alert_count,
+       MAX(last_alert_ts) as last_alert_ts
+       FROM alert_groups
        GROUP BY device_id, device_name
        ORDER BY last_alert_ts DESC NULLS LAST
        LIMIT 1000`
@@ -71,8 +72,8 @@ async function getDevices(req, res) {
 async function getAlertTypes(req, res) {
   try {
     const result = await db.query(
-      `SELECT alarm_type, COUNT(*) as alert_count
-       FROM alerts
+      `SELECT alarm_type, SUM(count) as alert_count
+       FROM alert_groups
        GROUP BY alarm_type
        ORDER BY alert_count DESC
        LIMIT 200`
@@ -87,11 +88,12 @@ async function getActiveAlerts(req, res) {
   try {
     const limit = parseInt(req.query.limit) || 2000;
 
-    const dbResult = await db.getActiveAlertsWithMedia({ pageSize: limit, pageIndex: 1 });
+    // Read from alert_groups for grouped view
+    const groups = await db.getActiveAlertGroupsWithMedia({ limit });
 
-    const alerts = dbResult.records.map(transformDbAlert);
+    const alerts = groups.map(transformDbAlert);
 
-    res.json({ success: true, alerts, count: alerts.length, total: dbResult.total, source: 'eps-db' });
+    res.json({ success: true, alerts, count: alerts.length, total: alerts.length, source: 'eps-db' });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -102,12 +104,22 @@ async function getAlertById(req, res) {
     const { id } = req.params;
     if (!id) return sendError(res, 'Alert ID required', 400);
 
-    const alert = await db.getAlertWithMedia(id);
+    // Try group lookup first, fall back to individual alert
+    let alert = await db.getAlertGroupByAlertId(id);
     if (!alert) {
-      return res.status(404).json({ success: false, message: `Alert ${id} not found` });
+      alert = await db.getAlertWithMedia(id);
+      if (!alert) {
+        return res.status(404).json({ success: false, message: `Alert ${id} not found` });
+      }
+      alert.media = alert.media || [];
+    } else {
+      // Attach media from last_alert_id
+      const media = await db.getMediaForAlert(alert.last_alert_id);
+      alert.media = media || [];
     }
 
     const transformed = transformDbAlert(alert);
+    transformed.count = alert.count || 1;
     transformed.screenshots = (alert.media || []).map((m, i) => ({
       id: m.id || `media-${i}`,
       url: m.file_url,
@@ -137,7 +149,11 @@ async function getAlertScreenshots(req, res) {
     const { id } = req.params;
     if (!id) return sendError(res, 'Alert ID required', 400);
 
-    const alert = await db.getAlertWithMedia(id);
+    // Try group lookup by last_alert_id
+    let group = await db.getAlertGroupByAlertId(id);
+    const alertId = group ? group.last_alert_id : id;
+
+    const alert = await db.getAlertWithMedia(alertId);
     if (!alert) {
       return res.json({ success: true, screenshots: [], count: 0, source: 'eps-db' });
     }
@@ -162,12 +178,17 @@ async function getAlertMedia(req, res) {
     const { id } = req.params;
     if (!id) return sendError(res, 'Alert ID required', 400);
 
-    const alert = await db.getAlertWithMedia(id);
+    // Try group lookup, fall back to individual alert
+    let group = await db.getAlertGroupByAlertId(id);
+    const alertId = group ? group.last_alert_id : id;
+
+    const alert = await db.getAlertWithMedia(alertId);
     if (!alert) {
       return res.json({ success: true, alert: null, screenshots: [], videos: [], captures: [], clipUrls: {}, source: 'eps-db' });
     }
 
     const transformed = transformDbAlert(alert);
+    if (group) transformed.count = group.count;
     const media = alert.media || [];
     const images = media.filter((m) => m.file_type === '00' || !m.file_type || m.file_type === '01');
     const videoFiles = media.filter((m) => m.file_type === '02');
@@ -229,6 +250,12 @@ async function resolveAlert(req, res) {
       return res.status(404).json({ success: false, message: `Alert ${id} not found` });
     }
 
+    // Also resolve the alert group if it exists
+    const group = await db.getAlertGroupByAlertId(id);
+    if (group) {
+      await db.resolveAlertGroup(group.group_key, { resolved: true, false_alert: closureType === 'false_alert', resolved_by: userId || null, resolved_at: new Date().toISOString(), notes: notes || null });
+    }
+
     const docs = [];
     if (docData) {
       const docEntries = Array.isArray(docData) ? docData : [docData];
@@ -255,7 +282,8 @@ async function resolveAlert(req, res) {
       resolved: true,
       false_alert: closureType === 'false_alert',
       documents: docs,
-      message: `Alert ${id} resolved successfully`,
+      count: group ? group.count : 1,
+      message: group ? `Alert group ${group.group_key} resolved (${group.count} alerts)` : `Alert ${id} resolved successfully`,
     });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
@@ -277,13 +305,20 @@ async function markFalseAlert(req, res) {
       return res.status(404).json({ success: false, message: `Alert ${id} not found` });
     }
 
+    // Also mark the group as false alert
+    const group = await db.getAlertGroupByAlertId(id);
+    if (group) {
+      await db.resolveAlertGroup(group.group_key, { resolved: true, false_alert: true, resolved_by: userId || null, resolved_at: new Date().toISOString(), notes: notes || null });
+    }
+
     res.json({
       success: true,
       alertId: id,
       action: 'mark-false',
       resolved: true,
       false_alert: true,
-      message: `Alert ${id} marked as false alarm`,
+      count: group ? group.count : 1,
+      message: group ? `Alert group ${group.group_key} marked as false (${group.count} alerts)` : `Alert ${id} marked as false alarm`,
     });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });

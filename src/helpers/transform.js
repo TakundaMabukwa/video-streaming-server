@@ -28,9 +28,12 @@ function transformDbAlert(record) {
   const alarmType = record.alarm_type || '';
   const priority = PRIORITY_MAP[alarmType] || 'medium';
   const documents = Array.isArray(record.documents) ? record.documents : [];
+  const ts = record.last_alert_ts || record.alarm_ts;
+  const id = record.last_alert_id || record.id;
+  const deviceId = record.device_id;
 
   return {
-    id: record.id,
+    id,
     alert_type: alarmType,
     type: alarmType,
     priority,
@@ -39,17 +42,20 @@ function transformDbAlert(record) {
     title: toTitle(alarmType),
     resolved: !!record.resolved,
     false_alert: !!record.false_alert,
+    resolved_at: record.resolved_at ? new Date(record.resolved_at).toISOString() : null,
+    resolved_by: record.resolved_by || null,
+    count: record.count || 1,
     documents,
     notes: record.notes || null,
     escalated: false,
-    device_id: record.device_id,
-    vehicleId: record.device_id,
-    vehicle_registration: record.device_name || record.device_id,
+    device_id: deviceId,
+    vehicleId: deviceId,
+    vehicle_registration: record.device_name || deviceId,
     driver_name: null,
-    timestamp: record.alarm_ts ? new Date(record.alarm_ts).toISOString() : new Date().toISOString(),
+    timestamp: ts ? new Date(ts).toISOString() : new Date().toISOString(),
     created_at: record.created_at ? new Date(record.created_at).toISOString() : null,
-    last_occurrence: record.alarm_ts ? new Date(record.alarm_ts).toISOString() : null,
-    displayTimestamp: record.alarm_ts ? new Date(record.alarm_ts).toISOString() : null,
+    last_occurrence: ts ? new Date(ts).toISOString() : null,
+    displayTimestamp: ts ? new Date(ts).toISOString() : null,
     location: {
       latitude: record.lat,
       longitude: record.lon,
@@ -59,7 +65,7 @@ function transformDbAlert(record) {
     lon: record.lon,
     metadata: {
       vehicle: {
-        vehicleId: record.device_id,
+        vehicleId: deviceId,
         plateNumber: record.device_name,
       },
     },
