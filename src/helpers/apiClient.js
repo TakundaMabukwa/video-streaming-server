@@ -40,7 +40,8 @@ class ApiClient {
         headers: {
           'Authorization': token,
           'Content-Type': 'application/json'
-        }
+        },
+        timeout: 20000
       });
       return response.data;
     } catch (error) {
