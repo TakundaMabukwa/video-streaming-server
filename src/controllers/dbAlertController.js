@@ -99,6 +99,20 @@ async function getActiveAlerts(req, res) {
   }
 }
 
+async function getResolvedAlerts(req, res) {
+  try {
+    const limit = parseInt(req.query.limit) || 2000;
+
+    const groups = await db.getResolvedAlertGroupsWithMedia({ limit });
+
+    const alerts = groups.map(transformDbAlert);
+
+    res.json({ success: true, alerts, count: alerts.length, total: alerts.length, source: 'eps-db' });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+}
+
 async function getAlertById(req, res) {
   try {
     const { id } = req.params;
@@ -377,6 +391,7 @@ module.exports = {
   getDevices,
   getAlertTypes,
   getActiveAlerts,
+  getResolvedAlerts,
   getAlertById,
   getAlertScreenshots,
   getAlertMedia,

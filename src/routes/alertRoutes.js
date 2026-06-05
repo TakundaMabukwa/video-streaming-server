@@ -1,6 +1,6 @@
 const express = require('express');
 const { getAlertTypes, getAlarmPage, getAlertFeed, getAlarmFilesById, getAlarmFilesByPage, getDevices } = require('../controllers/alertController');
-const { getActiveAlerts, getAlertById, getAlertScreenshots, getAlertMedia, acknowledgeAlert, resolveAlert, escalateAlert, markFalseAlert, uploadDocumentToAlert } = require('../controllers/dbAlertController');
+const { getActiveAlerts, getResolvedAlerts, getAlertById, getAlertScreenshots, getAlertMedia, acknowledgeAlert, resolveAlert, escalateAlert, markFalseAlert, uploadDocumentToAlert } = require('../controllers/dbAlertController');
 
 const router = express.Router();
 
@@ -12,6 +12,7 @@ router.post('/files/page', getAlarmFilesByPage);
 router.get('/devices', getDevices);
 
 router.get('/active', getActiveAlerts);
+router.get('/resolved', getResolvedAlerts);
 router.get('/:id/screenshots', getAlertScreenshots);
 router.get('/:id/media', getAlertMedia);
 router.post('/:id/acknowledge', acknowledgeAlert);

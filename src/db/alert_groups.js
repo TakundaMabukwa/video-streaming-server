@@ -103,6 +103,27 @@ async function getActiveAlertGroupsWithMedia({ limit = 2000 } = {}) {
   }));
 }
 
+async function getResolvedAlertGroupsWithMedia({ limit = 2000 } = {}) {
+  const result = await query(
+    `SELECT g.*,
+            jsonb_agg(DISTINCT jsonb_build_object(
+              'id', m.id, 'file_url', m.file_url, 'file_type', m.file_type,
+              'file_size', m.file_size, 'created_at', m.created_at
+            )) FILTER (WHERE m.id IS NOT NULL) AS media
+     FROM alert_groups g
+     LEFT JOIN alert_media m ON m.alert_id = g.last_alert_id
+     WHERE g.resolved = TRUE
+     GROUP BY g.id
+     ORDER BY g.updated_at DESC NULLS LAST, g.last_alert_ts DESC NULLS LAST
+     LIMIT $1`,
+    [limit]
+  );
+  return result.rows.map(r => ({
+    ...r,
+    media: (r.media || []).filter(m => m.id !== null)
+  }));
+}
+
 async function resolveAlertGroup(groupKey, updates) {
   const sets = [];
   const params = [];
@@ -159,6 +180,7 @@ module.exports = {
   getAlertGroupByKey,
   getAlertGroupByAlertId,
   getActiveAlertGroupsWithMedia,
+  getResolvedAlertGroupsWithMedia,
   resolveAlertGroup,
   getAlertGroupStats,
 };
