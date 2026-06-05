@@ -48,27 +48,26 @@ router.get('/stream/proxy', async (req, res) => {
     const isStream = mime === 'video/x-flv';
 
     if (isStream) {
+      const response = await axios.get(url, {
+        responseType: 'stream',
+        timeout: 15000,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+      });
+
+      if (response.status < 200 || response.status >= 300) {
+        return sendError(res, 'Upstream returned ' + response.status, 502);
+      }
+
       res.setHeader('Content-Type', 'video/x-flv');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
       res.setHeader('Access-Control-Allow-Origin', '*');
 
-      const response = await axios.get(url, {
-        responseType: 'stream',
-        timeout: 30000,
-        headers: {
-          'Connection': 'keep-alive',
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-      });
-
       response.data.pipe(res);
-      response.data.on('error', (err) => {
-        if (!res.destroyed) res.status(500).end();
-      });
-      res.on('close', () => {
-        response.data.destroy();
-      });
+      response.data.on('error', () => { if (!res.destroyed) res.end(); });
+      res.on('close', () => response.data.destroy());
     } else {
       res.setHeader('Content-Type', mime);
       res.setHeader('Cache-Control', 'public, max-age=3600');
