@@ -28,8 +28,6 @@ router.get('/nodes', async (req, res) => {
   }
 });
 
-const activeStreams = new Map();
-
 const MIME_MAP = {
   '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
   '.png': 'image/png', '.gif': 'image/gif', '.webp': 'image/webp',
@@ -53,14 +51,7 @@ router.get('/stream/proxy', async (req, res) => {
       res.setHeader('Content-Type', 'video/x-flv');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
-
-      const streamKey = Buffer.from(url).toString('base64');
-
-      if (activeStreams.has(streamKey)) {
-        const existingStream = activeStreams.get(streamKey);
-        existingStream.pipe(res);
-        return;
-      }
+      res.setHeader('Access-Control-Allow-Origin', '*');
 
       const response = await axios.get(url, {
         responseType: 'stream',
@@ -71,10 +62,13 @@ router.get('/stream/proxy', async (req, res) => {
         }
       });
 
-      activeStreams.set(streamKey, response.data);
       response.data.pipe(res);
-      response.data.on('end', () => activeStreams.delete(streamKey));
-      response.data.on('error', () => activeStreams.delete(streamKey));
+      response.data.on('error', (err) => {
+        if (!res.destroyed) res.status(500).end();
+      });
+      res.on('close', () => {
+        response.data.destroy();
+      });
     } else {
       res.setHeader('Content-Type', mime);
       res.setHeader('Cache-Control', 'public, max-age=3600');
