@@ -165,11 +165,15 @@ async function fetchMediaForAlerts(records, alarmTypeMap) {
       const hasVideo = files.some(f => f.fileType === '02');
       if (!hasVideo) {
         const ts = record.alarmTs || record.alarm_ts;
-        const tsEnd = record.alarmTsEnd || record.alarm_ts_end || ts;
+        const rawEnd = record.alarmTsEnd || record.alarm_ts_end || ts;
         const devId = record.deviceId || record.device_id;
         const devName = record.deviceName || record.device_name || '';
         if (ts && devId) {
-          const replayUrl = await fetchReplayUrl(devId, 1, ts, tsEnd);
+          const tsDate = new Date(ts);
+          const rawEndDate = new Date(rawEnd);
+          const minEnd = new Date(tsDate.getTime() + 15 * 1000);
+          const tsEnd = rawEndDate > minEnd ? rawEndDate : minEnd;
+          const replayUrl = await fetchReplayUrl(devId, 1, ts, tsEnd.toISOString().replace('T', ' ').slice(0, 19));
           if (replayUrl) {
             await db.batchInsertMedia([{
               alertId,
