@@ -317,6 +317,43 @@
             </div>
         </div>
     </div>
+                    <div class="form-group">
+                        <label>Channel</label>
+                        <select id="playback-channel" style="width:100%;padding:8px 12px;background:#0f1419;border:1px solid #2a3a4a;border-radius:6px;color:#e1e8ed;font-size:13px">
+                            <option value="1">Channel 1</option>
+                            <option value="2">Channel 2</option>
+                            <option value="3">Channel 3</option>
+                            <option value="4">Channel 4</option>
+                            <option value="5">Channel 5</option>
+                            <option value="6">Channel 6</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="form-row" style="grid-template-columns:1fr 1fr;margin-top:8px">
+                    <div class="form-group">
+                        <label>Start Time</label>
+                        <input type="datetime-local" id="playback-start" style="width:100%;padding:8px 12px;background:#0f1419;border:1px solid #2a3a4a;border-radius:6px;color:#e1e8ed;font-size:13px">
+                    </div>
+                    <div class="form-group">
+                        <label>End Time</label>
+                        <input type="datetime-local" id="playback-end" style="width:100%;padding:8px 12px;background:#0f1419;border:1px solid #2a3a4a;border-radius:6px;color:#e1e8ed;font-size:13px">
+                    </div>
+                </div>
+                <div style="margin-top:12px;display:flex;gap:8px">
+                    <button id="playback-fetch-btn" class="btn-primary">Get Replay</button>
+                    <button id="playback-set-btn" class="btn-ghost" onclick="stopPlayback()">Stop</button>
+                </div>
+            </div>
+
+            <div class="video-section">
+                <h3 id="playback-title">Select a vehicle and time range, then click Get Replay</h3>
+                <div class="video-box" id="playback-video" style="min-height:300px;flex-direction:column;gap:8px">
+                    <div style="font-size:40px">🎬</div>
+                    <div>No replay loaded</div>
+                </div>
+            </div>
+        </div>
+    </div>
             <div id="loading-alerts" class="loading">Loading alerts...</div>
             <div id="error-alerts" class="error" style="display:none"></div>
             <div id="alerts-content" style="display:none">
@@ -441,6 +478,7 @@
         </div>
     </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/flv.js@1.6.2/dist/flv.min.js"></script>
     <script>
         // ========== TABS ==========
         document.querySelectorAll('.tab-btn').forEach(btn => {
@@ -1121,7 +1159,7 @@
 
         // ========== PLAYBACK ==========
         let playbackVehicles = [];
-        let playbackMediaRecorder = null;
+        let flvPlayer = null;
 
         document.getElementById('playback-fetch-btn').addEventListener('click', fetchReplay);
         document.getElementById('playback-vehicle').addEventListener('change', function() {
@@ -1167,6 +1205,7 @@
             btn.textContent = 'Fetching...';
 
             const videoBox = document.getElementById('playback-video');
+            stopPlayback();
             videoBox.innerHTML = '<div class="loading" style="padding:40px">Fetching replay stream...</div>';
 
             try {
@@ -1183,18 +1222,33 @@
                 document.getElementById('playback-title').textContent = 'Replay — ' + startTime + ' to ' + endTime;
 
                 videoBox.innerHTML = `
-                    <video id="replay-player" controls style="width:100%;max-height:500px;background:#000;border-radius:4px">
-                        <source src="${proxyUrl}" type="video/x-flv">
-                        Your browser does not support video playback
-                    </video>
+                    <div style="width:100%;position:relative">
+                        <video id="replay-player" controls style="width:100%;max-height:500px;background:#000;border-radius:4px"></video>
+                    </div>
                     <div style="margin-top:8px;display:flex;gap:8px;align-items:center;width:100%;padding:0 8px">
                         <span style="font-size:11px;color:#8899aa;word-break:break-all;flex:1">${replayUrl}</span>
                         <button onclick="copyToClipboard('${replayUrl}')" style="background:#2a3a4a;color:#e1e8ed;padding:6px 12px;border:none;border-radius:4px;cursor:pointer;font-size:11px">Copy URL</button>
+                        <button onclick="downloadReplay()" style="background:#16a34a;color:white;padding:6px 12px;border:none;border-radius:4px;cursor:pointer;font-size:11px">Download</button>
                     </div>
                 `;
 
-                const player = document.getElementById('replay-player');
-                player.play().catch(() => {});
+                if (typeof flvjs !== 'undefined' && flvjs.isSupported()) {
+                    flvPlayer = flvjs.createPlayer({
+                        type: 'flv',
+                        url: proxyUrl,
+                        isLive: false
+                    }, {
+                        enableWorker: true,
+                        lazyLoad: true,
+                        stashInitialSize: 128,
+                        seekType: 'range'
+                    });
+                    flvPlayer.attachMediaElement(document.getElementById('replay-player'));
+                    flvPlayer.load();
+                    flvPlayer.play().catch(() => {});
+                } else {
+                    videoBox.innerHTML += '<div style="padding:8px;color:#f87171;font-size:12px">FLV playback not supported in this browser. Use VLC with the URL above.</div>';
+                }
             } catch (e) {
                 videoBox.innerHTML = '<div style="padding:40px;text-align:center;color:#f87171;font-size:13px">Error: ' + e.message + '</div>';
             }
@@ -1203,7 +1257,24 @@
             btn.textContent = 'Get Replay';
         }
 
+        function downloadReplay() {
+            const player = document.getElementById('replay-player');
+            if (player && player.src) {
+                const a = document.createElement('a');
+                a.href = player.src;
+                a.download = 'replay-' + Date.now() + '.flv';
+                a.click();
+            }
+        }
+
         function stopPlayback() {
+            if (flvPlayer) {
+                flvPlayer.pause();
+                flvPlayer.unload();
+                flvPlayer.detachMediaElement();
+                flvPlayer.destroy();
+                flvPlayer = null;
+            }
             const player = document.getElementById('replay-player');
             if (player) {
                 player.pause();
