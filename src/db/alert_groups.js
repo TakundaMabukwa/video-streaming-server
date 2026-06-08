@@ -105,15 +105,16 @@ async function getActiveAlertGroupsWithMedia({ limit = 2000 } = {}) {
 
 async function getResolvedAlertGroupsWithMedia({ limit = 2000 } = {}) {
   const result = await query(
-    `SELECT g.*,
+    `SELECT g.*, a.documents,
             jsonb_agg(DISTINCT jsonb_build_object(
               'id', m.id, 'file_url', m.file_url, 'file_type', m.file_type,
               'file_size', m.file_size, 'created_at', m.created_at
             )) FILTER (WHERE m.id IS NOT NULL) AS media
      FROM alert_groups g
+     LEFT JOIN alerts a ON a.id = g.last_alert_id
      LEFT JOIN alert_media m ON m.alert_id = g.last_alert_id
      WHERE g.resolved = TRUE
-     GROUP BY g.id
+     GROUP BY g.id, a.documents
      ORDER BY g.updated_at DESC NULLS LAST, g.last_alert_ts DESC NULLS LAST
      LIMIT $1`,
     [limit]

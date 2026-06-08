@@ -91,7 +91,7 @@ async function start() {
       console.log(`Server running on port ${config.port} in ${config.nodeEnv} mode`);
     });
     server.setTimeout(30000);
-    syncService.startAutoSync(30000);
+    syncService.startAutoSync(60000);
   } catch (err) {
     console.error(`Startup failed: ${err.message}`);
     process.exit(1);

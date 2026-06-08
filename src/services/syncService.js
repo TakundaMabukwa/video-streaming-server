@@ -18,14 +18,36 @@ const ALERT_TYPE_LIST = [
   'overtime', 'speed', 'powerCut', 'occlusion', 'sos',
 ];
 
+const VIDEO_MANDATORY_TYPES = new Set([
+  'fatigueWarn', 'fatigueAlarm', 'bang', 'hardBraking',
+  'forwardCollisionWarning', 'pedestrianBang', 'closeProximity',
+]);
+
 async function getAllDeviceIds() {
   const allDevices = [];
   let pageIndex = 1;
   let hasMore = true;
   while (hasMore) {
-    const response = await apiClient.makeRequest('/device/page', {
-      pageIndex, pageSize: 100, subsumption: true,
-    });
+    let response;
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        response = await apiClient.makeRequest('/device/page', {
+          pageIndex, pageSize: 100, subsumption: true,
+        });
+        if (response.code === 63001) {
+          await sleep(RETRY_DELAY_MS * Math.pow(2, attempt));
+          continue;
+        }
+        break;
+      } catch (err) {
+        if (attempt < MAX_RETRIES) {
+          await sleep(RETRY_DELAY_MS * Math.pow(2, attempt));
+          continue;
+        }
+        console.error(`[SYNC] /device/page failed: ${err.message}`);
+        return allDevices;
+      }
+    }
     if (response.code === 0 && response.data.records.length > 0) {
       allDevices.push(...response.data.records.map(d => d.id));
       pageIndex++;
@@ -33,52 +55,186 @@ async function getAllDeviceIds() {
     } else {
       hasMore = false;
     }
+    if (hasMore) await sleep(200);
   }
   return allDevices;
 }
 
-async function fetchAlarmsPage({ deviceIds, alarmType, startTime, endTime, pageIndex = 1, pageSize = 50 }) {
-  const response = await apiClient.makeRequest('/alarm/alarmPage', {
-    pageSize,
-    pageIndex,
-    deviceIds,
-    alarmType: alarmType || ALERT_TYPE_LIST.join(','),
-    startTime,
-    endTime,
-  });
-  return response;
+async function fetchAlarmsPageWithRetry({ deviceIds, alarmType, startTime, endTime, pageIndex = 1, pageSize = 50 }) {
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const response = await apiClient.makeRequest('/alarm/alarmPage', {
+        pageSize,
+        pageIndex,
+        deviceIds,
+        alarmType: alarmType || ALERT_TYPE_LIST.join(','),
+        startTime,
+        endTime,
+      });
+
+      if (response.code === 63001) {
+        const wait = RETRY_DELAY_MS * Math.pow(2, attempt);
+        console.log(`[SYNC] Rate limited (63001) on alarmPage page ${pageIndex}, retry ${attempt + 1}/${MAX_RETRIES} in ${wait}ms`);
+        await sleep(wait);
+        continue;
+      }
+
+      return response;
+    } catch (err) {
+      if (attempt < MAX_RETRIES) {
+        const wait = RETRY_DELAY_MS * Math.pow(2, attempt);
+        console.log(`[SYNC] alarmPage page ${pageIndex} error (${err.message}), retry ${attempt + 1}/${MAX_RETRIES} in ${wait}ms`);
+        await sleep(wait);
+        continue;
+      }
+      console.error(`[SYNC] alarmPage page ${pageIndex} failed after ${MAX_RETRIES} retries: ${err.message}`);
+      return { code: -1, data: null, msg: err.message };
+    }
+  }
+  return { code: -1, data: null, msg: 'Max retries exceeded' };
+}
+
+const RETRY_DELAY_MS = 1000;
+const MAX_RETRIES = 3;
+const MEDIA_CONCURRENCY = 5;
+const BATCH_DELAY_MS = 1500;
+
+async function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
 }
 
 async function fetchMediaForAlarm(alarmId) {
-  try {
-    const response = await apiClient.makeRequest('/alarm/file/id', { alarmId });
-    if (response.code === 0 && Array.isArray(response.data)) {
-      return response.data;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const response = await apiClient.makeRequest('/alarm/file/id', { alarmId });
+
+      if (response.code === 63001) {
+        const wait = RETRY_DELAY_MS * Math.pow(2, attempt);
+        console.log(`[SYNC] Rate limited (63001) alarm ${alarmId}, retry ${attempt + 1}/${MAX_RETRIES} in ${wait}ms`);
+        await sleep(wait);
+        continue;
+      }
+
+      if (response.code === 0 && Array.isArray(response.data)) {
+        return response.data;
+      }
+      return [];
+    } catch (err) {
+      if (attempt < MAX_RETRIES) {
+        await sleep(RETRY_DELAY_MS * Math.pow(2, attempt));
+        continue;
+      }
+      return [];
     }
-    return [];
-  } catch (err) {
-    return [];
   }
+  return [];
 }
 
-async function fetchMediaBatch(records) {
-  const results = await Promise.all(
-    records.map(async (record) => {
-      const files = await fetchMediaForAlarm(record.id);
-      return { alertId: record.id, files };
-    })
-  );
-  return results;
+async function fetchMediaForAlerts(records, alarmTypeMap) {
+  let mediaCount = 0;
+  const total = records.length;
+
+  for (let i = 0; i < total; i += MEDIA_CONCURRENCY) {
+    const batch = records.slice(i, i + MEDIA_CONCURRENCY);
+    const results = await Promise.all(
+      batch.map(async (record) => {
+        const alertId = record.id || record.alert_id;
+        const alarmType = record.alarmType || record.alarm_type;
+        const files = await fetchMediaForAlarm(alertId);
+        return { alertId, alarmType, files, record };
+      })
+    );
+
+    for (const { alertId, alarmType, files, record } of results) {
+      if (files.length > 0) {
+        const existingMedia = await db.batchMediaExists(files.map(f => ({ alertId, fileUrl: f.fileUrl })));
+        const newFiles = files.filter(f => !existingMedia[`${alertId}::${f.fileUrl}`]);
+        if (newFiles.length > 0) {
+          await db.batchInsertMedia(newFiles.map(f => ({
+            alertId,
+            fileUrl: f.fileUrl,
+            fileType: f.fileType,
+            fileSize: f.fileSize,
+            deviceName: f.deviceName,
+            alarmType,
+          })));
+          mediaCount += newFiles.length;
+        }
+      }
+
+      const hasVideo = files.some(f => f.fileType === '02');
+      if (!hasVideo) {
+        const ts = record.alarmTs || record.alarm_ts;
+        const tsEnd = record.alarmTsEnd || record.alarm_ts_end || ts;
+        const devId = record.deviceId || record.device_id;
+        const devName = record.deviceName || record.device_name || '';
+        if (ts && devId) {
+          const replayUrl = await fetchReplayUrl(devId, 1, ts, tsEnd);
+          if (replayUrl) {
+            await db.batchInsertMedia([{
+              alertId,
+              fileUrl: replayUrl,
+              fileType: '02',
+              fileSize: 0,
+              deviceName: devName,
+              alarmType,
+            }]);
+            mediaCount++;
+          }
+        }
+      }
+    }
+
+    const processed = Math.min(i + MEDIA_CONCURRENCY, total);
+    console.log(`[SYNC] Media ${processed}/${total}: ${mediaCount} files so far`);
+
+    if (i + MEDIA_CONCURRENCY < total) {
+      await sleep(BATCH_DELAY_MS);
+    }
+  }
+
+  return mediaCount;
+}
+
+async function fetchReplayUrl(deviceId, channelId, startTime, endTime) {
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const response = await apiClient.makeRequest('/video/history/replay', {
+        deviceId,
+        channelId,
+        playbackType: 0,
+        fastForwardOrBackward: 0,
+        startTime: typeof startTime === 'string' ? startTime : new Date(startTime).toISOString().replace('T', ' ').slice(0, 19),
+        endTime: typeof endTime === 'string' ? endTime : new Date(endTime).toISOString().replace('T', ' ').slice(0, 19),
+      });
+
+      if (response.code === 63001) {
+        const wait = RETRY_DELAY_MS * Math.pow(2, attempt);
+        await sleep(wait);
+        continue;
+      }
+
+      if (response.code === 0 && response.data) return response.data;
+      return null;
+    } catch (err) {
+      if (attempt < MAX_RETRIES) {
+        await sleep(RETRY_DELAY_MS * Math.pow(2, attempt));
+        continue;
+      }
+      return null;
+    }
+  }
+  return null;
 }
 
 async function syncAlerts(deviceIds, startTime, endTime) {
   let pageIndex = 1;
   let hasMore = true;
-  let newCount = 0;
-  let mediaCount = 0;
+  const allNewRecords = [];
+  let emptyPageCount = 0;
 
   while (hasMore) {
-    const response = await fetchAlarmsPage({
+    const response = await fetchAlarmsPageWithRetry({
       deviceIds,
       startTime,
       endTime,
@@ -93,18 +249,12 @@ async function syncAlerts(deviceIds, startTime, endTime) {
 
     const records = response.data.records;
 
-    // Batch existence check — 1 query instead of N
     const ids = records.map(r => r.id);
     const existsMap = await db.batchAlertExists(ids);
     const newRecords = records.filter(r => !existsMap[r.id]);
 
-    for (const record of newRecords) {
-      newCount++;
-    }
-
-    const MEDIA_CONCURRENCY = 5;
-
     if (newRecords.length > 0) {
+      emptyPageCount = 0;
       await db.batchUpsertAlerts(newRecords.map(r => ({
         id: r.id,
         deviceId: r.deviceId,
@@ -120,7 +270,6 @@ async function syncAlerts(deviceIds, startTime, endTime) {
         alarmExtension: r.alarmExtension ? JSON.stringify(r.alarmExtension) : null,
       })));
 
-      // Group by (device_id, alarm_type) and upsert into alert_groups
       const groupMap = {};
       for (const r of newRecords) {
         const key = `${r.deviceId}:${r.alarmType}`.toLowerCase();
@@ -142,41 +291,30 @@ async function syncAlerts(deviceIds, startTime, endTime) {
         await db.batchUpsertAlertGroups(groupEntries);
       }
 
-      const alarmTypeMap = {};
-      for (const r of newRecords) { alarmTypeMap[r.id] = r.alarmType; }
-
-
-      for (let i = 0; i < newRecords.length; i += MEDIA_CONCURRENCY) {
-        const batch = newRecords.slice(i, i + MEDIA_CONCURRENCY);
-        const batchResults = await fetchMediaBatch(batch);
-        for (const { alertId, files } of batchResults) {
-          if (files.length === 0) continue;
-          const existingMedia = await db.batchMediaExists(files.map(f => ({ alertId, fileUrl: f.fileUrl })));
-          const newFiles = files.filter(f => !existingMedia[`${alertId}::${f.fileUrl}`]);
-          if (newFiles.length > 0) {
-            await db.batchInsertMedia(newFiles.map(f => ({
-              alertId,
-              fileUrl: f.fileUrl,
-              fileType: f.fileType,
-              fileSize: f.fileSize,
-              deviceName: f.deviceName,
-              alarmType: alarmTypeMap[alertId],
-            })));
-            mediaCount += newFiles.length;
-          }
-        }
-      }
+      allNewRecords.push(...newRecords);
+    } else {
+      emptyPageCount++;
     }
 
-    if (newCount > 0) {
-      console.log(`[SYNC] Page ${pageIndex}: ${newCount} new alerts, ${mediaCount} media files (batch ${MEDIA_CONCURRENCY})`);
-    }
-
+    console.log(`[SYNC] Page ${pageIndex}: ${newRecords.length} new alerts`);
     hasMore = records.length === 100 && (response.data.total > pageIndex * 100);
     pageIndex++;
+    if (hasMore) await sleep(200);
+
+    if (emptyPageCount >= 5) {
+      console.log(`[SYNC] ${emptyPageCount} consecutive empty pages — stopping pagination`);
+      break;
+    }
   }
 
-  return { newCount, mediaCount };
+  let mediaCount = 0;
+  if (allNewRecords.length > 0) {
+    console.log(`[SYNC] Fetching media for ${allNewRecords.length} alerts via /alarm/file/id...`);
+    mediaCount = await fetchMediaForAlerts(allNewRecords, {});
+    console.log(`[SYNC] Media fetch done: ${mediaCount} files`);
+  }
+
+  return { newCount: allNewRecords.length, mediaCount };
 }
 
 async function runSync() {
@@ -206,7 +344,7 @@ async function runSync() {
     if (syncState.lastSyncTime) {
       defaultStart = new Date(syncState.lastSyncTime - 5 * 60 * 1000).toISOString().replace('T', ' ').slice(0, 19);
     } else {
-      defaultStart = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString().replace('T', ' ').slice(0, 19);
+      defaultStart = new Date(now.getTime() - 6 * 60 * 1000).toISOString().replace('T', ' ').slice(0, 19);
     }
 
     const result = await syncAlerts(idsStr, defaultStart, defaultEnd);
@@ -235,36 +373,18 @@ async function refetchMissingMedia() {
   syncState.isRunning = true;
   const startTime = Date.now();
   let refetched = 0;
-  const CONCURRENCY = 5;
 
   try {
     console.log('[SYNC] Refetching media for alerts with no media...');
-    const alertsWithoutMedia = await db.getAlertsWithoutMedia(200);
+    const alertsWithoutMedia = await db.getAlertsWithoutMedia(100);
+    if (alertsWithoutMedia.length === 0) {
+      console.log('[SYNC] No alerts without media');
+      return { refetched: 0, elapsed: 0 };
+    }
     console.log(`[SYNC] Found ${alertsWithoutMedia.length} alerts without media`);
 
-    const alarmTypeMap = {};
-    for (const a of alertsWithoutMedia) { alarmTypeMap[a.id] = a.alarm_type; }
-
-    for (let i = 0; i < alertsWithoutMedia.length; i += CONCURRENCY) {
-      const batch = alertsWithoutMedia.slice(i, i + CONCURRENCY);
-      const batchResults = await fetchMediaBatch(batch);
-      for (const { alertId, files } of batchResults) {
-        if (files.length === 0) continue;
-        const existingMedia = await db.batchMediaExists(files.map(f => ({ alertId, fileUrl: f.fileUrl })));
-        const newFiles = files.filter(f => !existingMedia[`${alertId}::${f.fileUrl}`]);
-        if (newFiles.length > 0) {
-          await db.batchInsertMedia(newFiles.map(f => ({
-            alertId,
-            fileUrl: f.fileUrl,
-            fileType: f.fileType,
-            fileSize: f.fileSize,
-            deviceName: f.deviceName,
-            alarmType: alarmTypeMap[alertId],
-          })));
-          refetched += newFiles.length;
-        }
-      }
-    }
+    console.log(`[SYNC] Fetching media for ${alertsWithoutMedia.length} alerts via /alarm/file/id...`);
+    refetched = await fetchMediaForAlerts(alertsWithoutMedia, {});
 
     const elapsed = Date.now() - startTime;
     console.log(`[SYNC] Media refetch done: ${refetched} new files (${elapsed}ms)`);
@@ -283,10 +403,14 @@ function getStatus() {
   return { ...rest };
 }
 
-async function startAutoSync(intervalMs = 30000) {
+async function startAutoSync(intervalMs = 60000) {
   await runSync();
-  syncState.syncInterval = setInterval(runSync, intervalMs);
-  console.log(`[SYNC] Auto-sync every ${intervalMs / 1000}s`);
+  await refetchMissingMedia();
+  syncState.syncInterval = setInterval(async () => {
+    await runSync();
+    await refetchMissingMedia();
+  }, intervalMs);
+  console.log(`[SYNC] Auto-sync every ${intervalMs / 1000}s with media refetch`);
 }
 
 function stopAutoSync() {
@@ -301,4 +425,5 @@ module.exports = {
   startAutoSync,
   stopAutoSync,
   getStatus,
+  refetchMissingMedia,
 };

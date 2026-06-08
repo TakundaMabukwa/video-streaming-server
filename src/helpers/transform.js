@@ -32,6 +32,12 @@ function transformDbAlert(record) {
   const id = record.last_alert_id || record.id;
   const deviceId = record.device_id;
 
+  const media = Array.isArray(record.media) ? record.media : [];
+  const screenshotUrls = media
+    .filter((m) => m.file_type === '00' || !m.file_type || m.file_type === '01')
+    .map((m) => m.file_url)
+    .filter(Boolean);
+
   return {
     id,
     alert_type: alarmType,
@@ -56,6 +62,11 @@ function transformDbAlert(record) {
     created_at: record.created_at ? new Date(record.created_at).toISOString() : null,
     last_occurrence: ts ? new Date(ts).toISOString() : null,
     displayTimestamp: ts ? new Date(ts).toISOString() : null,
+    screenshotUrls,
+    media: { screenshots: media
+      .filter((m) => m.file_type === '00' || !m.file_type || m.file_type === '01')
+      .map((m) => ({ url: m.file_url, file_url: m.file_url }))
+    },
     location: {
       latitude: record.lat,
       longitude: record.lon,
