@@ -19,6 +19,30 @@ router.post('/online', getOnlineDevices);
 router.post('/vehicles/streams', getAllVehiclesWithStreams);
 router.post('/debug/vehicle', debugVehicleStreams);
 
+router.post('/replay', async (req, res) => {
+  try {
+    const { deviceId, channelId, startTime, endTime } = req.body;
+    if (!deviceId || !channelId || !startTime || !endTime) {
+      return sendError(res, 'deviceId, channelId, startTime, endTime required', 400);
+    }
+    const replayUrl = await apiClient.makeRequest('/video/history/replay', {
+      deviceId,
+      channelId,
+      playbackType: 0,
+      fastForwardOrBackward: 0,
+      startTime,
+      endTime,
+    });
+    if (replayUrl.code === 0 && replayUrl.data) {
+      sendSuccess(res, { replayUrl: replayUrl.data }, 'Replay URL retrieved');
+    } else {
+      sendError(res, replayUrl.msg || 'No replay available', 404);
+    }
+  } catch (error) {
+    sendError(res, 'Replay failed: ' + error.message, 500);
+  }
+});
+
 router.get('/nodes', async (req, res) => {
   try {
     const nodes = await apiClient.getLiveNodes();

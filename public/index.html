@@ -205,6 +205,7 @@
         <button class="tab-btn" data-tab="streams">Live Streams</button>
         <button class="tab-btn" data-tab="screenshots">Screenshots <span class="count" id="screenshot-count">0</span></button>
         <button class="tab-btn" data-tab="alerts">Alerts <span class="count" id="alert-count">0</span></button>
+        <button class="tab-btn" data-tab="playback">Playback</button>
     </div>
 
     <!-- DASHBOARD -->
@@ -264,12 +265,58 @@
 
     <!-- ALERTS -->
     <div class="tab-panel" id="panel-alerts">
+        ...
+        </div>
+    </div>
+
+    <!-- PLAYBACK -->
+    <div class="tab-panel" id="panel-playback">
         <div class="container">
-            <div class="filter-bar">
-                <select id="alert-type-filter"><option value="">All Types</option></select>
-                <button onclick="loadAlerts(1)">Refresh</button>
-                <span class="total" id="alert-total"></span>
+            <div class="search-section" style="margin-bottom:16px">
+                <div class="form-row" style="grid-template-columns:1fr 1fr">
+                    <div class="form-group">
+                        <label>Vehicle</label>
+                        <select id="playback-vehicle" style="width:100%;padding:8px 12px;background:#0f1419;border:1px solid #2a3a4a;border-radius:6px;color:#e1e8ed;font-size:13px">
+                            <option value="">Select a vehicle...</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Channel</label>
+                        <select id="playback-channel" style="width:100%;padding:8px 12px;background:#0f1419;border:1px solid #2a3a4a;border-radius:6px;color:#e1e8ed;font-size:13px">
+                            <option value="1">Channel 1</option>
+                            <option value="2">Channel 2</option>
+                            <option value="3">Channel 3</option>
+                            <option value="4">Channel 4</option>
+                            <option value="5">Channel 5</option>
+                            <option value="6">Channel 6</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="form-row" style="grid-template-columns:1fr 1fr;margin-top:8px">
+                    <div class="form-group">
+                        <label>Start Time</label>
+                        <input type="datetime-local" id="playback-start" style="width:100%;padding:8px 12px;background:#0f1419;border:1px solid #2a3a4a;border-radius:6px;color:#e1e8ed;font-size:13px">
+                    </div>
+                    <div class="form-group">
+                        <label>End Time</label>
+                        <input type="datetime-local" id="playback-end" style="width:100%;padding:8px 12px;background:#0f1419;border:1px solid #2a3a4a;border-radius:6px;color:#e1e8ed;font-size:13px">
+                    </div>
+                </div>
+                <div style="margin-top:12px;display:flex;gap:8px">
+                    <button id="playback-fetch-btn" class="btn-primary">Get Replay</button>
+                    <button id="playback-set-btn" class="btn-ghost" onclick="stopPlayback()">Stop</button>
+                </div>
             </div>
+
+            <div class="video-section">
+                <h3 id="playback-title">Select a vehicle and time range, then click Get Replay</h3>
+                <div class="video-box" id="playback-video" style="min-height:300px;flex-direction:column;gap:8px">
+                    <div style="font-size:40px">🎬</div>
+                    <div>No replay loaded</div>
+                </div>
+            </div>
+        </div>
+    </div>
             <div id="loading-alerts" class="loading">Loading alerts...</div>
             <div id="error-alerts" class="error" style="display:none"></div>
             <div id="alerts-content" style="display:none">
@@ -1071,6 +1118,106 @@
             btn.disabled = false;
             btn.textContent = 'Save Report & Close Alert';
         }
+
+        // ========== PLAYBACK ==========
+        let playbackVehicles = [];
+        let playbackMediaRecorder = null;
+
+        document.getElementById('playback-fetch-btn').addEventListener('click', fetchReplay);
+        document.getElementById('playback-vehicle').addEventListener('change', function() {
+            const sel = playbackVehicles.find(v => v.deviceId === this.value);
+            if (sel) {
+                document.getElementById('playback-title').textContent = 'Replay — ' + sel.plateName;
+                const now = new Date();
+                const end = now.toISOString().slice(0, 16);
+                const start = new Date(now - 30 * 60 * 1000).toISOString().slice(0, 16);
+                document.getElementById('playback-start').value = start;
+                document.getElementById('playback-end').value = end;
+            }
+        });
+
+        async function loadPlaybackVehicles() {
+            try {
+                const res = await fetch('/api/stream/network');
+                const data = await res.json();
+                if (!data.success) throw new Error(data.message);
+                playbackVehicles = data.data.devices || [];
+                const sel = document.getElementById('playback-vehicle');
+                sel.innerHTML = '<option value="">Select a vehicle...</option>' +
+                    playbackVehicles.map(v => `<option value="${v.deviceId}">${v.plateName} (${v.deviceId})</option>`).join('');
+            } catch (e) {
+                console.error('Failed to load vehicles:', e.message);
+            }
+        }
+
+        async function fetchReplay() {
+            const deviceId = document.getElementById('playback-vehicle').value;
+            const channelId = parseInt(document.getElementById('playback-channel').value) || 1;
+            const startInput = document.getElementById('playback-start').value;
+            const endInput = document.getElementById('playback-end').value;
+
+            if (!deviceId) return alert('Select a vehicle');
+            if (!startInput || !endInput) return alert('Select start and end time');
+
+            const startTime = startInput.replace('T', ' ') + ':00';
+            const endTime = endInput.replace('T', ' ') + ':00';
+
+            const btn = document.getElementById('playback-fetch-btn');
+            btn.disabled = true;
+            btn.textContent = 'Fetching...';
+
+            const videoBox = document.getElementById('playback-video');
+            videoBox.innerHTML = '<div class="loading" style="padding:40px">Fetching replay stream...</div>';
+
+            try {
+                const res = await fetch('/api/stream/replay', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ deviceId, channelId, startTime, endTime })
+                });
+                const result = await res.json();
+                if (!result.success) throw new Error(result.message);
+
+                const replayUrl = result.data.replayUrl;
+                const proxyUrl = '/api/stream/stream/proxy?url=' + encodeURIComponent(replayUrl);
+
+                document.getElementById('playback-title').textContent = 'Replay — ' + startTime + ' to ' + endTime;
+
+                videoBox.innerHTML = `
+                    <video id="replay-player" controls style="width:100%;max-height:500px;background:#000;border-radius:4px">
+                        <source src="${proxyUrl}" type="video/x-flv">
+                        Your browser does not support video playback
+                    </video>
+                    <div style="margin-top:8px;display:flex;gap:8px;align-items:center;width:100%;padding:0 8px">
+                        <span style="font-size:11px;color:#8899aa;word-break:break-all;flex:1">${replayUrl}</span>
+                        <button onclick="copyToClipboard('${replayUrl}')" style="background:#2a3a4a;color:#e1e8ed;padding:6px 12px;border:none;border-radius:4px;cursor:pointer;font-size:11px">Copy URL</button>
+                    </div>
+                `;
+
+                const player = document.getElementById('replay-player');
+                player.play().catch(() => {});
+            } catch (e) {
+                videoBox.innerHTML = '<div style="padding:40px;text-align:center;color:#f87171;font-size:13px">Error: ' + e.message + '</div>';
+            }
+
+            btn.disabled = false;
+            btn.textContent = 'Get Replay';
+        }
+
+        function stopPlayback() {
+            const player = document.getElementById('replay-player');
+            if (player) {
+                player.pause();
+                player.src = '';
+                player.load();
+            }
+            document.getElementById('playback-title').textContent = 'Select a vehicle and time range, then click Get Replay';
+            document.getElementById('playback-video').innerHTML = '<div style="font-size:40px">🎬</div><div>No replay loaded</div>';
+        }
+
+        // Load playback vehicles when tab is activated
+        document.querySelector('[data-tab="playback"]').addEventListener('click', function() {
+            if (playbackVehicles.length === 0) loadPlaybackVehicles();
+        });
     </script>
 </body>
 </html>
