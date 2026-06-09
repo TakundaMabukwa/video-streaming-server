@@ -127,24 +127,13 @@ async function getAlertById(req, res) {
         return res.status(404).json({ success: false, message: `Alert ${id} not found` });
       }
       alert.media = alert.media || [];
-      // If individual alert has no media, try finding the group by device+type
-      if ((!alert.media || alert.media.length === 0) && alert.device_id && alert.alarm_type) {
-        const groupKey = `${alert.device_id}:${alert.alarm_type}`.toLowerCase();
-        const group = await db.getAlertGroupByKey(groupKey);
-        if (group) {
-          const groupMedia = await db.getMediaForAlert(group.last_alert_id);
-          if (groupMedia && groupMedia.length > 0) {
-            alert.media = groupMedia;
-          }
-        }
-      }
     } else {
       const media = await db.getMediaForAlert(alert.last_alert_id);
       alert.media = media || [];
     }
 
-    // On-demand media fetch if none exists
-    if ((!alert.media || alert.media.length === 0) && ensureMedia) {
+    // On-demand media fetch for the specific alert if none exists (match timestamps)
+    if (!alert.media || alert.media.length === 0) {
       const dbAlert = await db.query('SELECT * FROM alerts WHERE id = $1', [id]);
       if (dbAlert.rows.length > 0) {
         const newMedia = await syncService.fetchMediaOnDemand(dbAlert.rows[0]);
@@ -190,9 +179,18 @@ async function getAlertScreenshots(req, res) {
     let group = await db.getAlertGroupByAlertId(id);
     const alertId = group ? group.last_alert_id : id;
 
-    const alert = await db.getAlertWithMedia(alertId);
+    let alert = await db.getAlertWithMedia(alertId);
     if (!alert) {
       return res.json({ success: true, screenshots: [], count: 0, source: 'eps-db' });
+    }
+
+    // On-demand media fetch for the specific alert if none exists (match timestamps)
+    if (!alert.media || alert.media.length === 0) {
+      const dbAlert = await db.query('SELECT * FROM alerts WHERE id = $1', [alertId]);
+      if (dbAlert.rows.length > 0) {
+        const newMedia = await syncService.fetchMediaOnDemand(dbAlert.rows[0]);
+        alert.media = newMedia;
+      }
     }
 
     const screenshots = (alert.media || []).map((m, i) => ({
@@ -214,7 +212,6 @@ async function getAlertScreenshots(req, res) {
 async function getAlertMedia(req, res) {
   try {
     const { id } = req.params;
-    const ensureMedia = req.query.ensureMedia === 'true';
     if (!id) return sendError(res, 'Alert ID required', 400);
 
     // Try group lookup, fall back to individual alert
@@ -226,8 +223,8 @@ async function getAlertMedia(req, res) {
       return res.json({ success: true, alert: null, screenshots: [], videos: [], captures: [], clipUrls: {}, source: 'eps-db' });
     }
 
-    // On-demand media fetch if none exists
-    if ((!alert.media || alert.media.length === 0) && ensureMedia) {
+    // On-demand media fetch for the specific alert if none exists (match timestamps)
+    if (!alert.media || alert.media.length === 0) {
       const dbAlert = await db.query('SELECT * FROM alerts WHERE id = $1', [alertId]);
       if (dbAlert.rows.length > 0) {
         const newMedia = await syncService.fetchMediaOnDemand(dbAlert.rows[0]);
