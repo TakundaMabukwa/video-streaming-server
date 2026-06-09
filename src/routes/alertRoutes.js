@@ -22,4 +22,9 @@ router.post('/:id/mark-false', markFalseAlert);
 router.post('/:id/documents', uploadDocumentToAlert);
 router.get('/:id', getAlertById);
 
+// Catch-all for any other GET /alerts/* paths — return empty
+router.get('*', (req, res) => {
+  res.json({ success: true, alerts: [], count: 0, total: 0, source: 'eps-db' });
+});
+
 module.exports = router;

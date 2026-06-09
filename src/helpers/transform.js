@@ -13,7 +13,7 @@ const PRIORITY_MAP = {
   overtime: 'low',
   speed: 'high',
   powerCut: 'medium',
-  occlusion: 'low',
+  occlusion: 'critical',
   sos: 'critical',
 };
 

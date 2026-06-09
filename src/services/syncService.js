@@ -200,6 +200,59 @@ async function fetchMediaForAlerts(records, alarmTypeMap) {
   return mediaCount;
 }
 
+async function fetchMediaOnDemand(alertRecord) {
+  const alertId = alertRecord.id || alertRecord.alert_id;
+  const alarmType = alertRecord.alarmType || alertRecord.alarm_type;
+  const ts = alertRecord.alarmTs || alertRecord.alarm_ts;
+  const rawEnd = alertRecord.alarmTsEnd || alertRecord.alarm_ts_end || ts;
+  const devId = alertRecord.deviceId || alertRecord.device_id;
+  const devName = alertRecord.deviceName || alertRecord.device_name || '';
+
+  const files = await fetchMediaForAlarm(alertId);
+  let storedCount = 0;
+
+  if (files.length > 0) {
+    const existingMedia = await db.batchMediaExists(files.map(f => ({ alertId, fileUrl: f.fileUrl })));
+    const newFiles = files.filter(f => !existingMedia[`${alertId}::${f.fileUrl}`]);
+    if (newFiles.length > 0) {
+      await db.batchInsertMedia(newFiles.map(f => ({
+        alertId,
+        fileUrl: f.fileUrl,
+        fileType: f.fileType,
+        fileSize: f.fileSize,
+        deviceName: f.deviceName,
+        alarmType,
+      })));
+      storedCount += newFiles.length;
+    }
+  }
+
+  const hasVideo = files.some(f => f.fileType === '02');
+  if (!hasVideo && ts && devId) {
+    const tsDate = new Date(ts);
+    const rawEndDate = new Date(rawEnd);
+    const minEnd = new Date(tsDate.getTime() + 15 * 1000);
+    const tsEnd = rawEndDate > minEnd ? rawEndDate : minEnd;
+    const replayUrl = await fetchReplayUrl(devId, 1, ts, tsEnd.toISOString().replace('T', ' ').slice(0, 19));
+    if (replayUrl) {
+      await db.batchInsertMedia([{
+        alertId,
+        fileUrl: replayUrl,
+        fileType: '02',
+        fileSize: 0,
+        deviceName: devName,
+        alarmType,
+      }]);
+      storedCount++;
+    }
+  }
+
+  if (storedCount > 0) {
+    console.log(`[MEDIA] On-demand: ${storedCount} files for alert ${alertId}`);
+  }
+  return db.getMediaForAlert(alertId);
+}
+
 async function fetchReplayUrl(deviceId, channelId, startTime, endTime) {
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
@@ -313,8 +366,16 @@ async function syncAlerts(deviceIds, startTime, endTime) {
 
   let mediaCount = 0;
   if (allNewRecords.length > 0) {
-    console.log(`[SYNC] Fetching media for ${allNewRecords.length} alerts via /alarm/file/id...`);
-    mediaCount = await fetchMediaForAlerts(allNewRecords, {});
+    const groupMap = {};
+    for (const r of allNewRecords) {
+      const key = `${r.deviceId}:${r.alarmType}`.toLowerCase();
+      if (!groupMap[key] || new Date(r.alarmTs || 0) > new Date(groupMap[key].alarmTs || 0)) {
+        groupMap[key] = r;
+      }
+    }
+    const latestPerGroup = Object.values(groupMap);
+    console.log(`[SYNC] ${allNewRecords.length} new alerts across ${latestPerGroup.length} groups — fetching media per group`);
+    mediaCount = await fetchMediaForAlerts(latestPerGroup, {});
     console.log(`[SYNC] Media fetch done: ${mediaCount} files`);
   }
 
@@ -430,4 +491,5 @@ module.exports = {
   stopAutoSync,
   getStatus,
   refetchMissingMedia,
+  fetchMediaOnDemand,
 };

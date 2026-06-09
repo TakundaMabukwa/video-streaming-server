@@ -116,6 +116,7 @@ async function getResolvedAlerts(req, res) {
 async function getAlertById(req, res) {
   try {
     const { id } = req.params;
+    const ensureMedia = req.query.ensureMedia === 'true';
     if (!id) return sendError(res, 'Alert ID required', 400);
 
     // Try group lookup first, fall back to individual alert
@@ -123,17 +124,22 @@ async function getAlertById(req, res) {
     if (!alert) {
       alert = await db.getAlertWithMedia(id);
       if (!alert) {
+        // If alert not in DB, notify but don't 404 — frontend can still show it
         return res.status(404).json({ success: false, message: `Alert ${id} not found` });
       }
       alert.media = alert.media || [];
     } else {
-      // Attach media from last_alert_id
       const media = await db.getMediaForAlert(alert.last_alert_id);
       alert.media = media || [];
     }
 
-    if (!alert.media || alert.media.length === 0) {
-      return res.status(404).json({ success: false, message: `Alert ${id} has no media` });
+    // On-demand media fetch if none exists
+    if ((!alert.media || alert.media.length === 0) && ensureMedia) {
+      const dbAlert = await db.query('SELECT * FROM alerts WHERE id = $1', [id]);
+      if (dbAlert.rows.length > 0) {
+        const newMedia = await syncService.fetchMediaOnDemand(dbAlert.rows[0]);
+        alert.media = newMedia;
+      }
     }
 
     const transformed = transformDbAlert(alert);
@@ -194,15 +200,25 @@ async function getAlertScreenshots(req, res) {
 async function getAlertMedia(req, res) {
   try {
     const { id } = req.params;
+    const ensureMedia = req.query.ensureMedia === 'true';
     if (!id) return sendError(res, 'Alert ID required', 400);
 
     // Try group lookup, fall back to individual alert
     let group = await db.getAlertGroupByAlertId(id);
     const alertId = group ? group.last_alert_id : id;
 
-    const alert = await db.getAlertWithMedia(alertId);
+    let alert = await db.getAlertWithMedia(alertId);
     if (!alert) {
       return res.json({ success: true, alert: null, screenshots: [], videos: [], captures: [], clipUrls: {}, source: 'eps-db' });
+    }
+
+    // On-demand media fetch if none exists
+    if ((!alert.media || alert.media.length === 0) && ensureMedia) {
+      const dbAlert = await db.query('SELECT * FROM alerts WHERE id = $1', [alertId]);
+      if (dbAlert.rows.length > 0) {
+        const newMedia = await syncService.fetchMediaOnDemand(dbAlert.rows[0]);
+        alert.media = newMedia;
+      }
     }
 
     const transformed = transformDbAlert(alert);

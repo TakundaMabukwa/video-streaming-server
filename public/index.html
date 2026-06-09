@@ -699,9 +699,9 @@
             const targets = [];
             for (const v of online) {
                 if (!v.deviceId) continue;
-                targets.push({ deviceId: v.deviceId, channelId: 1 });
-                if ((v.cameras || 2) >= 2) {
-                    targets.push({ deviceId: v.deviceId, channelId: 2 });
+                const cams = v.cameras || 1;
+                for (let c = 1; c <= cams; c++) {
+                    targets.push({ deviceId: v.deviceId, channelId: c });
                 }
             }
             if (targets.length === 0) return;
@@ -737,10 +737,13 @@
             }
             grid.innerHTML = filtered.map(v => {
                 const dev = byDevice[v.deviceId] || {};
-                const ch1 = dev[1];
-                const ch2 = dev[2];
+                const cams = v.cameras || 1;
+                const chs = [];
+                for (let c = 1; c <= cams; c++) {
+                    chs.push(renderCh(v.deviceId, dev[c], 'CH ' + c, v.online));
+                }
                 const online = v.online;
-                const hasAny = ch1 || ch2;
+                const hasAny = dev[1] || dev[2];
                 const statusColor = online ? '#22c55e' : '#6b7280';
                 const statusLabel = online ? (hasAny ? '● Live' : '● Online') : '○ Offline';
                 return `
@@ -749,9 +752,8 @@
                             <span class="plate" style="font-size:13px;font-weight:600;color:#fff">${v.plateName || v.deviceId}</span>
                             <span class="vstatus${online ? '' : ' idle'}" style="font-size:10px;color:${statusColor};margin-left:auto">${statusLabel}</span>
                         </div>
-                    <div class="ch-grid">
-                                        ${renderCh(v.deviceId, dev[1], 'CH 1', v.online)}
-                                        ${renderCh(v.deviceId, dev[2], 'CH 2', v.online)}
+                    <div class="ch-grid" style="grid-template-columns:repeat(${Math.min(cams, 2)}, 1fr)">
+                                        ${chs.join('')}
                                     </div>
                     </div>
                 `;
