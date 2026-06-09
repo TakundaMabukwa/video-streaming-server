@@ -142,18 +142,18 @@ async function getAlertById(req, res) {
 
     const transformed = transformDbAlert(alert);
     transformed.count = alert.count || 1;
-    transformed.screenshots = (alert.media || []).map((m, i) => ({
-      id: m.id || `media-${i}`,
-      url: m.file_url,
-      storage_url: m.file_url,
-      timestamp: m.created_at || m.alarm_time,
-      type: (m.file_type === '00' || !m.file_type || m.file_type === '01') ? 'image' : 'video',
-      file_type: m.file_type,
-      channel: m.channel_id || m.channel || null,
-    }));
+    const media = alert.media || [];
+    transformed.screenshots = media
+      .filter((m) => m.file_type === '00' || !m.file_type || m.file_type === '01')
+      .map((m, i) => ({
+        id: m.id || `media-${i}`,
+        url: m.file_url,
+        storage_url: m.file_url,
+        timestamp: m.created_at || m.alarm_time,
+      }));
     transformed.videos = [];
 
-    const entries = (alert.media || [])
+    const entries = media
       .filter((m) => m.file_type === '02')
       .map((m) => ({
         id: m.id,
@@ -183,15 +183,14 @@ async function getAlertScreenshots(req, res) {
       return res.json({ success: true, screenshots: [], count: 0, source: 'eps-db' });
     }
 
-    const screenshots = (alert.media || []).map((m, i) => ({
-      id: m.id || `shot-${i}`,
-      url: m.file_url,
-      storage_url: m.file_url,
-      timestamp: m.created_at || m.alarm_time,
-      type: (m.file_type === '00' || !m.file_type || m.file_type === '01') ? 'image' : 'video',
-      file_type: m.file_type,
-      channel: m.channel_id || m.channel || null,
-    }));
+    const screenshots = (alert.media || [])
+      .filter((m) => m.file_type === '00' || !m.file_type || m.file_type === '01')
+      .map((m, i) => ({
+        id: m.id || `shot-${i}`,
+        url: m.file_url,
+        storage_url: m.file_url,
+        timestamp: m.created_at || m.alarm_time,
+      }));
 
     res.json({ success: true, screenshots, count: screenshots.length, source: 'eps-db' });
   } catch (error) {

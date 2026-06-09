@@ -33,19 +33,15 @@ function transformDbAlert(record) {
   const deviceId = record.device_id;
 
   const media = Array.isArray(record.media) ? record.media : [];
-  const screenshotUrls = media
+  const screenshotEntries = media
     .filter((m) => m.file_type === '00' || !m.file_type || m.file_type === '01')
-    .map((m) => m.file_url)
-    .filter(Boolean);
+    .map((m) => ({
+      url: m.file_url,
+      file_url: m.file_url,
+      timestamp: m.created_at || m.alarm_time,
+    }));
 
-  const screenshots = media.map((m) => ({
-    url: m.file_url,
-    file_url: m.file_url,
-    timestamp: m.created_at || m.alarm_time,
-    type: (m.file_type === '00' || !m.file_type || m.file_type === '01') ? 'image' : 'video',
-    file_type: m.file_type,
-    channel: m.channel_id || m.channel || null,
-  }));
+  const screenshotUrls = screenshotEntries.map((m) => m.url).filter(Boolean);
 
   return {
     id,
@@ -72,7 +68,7 @@ function transformDbAlert(record) {
     last_occurrence: ts ? new Date(ts).toISOString() : null,
     displayTimestamp: ts ? new Date(ts).toISOString() : null,
     screenshotUrls,
-    media: { screenshots },
+    media: { screenshots: screenshotEntries },
     location: {
       latitude: record.lat,
       longitude: record.lon,
