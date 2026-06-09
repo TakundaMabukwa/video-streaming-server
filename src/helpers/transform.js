@@ -38,6 +38,15 @@ function transformDbAlert(record) {
     .map((m) => m.file_url)
     .filter(Boolean);
 
+  const screenshots = media.map((m) => ({
+    url: m.file_url,
+    file_url: m.file_url,
+    timestamp: m.created_at || m.alarm_time,
+    type: (m.file_type === '00' || !m.file_type || m.file_type === '01') ? 'image' : 'video',
+    file_type: m.file_type,
+    channel: m.channel_id || m.channel || null,
+  }));
+
   return {
     id,
     alert_type: alarmType,
@@ -63,10 +72,7 @@ function transformDbAlert(record) {
     last_occurrence: ts ? new Date(ts).toISOString() : null,
     displayTimestamp: ts ? new Date(ts).toISOString() : null,
     screenshotUrls,
-    media: { screenshots: media
-      .filter((m) => m.file_type === '00' || !m.file_type || m.file_type === '01')
-      .map((m) => ({ url: m.file_url, file_url: m.file_url }))
-    },
+    media: { screenshots },
     location: {
       latitude: record.lat,
       longitude: record.lon,
