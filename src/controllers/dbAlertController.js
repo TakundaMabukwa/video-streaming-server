@@ -126,15 +126,13 @@ async function getAlertById(req, res) {
         return res.status(404).json({ success: false, message: `Alert ${id} not found` });
       }
       alert.media = alert.media || [];
-      // If individual alert has no media, fall back to group media (from latest alert in group)
-      if ((!alert.media || alert.media.length === 0) && alert.device_id && alert.alarm_type) {
-        const groupKey = `${alert.device_id}:${alert.alarm_type}`.toLowerCase();
-        const group = await db.getAlertGroupByKey(groupKey);
-        if (group) {
-          const groupMedia = await db.getMediaForAlert(group.last_alert_id);
-          if (groupMedia && groupMedia.length > 0) {
-            alert.media = groupMedia;
-          }
+      // If individual alert has no media, fetch on-demand for this specific alert ID
+      if (!alert.media || alert.media.length === 0) {
+        const dbAlert = await db.query('SELECT * FROM alerts WHERE id = $1', [id]);
+        if (dbAlert.rows.length > 0) {
+          console.log(`[ALERT] On-demand media fetch for alert ${id}`);
+          const newMedia = await syncService.fetchMediaOnDemand(dbAlert.rows[0]);
+          alert.media = newMedia;
         }
       }
     } else {
