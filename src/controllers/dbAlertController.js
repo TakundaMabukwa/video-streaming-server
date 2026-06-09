@@ -124,10 +124,20 @@ async function getAlertById(req, res) {
     if (!alert) {
       alert = await db.getAlertWithMedia(id);
       if (!alert) {
-        // If alert not in DB, notify but don't 404 — frontend can still show it
         return res.status(404).json({ success: false, message: `Alert ${id} not found` });
       }
       alert.media = alert.media || [];
+      // If individual alert has no media, try finding the group by device+type
+      if ((!alert.media || alert.media.length === 0) && alert.device_id && alert.alarm_type) {
+        const groupKey = `${alert.device_id}:${alert.alarm_type}`.toLowerCase();
+        const group = await db.getAlertGroupByKey(groupKey);
+        if (group) {
+          const groupMedia = await db.getMediaForAlert(group.last_alert_id);
+          if (groupMedia && groupMedia.length > 0) {
+            alert.media = groupMedia;
+          }
+        }
+      }
     } else {
       const media = await db.getMediaForAlert(alert.last_alert_id);
       alert.media = media || [];
