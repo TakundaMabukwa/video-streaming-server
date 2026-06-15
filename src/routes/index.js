@@ -6,6 +6,7 @@ const alertRoutes = require('./alertRoutes');
 const dbAlertRoutes = require('./dbAlertRoutes');
 const syncRoutes = require('./syncRoutes');
 const galleryRoutes = require('./galleryRoutes');
+const playbackRoutes = require('./playbackRoutes');
 
 const router = express.Router();
 
@@ -16,5 +17,6 @@ router.use('/alerts', alertRoutes);
 router.use('/db/alerts', dbAlertRoutes);
 router.use('/sync', syncRoutes);
 router.use('/gallery', galleryRoutes);
+router.use('/playback', playbackRoutes);
 
 module.exports = router;
