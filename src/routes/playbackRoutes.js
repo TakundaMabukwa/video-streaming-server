@@ -127,18 +127,9 @@ router.get('/flv-proxy', async (req, res) => {
 
 router.get('/download-mp4', async (req, res) => {
   try {
-    const { url } = req.query;
+    const { url, duration } = req.query;
     if (!url) return sendError(res, 'url query parameter required', 400);
-
-    const response = await axios.get(url, {
-      responseType: 'stream',
-      timeout: 60000,
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-    });
-
-    if (response.status < 200 || response.status >= 300) {
-      return sendError(res, 'Upstream returned ' + response.status, 502);
-    }
+    const maxDuration = Math.min(Number(duration) || 300, 600);
 
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('Cache-Control', 'no-cache');
@@ -146,7 +137,9 @@ router.get('/download-mp4', async (req, res) => {
     res.setHeader('Content-Disposition', `attachment; filename="video-${Date.now()}.mp4"`);
 
     const ffmpeg = spawn('ffmpeg', [
-      '-i', 'pipe:0',
+      '-headers', 'User-Agent: Mozilla/5.0\r\n',
+      '-i', url,
+      '-t', String(maxDuration),
       '-c:v', 'copy',
       '-c:a', 'copy',
       '-movflags', 'faststart',
@@ -154,15 +147,10 @@ router.get('/download-mp4', async (req, res) => {
       'pipe:1',
     ]);
 
-    response.data.pipe(ffmpeg.stdin);
     ffmpeg.stdout.pipe(res);
 
-    ffmpeg.stderr.on('data', () => {});
-
-    response.data.on('error', () => {
-      ffmpeg.kill();
-      if (!res.destroyed) res.end();
-    });
+    let ffmpegError = '';
+    ffmpeg.stderr.on('data', (chunk) => { ffmpegError += chunk.toString(); });
 
     ffmpeg.on('error', () => {
       if (!res.headersSent) {
@@ -170,13 +158,15 @@ router.get('/download-mp4', async (req, res) => {
       }
     });
 
-    ffmpeg.on('close', () => {
+    ffmpeg.on('close', (code) => {
       if (!res.destroyed) res.end();
+      if (code !== 0 && code !== null) {
+        console.error('[download-mp4] ffmpeg exited code', code, ffmpegError.slice(-200));
+      }
     });
 
     res.on('close', () => {
       ffmpeg.kill();
-      response.data.destroy();
     });
   } catch (error) {
     if (!res.headersSent) {
