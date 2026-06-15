@@ -1,5 +1,6 @@
 const express = require('express');
 const axios = require('axios');
+const { spawn } = require('child_process');
 const apiClient = require('../helpers/apiClient');
 const { sendSuccess, sendError } = require('../helpers/response');
 
@@ -120,6 +121,66 @@ router.get('/flv-proxy', async (req, res) => {
   } catch (error) {
     if (!res.headersSent) {
       sendError(res, 'FLV proxy failed: ' + error.message, 500);
+    }
+  }
+});
+
+router.get('/download-mp4', async (req, res) => {
+  try {
+    const { url } = req.query;
+    if (!url) return sendError(res, 'url query parameter required', 400);
+
+    const response = await axios.get(url, {
+      responseType: 'stream',
+      timeout: 60000,
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+    });
+
+    if (response.status < 200 || response.status >= 300) {
+      return sendError(res, 'Upstream returned ' + response.status, 502);
+    }
+
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Content-Disposition', `attachment; filename="video-${Date.now()}.mp4"`);
+
+    const ffmpeg = spawn('ffmpeg', [
+      '-i', 'pipe:0',
+      '-c:v', 'copy',
+      '-c:a', 'copy',
+      '-movflags', 'faststart',
+      '-f', 'mp4',
+      'pipe:1',
+    ]);
+
+    response.data.pipe(ffmpeg.stdin);
+    ffmpeg.stdout.pipe(res);
+
+    ffmpeg.stderr.on('data', () => {});
+
+    response.data.on('error', () => {
+      ffmpeg.kill();
+      if (!res.destroyed) res.end();
+    });
+
+    ffmpeg.on('error', () => {
+      if (!res.headersSent) {
+        sendError(res, 'ffmpeg not available', 500);
+      }
+    });
+
+    ffmpeg.on('close', () => {
+      if (!res.destroyed) res.end();
+    });
+
+    res.on('close', () => {
+      ffmpeg.kill();
+      response.data.destroy();
+    });
+  } catch (error) {
+    if (!res.headersSent) {
+      sendError(res, 'MP4 download failed: ' + error.message, 500);
     }
   }
 });
