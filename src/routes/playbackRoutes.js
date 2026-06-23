@@ -131,14 +131,24 @@ router.get('/download-mp4', async (req, res) => {
     if (!url) return sendError(res, 'url query parameter required', 400);
     const maxDuration = Math.min(Number(duration) || 300, 600);
 
+    const response = await axios.get(url, {
+      responseType: 'stream',
+      timeout: 30000,
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+    });
+
+    if (response.status < 200 || response.status >= 300) {
+      return sendError(res, 'Upstream returned ' + response.status, 502);
+    }
+
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Content-Disposition', `attachment; filename="video-${Date.now()}.mp4"`);
 
     const ffmpeg = spawn('ffmpeg', [
-      '-headers', 'User-Agent: Mozilla/5.0\r\n',
-      '-i', url,
+      '-f', 'flv',
+      '-i', 'pipe:0',
       '-t', String(maxDuration),
       '-c:v', 'copy',
       '-c:a', 'copy',
@@ -147,10 +157,16 @@ router.get('/download-mp4', async (req, res) => {
       'pipe:1',
     ]);
 
+    response.data.pipe(ffmpeg.stdin);
     ffmpeg.stdout.pipe(res);
 
     let ffmpegError = '';
     ffmpeg.stderr.on('data', (chunk) => { ffmpegError += chunk.toString(); });
+
+    response.data.on('error', () => {
+      ffmpeg.kill();
+      if (!res.destroyed) res.end();
+    });
 
     ffmpeg.on('error', () => {
       if (!res.headersSent) {
@@ -167,6 +183,7 @@ router.get('/download-mp4', async (req, res) => {
 
     res.on('close', () => {
       ffmpeg.kill();
+      response.data.destroy();
     });
   } catch (error) {
     if (!res.headersSent) {
