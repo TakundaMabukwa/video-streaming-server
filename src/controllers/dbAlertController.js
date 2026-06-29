@@ -252,9 +252,10 @@ async function getAlertMedia(req, res) {
     const transformed = transformDbAlert(alert);
     if (group) transformed.count = group.count;
 
+    const baseUrl = `${req.protocol}://${req.get('host')}`;
     const screenshots = finalImages.map((m, i) => ({
       id: m.id || `shot-${i}`,
-      url: m.file_url,
+      url: m.file_url ? `${baseUrl}/api/playback/image-proxy?url=${encodeURIComponent(m.file_url)}` : null,
       storage_url: m.file_url,
       timestamp: m.created_at || m.alarm_time,
     }));
