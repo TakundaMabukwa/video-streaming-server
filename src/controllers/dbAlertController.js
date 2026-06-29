@@ -260,15 +260,25 @@ async function getAlertMedia(req, res) {
       timestamp: m.created_at || m.alarm_time,
     }));
 
-    const entries = finalVideoFiles.map((m) => ({
-      id: m.id,
-      label: 'Alert Media',
-      url: m.file_url,
-      fileUrl: m.file_url,
-      fileType: m.file_type || '02',
-      isFlv: true,
-      timestamp: m.created_at || m.alarm_time,
-    }));
+    const entries = finalVideoFiles.map((m) => {
+      const mp4Url = m.file_url
+        ? `${baseUrl}/api/playback/stream-mp4?url=${encodeURIComponent(m.file_url)}`
+        : null;
+      const flvProxyUrl = m.file_url
+        ? `${baseUrl}/api/playback/flv-proxy?url=${encodeURIComponent(m.file_url)}`
+        : null;
+      return {
+        id: m.id,
+        label: 'Alert Media',
+        url: mp4Url || m.file_url,
+        mp4Url,
+        flvProxyUrl,
+        fileUrl: m.file_url,
+        fileType: m.file_type || '02',
+        isFlv: false,
+        timestamp: m.created_at || m.alarm_time,
+      };
+    });
 
     const primaryUrl = entries[0]?.url || '';
 

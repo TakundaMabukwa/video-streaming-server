@@ -128,6 +128,73 @@ router.get('/flv-proxy', async (req, res) => {
   }
 });
 
+router.get('/stream-mp4', async (req, res) => {
+  const tmpFile = path.join(os.tmpdir(), `stream-${Date.now()}.flv`);
+  try {
+    const { url } = req.query;
+    if (!url) return sendError(res, 'url query parameter required', 400);
+
+    console.log('[stream-mp4] Downloading FLV from', url.slice(0, 80));
+
+    const response = await axios.get(url, {
+      responseType: 'stream',
+      timeout: 60000,
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+    });
+
+    if (response.status < 200 || response.status >= 300) {
+      return sendError(res, 'Upstream returned ' + response.status, 502);
+    }
+
+    const writer = fs.createWriteStream(tmpFile);
+    await new Promise((resolve, reject) => {
+      response.data.pipe(writer);
+      writer.on('finish', resolve);
+      writer.on('error', reject);
+      response.data.on('error', reject);
+    });
+
+    const flvSize = fs.statSync(tmpFile).size;
+    console.log('[stream-mp4] FLV downloaded:', flvSize, 'bytes');
+
+    if (flvSize === 0) {
+      return sendError(res, 'Empty FLV stream', 502);
+    }
+
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Transfer-Encoding', 'chunked');
+
+    const ffmpeg = spawn('ffmpeg', [
+      '-re',
+      '-i', tmpFile,
+      '-c:v', 'copy',
+      '-c:a', 'copy',
+      '-movflags', 'frag_keyframe+empty_moov',
+      '-f', 'mp4',
+      'pipe:1',
+    ]);
+
+    ffmpeg.stdout.pipe(res);
+    ffmpeg.stderr.on('data', () => {});
+
+    ffmpeg.on('error', () => { if (!res.destroyed) res.end(); });
+    ffmpeg.on('close', () => { fs.unlink(tmpFile, () => {}); });
+
+    res.on('close', () => {
+      ffmpeg.kill('SIGTERM');
+      fs.unlink(tmpFile, () => {});
+    });
+  } catch (error) {
+    fs.unlink(tmpFile, () => {});
+    if (!res.headersSent) {
+      console.error('[stream-mp4] Error:', error.message);
+      sendError(res, 'Stream MP4 failed: ' + error.message, 500);
+    }
+  }
+});
+
 router.get('/image-proxy', async (req, res) => {
   try {
     const { url } = req.query;
