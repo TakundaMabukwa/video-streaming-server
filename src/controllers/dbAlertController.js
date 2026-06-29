@@ -252,30 +252,25 @@ async function getAlertMedia(req, res) {
     const transformed = transformDbAlert(alert);
     if (group) transformed.count = group.count;
 
-    const baseUrl = `${req.protocol}://${req.get('host')}`;
     const screenshots = finalImages.map((m, i) => ({
       id: m.id || `shot-${i}`,
-      url: m.file_url ? `${baseUrl}/api/playback/image-proxy?url=${encodeURIComponent(m.file_url)}` : null,
+      url: m.file_url ? `/api/video-server/playback/image-proxy?url=${encodeURIComponent(m.file_url)}` : null,
       storage_url: m.file_url,
       timestamp: m.created_at || m.alarm_time,
     }));
 
     const entries = finalVideoFiles.map((m) => {
-      const mp4Url = m.file_url
-        ? `${baseUrl}/api/playback/stream-mp4?url=${encodeURIComponent(m.file_url)}`
-        : null;
       const flvProxyUrl = m.file_url
-        ? `${baseUrl}/api/playback/flv-proxy?url=${encodeURIComponent(m.file_url)}`
+        ? `/api/video-server/playback/flv-proxy?url=${encodeURIComponent(m.file_url)}`
         : null;
       return {
         id: m.id,
         label: 'Alert Media',
-        url: mp4Url || m.file_url,
-        mp4Url,
+        url: flvProxyUrl || m.file_url,
         flvProxyUrl,
         fileUrl: m.file_url,
         fileType: m.file_type || '02',
-        isFlv: false,
+        isFlv: true,
         timestamp: m.created_at || m.alarm_time,
       };
     });
