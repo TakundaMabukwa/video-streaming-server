@@ -201,6 +201,7 @@ async function getAlertScreenshots(req, res) {
 async function getAlertMedia(req, res) {
   try {
     const { id } = req.params;
+    const ensureMedia = req.query.ensureMedia === 'true';
     if (!id) return sendError(res, 'Alert ID required', 400);
 
     // Try group lookup, fall back to individual alert
@@ -209,23 +210,56 @@ async function getAlertMedia(req, res) {
 
     let alert = await db.getAlertWithMedia(alertId);
     if (!alert) {
-      return res.json({ success: true, alert: null, screenshots: [], videos: [], captures: [], clipUrls: {}, source: 'eps-db' });
+      // If ensureMedia, try to fetch on-demand even if alert not in DB yet
+      if (ensureMedia) {
+        const dbAlert = await db.query('SELECT * FROM alerts WHERE id = $1', [id]);
+        if (dbAlert.rows.length > 0) {
+          console.log(`[ALERT] On-demand media fetch (ensureMedia) for alert ${id}`);
+          const newMedia = await syncService.fetchMediaOnDemand(dbAlert.rows[0]);
+          alert = { ...dbAlert.rows[0], media: newMedia };
+        }
+      }
+      if (!alert) {
+        return res.json({ success: true, alert: null, screenshots: [], videos: [], captures: [], clipUrls: {}, source: 'eps-db' });
+      }
     }
 
-    const transformed = transformDbAlert(alert);
-    if (group) transformed.count = group.count;
     const media = alert.media || [];
     const images = media.filter((m) => m.file_type === '00' || !m.file_type || m.file_type === '01');
     const videoFiles = media.filter((m) => m.file_type === '02');
 
-    const screenshots = images.map((m, i) => ({
+    // If ensureMedia and no media found, fetch on-demand
+    if (ensureMedia && media.length === 0) {
+      let rawAlert = null;
+      if (group) {
+        rawAlert = await db.query('SELECT * FROM alerts WHERE id = $1', [alert.last_alert_id || id]);
+      } else {
+        rawAlert = await db.query('SELECT * FROM alerts WHERE id = $1', [id]);
+      }
+      if (rawAlert && rawAlert.rows.length > 0) {
+        console.log(`[ALERT] On-demand media fetch (ensureMedia, empty) for alert ${id}`);
+        const newMedia = await syncService.fetchMediaOnDemand(rawAlert.rows[0]);
+        if (newMedia.length > 0) {
+          alert.media = newMedia;
+        }
+      }
+    }
+
+    const finalMedia = alert.media || [];
+    const finalImages = finalMedia.filter((m) => m.file_type === '00' || !m.file_type || m.file_type === '01');
+    const finalVideoFiles = finalMedia.filter((m) => m.file_type === '02');
+
+    const transformed = transformDbAlert(alert);
+    if (group) transformed.count = group.count;
+
+    const screenshots = finalImages.map((m, i) => ({
       id: m.id || `shot-${i}`,
       url: m.file_url,
       storage_url: m.file_url,
       timestamp: m.created_at || m.alarm_time,
     }));
 
-    const entries = videoFiles.map((m) => ({
+    const entries = finalVideoFiles.map((m) => ({
       id: m.id,
       label: 'Alert Media',
       url: m.file_url,
