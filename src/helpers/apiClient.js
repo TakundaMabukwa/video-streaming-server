@@ -32,7 +32,7 @@ class ApiClient {
     }
   }
 
-  async makeRequest(endpoint, data = {}) {
+  async makeRequest(endpoint, data = {}, timeout = 20000) {
     const token = await this.getToken();
     
     try {
@@ -41,7 +41,7 @@ class ApiClient {
           'Authorization': token,
           'Content-Type': 'application/json'
         },
-        timeout: 20000
+        timeout
       });
       return response.data;
     } catch (error) {
@@ -63,20 +63,29 @@ class ApiClient {
   }
 
   async tryNodesForStream(deviceId, channelId, bitstreamType = 1) {
-    // First try without nodeValue (API uses default when omitted)
-    let body = { deviceId, channelId, bitstreamType };
-    let result = await this.makeRequest('/video/live', body);
-    if (result.code === 0 && result.data) return result;
+    let lastResult = null;
 
-    // Default failed — try each available node
+    const tryOnce = async (body) => {
+      try {
+        const result = await this.makeRequest('/video/live', body, 10000);
+        if (result.code === 0 && result.data) return result;
+        lastResult = result;
+      } catch {
+        lastResult = lastResult || { code: -1, msg: 'Request failed' };
+      }
+      return null;
+    };
+
+    let result = await tryOnce({ deviceId, channelId, bitstreamType });
+    if (result) return result;
+
     const nodes = await this.getLiveNodes();
     for (const node of nodes) {
       if (!node.nodeValue) continue;
-      body = { deviceId, channelId, bitstreamType, nodeValue: node.nodeValue };
-      result = await this.makeRequest('/video/live', body);
-      if (result.code === 0 && result.data) return result;
+      result = await tryOnce({ deviceId, channelId, bitstreamType, nodeValue: node.nodeValue });
+      if (result) return result;
     }
-    return result; // return last failure
+    return lastResult || { code: -1, msg: 'No stream available' };
   }
 }
 
