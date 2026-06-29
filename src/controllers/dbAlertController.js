@@ -230,6 +230,8 @@ async function getAlertMedia(req, res) {
       label: 'Alert Media',
       url: m.file_url,
       fileUrl: m.file_url,
+      fileType: m.file_type || '02',
+      isFlv: true,
       timestamp: m.created_at || m.alarm_time,
     }));
 

@@ -1,6 +1,9 @@
 const express = require('express');
 const axios = require('axios');
 const { spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 const apiClient = require('../helpers/apiClient');
 const { sendSuccess, sendError } = require('../helpers/response');
 
@@ -126,14 +129,19 @@ router.get('/flv-proxy', async (req, res) => {
 });
 
 router.get('/download-mp4', async (req, res) => {
+  const tmpFlv = path.join(os.tmpdir(), `dl-${Date.now()}.flv`);
+  const tmpMp4 = path.join(os.tmpdir(), `dl-${Date.now()}.mp4`);
   try {
     const { url, duration } = req.query;
     if (!url) return sendError(res, 'url query parameter required', 400);
     const maxDuration = Math.min(Number(duration) || 300, 600);
 
+    console.log('[download-mp4] Starting download from', url.slice(0, 80));
+
+    // Download FLV to temp file first
     const response = await axios.get(url, {
       responseType: 'stream',
-      timeout: 30000,
+      timeout: 60000,
       headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
     });
 
@@ -141,52 +149,83 @@ router.get('/download-mp4', async (req, res) => {
       return sendError(res, 'Upstream returned ' + response.status, 502);
     }
 
+    const writer = fs.createWriteStream(tmpFlv);
+    await new Promise((resolve, reject) => {
+      response.data.pipe(writer);
+      writer.on('finish', resolve);
+      writer.on('error', reject);
+      response.data.on('error', reject);
+    });
+
+    const flvSize = fs.statSync(tmpFlv).size;
+    console.log('[download-mp4] FLV downloaded:', flvSize, 'bytes');
+
+    if (flvSize === 0) {
+      return sendError(res, 'No data received from upstream', 502);
+    }
+
+    // Convert FLV to MP4 with ffmpeg
+    await new Promise((resolve, reject) => {
+      const ffmpeg = spawn('ffmpeg', [
+        '-y',
+        '-i', tmpFlv,
+        '-t', String(maxDuration),
+        '-c:v', 'copy',
+        '-c:a', 'copy',
+        '-movflags', 'faststart',
+        tmpMp4,
+      ]);
+
+      let ffmpegError = '';
+      ffmpeg.stderr.on('data', (chunk) => { ffmpegError += chunk.toString(); });
+
+      ffmpeg.on('error', (err) => reject(err));
+
+      ffmpeg.on('close', (code) => {
+        if (code === 0) {
+          resolve();
+        } else {
+          console.error('[download-mp4] ffmpeg exited code', code, ffmpegError.slice(-500));
+          reject(new Error(`ffmpeg failed with code ${code}`));
+        }
+      });
+    });
+
+    const mp4Size = fs.statSync(tmpMp4).size;
+    console.log('[download-mp4] MP4 converted:', mp4Size, 'bytes');
+
+    if (mp4Size === 0) {
+      return sendError(res, 'Conversion produced empty file', 500);
+    }
+
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Content-Disposition', `attachment; filename="video-${Date.now()}.mp4"`);
+    res.setHeader('Content-Length', mp4Size);
 
-    const ffmpeg = spawn('ffmpeg', [
-      '-f', 'flv',
-      '-i', 'pipe:0',
-      '-t', String(maxDuration),
-      '-c:v', 'copy',
-      '-c:a', 'copy',
-      '-movflags', 'faststart',
-      '-f', 'mp4',
-      'pipe:1',
-    ]);
-
-    response.data.pipe(ffmpeg.stdin);
-    ffmpeg.stdout.pipe(res);
-
-    let ffmpegError = '';
-    ffmpeg.stderr.on('data', (chunk) => { ffmpegError += chunk.toString(); });
-
-    response.data.on('error', () => {
-      ffmpeg.kill();
-      if (!res.destroyed) res.end();
+    const readStream = fs.createReadStream(tmpMp4);
+    readStream.pipe(res);
+    readStream.on('end', () => {
+      fs.unlink(tmpFlv, () => {});
+      fs.unlink(tmpMp4, () => {});
     });
-
-    ffmpeg.on('error', () => {
-      if (!res.headersSent) {
-        sendError(res, 'ffmpeg not available', 500);
-      }
-    });
-
-    ffmpeg.on('close', (code) => {
+    readStream.on('error', () => {
+      fs.unlink(tmpFlv, () => {});
+      fs.unlink(tmpMp4, () => {});
       if (!res.destroyed) res.end();
-      if (code !== 0 && code !== null) {
-        console.error('[download-mp4] ffmpeg exited code', code, ffmpegError.slice(-200));
-      }
     });
 
     res.on('close', () => {
-      ffmpeg.kill();
-      response.data.destroy();
+      readStream.destroy();
+      fs.unlink(tmpFlv, () => {});
+      fs.unlink(tmpMp4, () => {});
     });
   } catch (error) {
+    fs.unlink(tmpFlv, () => {});
+    fs.unlink(tmpMp4, () => {});
     if (!res.headersSent) {
+      console.error('[download-mp4] Error:', error.message);
       sendError(res, 'MP4 download failed: ' + error.message, 500);
     }
   }
