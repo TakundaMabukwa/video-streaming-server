@@ -45,7 +45,13 @@ class ApiClient {
       });
       return response.data;
     } catch (error) {
-      throw new Error(`API request failed: ${error.message}`);
+      if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
+        throw new Error('Connection timed out. The device may be offline or unreachable.');
+      }
+      if (error.code === 'ENOTFOUND' || error.code === 'ENETUNREACH') {
+        throw new Error('Network error. Please check your internet connection.');
+      }
+      throw new Error(error.message || 'Request failed');
     }
   }
 
@@ -70,8 +76,8 @@ class ApiClient {
         const result = await this.makeRequest('/video/live', body, 10000);
         if (result.code === 0 && result.data) return result;
         lastResult = result;
-      } catch {
-        lastResult = lastResult || { code: -1, msg: 'Request failed' };
+      } catch (error) {
+        lastResult = { code: -1, msg: error.message || 'Request failed' };
       }
       return null;
     };

@@ -21,13 +21,15 @@ const debugVehicleStreams = async (req, res) => {
           channelId,
           success: streamResponse.code === 0,
           streamUrl: streamResponse.data || null,
-          message: streamResponse.msg || 'OK'
+          message: streamResponse.code === 0 ? 'OK' : (streamResponse.msg || 'Stream not available')
         });
       } catch (error) {
+        const msg = error.message || 'Connection failed';
         channelTests.push({
           channelId,
           success: false,
-          error: error.message
+          streamUrl: null,
+          message: msg.includes('timed out') ? 'Device not responding' : msg.includes('Network') ? 'Network error' : msg
         });
       }
     }
