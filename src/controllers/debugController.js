@@ -11,9 +11,9 @@ const debugVehicleStreams = async (req, res) => {
 
     const id = deviceId || plateName;
 
-    // Try channels 1 and 2 directly — no device page lookup needed
+    // Try channels 1-4 directly
     const channelTests = [];
-    for (let channelId = 1; channelId <= 2; channelId++) {
+    for (let channelId = 1; channelId <= 4; channelId++) {
       try {
         const streamResponse = await apiClient.tryNodesForStream(id, channelId, 1);
 
