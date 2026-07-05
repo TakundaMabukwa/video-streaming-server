@@ -7,8 +7,6 @@ const config = require('./config/config');
 const routes = require('./routes');
 const { sendError } = require('./helpers/response');
 const db = require('./db');
-const syncService = require('./services/syncService');
-
 const app = express();
 
 app.use(compression());
@@ -30,15 +28,6 @@ const apiLimiter = rateLimit({
   message: { success: false, message: 'Too many requests, please try again later.' },
 });
 app.use('/api', apiLimiter, routes);
-
-const fileUpload = require('express-fileupload');
-app.use('/api/alerts', (req, res, next) => {
-  if (req.method === 'POST' && req.path.match(/\/[^/]+\/documents$/)) {
-    fileUpload({ limits: { fileSize: 10 * 1024 * 1024 }, abortOnLimit: true })(req, res, next);
-  } else {
-    next();
-  }
-});
 
 app.use('*', (req, res) => {
   sendError(res, 'Route not found', 404);
@@ -71,7 +60,6 @@ async function waitForDb(retries = 30, delay = 2000) {
 
 async function shutdown(signal) {
   console.log(`[SERVER] Received ${signal}, shutting down gracefully...`);
-  syncService.stopAutoSync();
   server.close(async () => {
     await db.closePool();
     console.log('[SERVER] Shutdown complete');
@@ -91,7 +79,6 @@ async function start() {
       console.log(`Server running on port ${config.port} in ${config.nodeEnv} mode`);
     });
     server.setTimeout(30000);
-    syncService.startAutoSync(60000);
   } catch (err) {
     console.error(`Startup failed: ${err.message}`);
     process.exit(1);
