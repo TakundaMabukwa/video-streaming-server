@@ -1,0 +1,39 @@
+services:
+  streaming-db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    container_name: streaming-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: SRS@981234#*
+      POSTGRES_DB: eps_streaming
+    ports:
+      - "5434:5432"
+    volumes:
+      - streaming-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d eps_streaming"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  streaming-server:
+    build: .
+    restart: unless-stopped
+    container_name: streaming-server
+    depends_on:
+      streaming-db:
+        condition: service_healthy
+    environment:
+      PORT: "3003"
+      NODE_ENV: development
+      DATABASE_URL: postgresql://postgres:SRS%40981234%23*@streaming-db:5432/eps_streaming
+      VIDEO_API_KEY: ${VIDEO_API_KEY}
+      VIDEO_API_SECRET: ${VIDEO_API_SECRET}
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY}
+    ports:
+      - "3003:3003"
+
+volumes:
+  streaming-pgdata:
