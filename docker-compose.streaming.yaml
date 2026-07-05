@@ -8,7 +8,7 @@ services:
       POSTGRES_PASSWORD: SRS@981234#*
       POSTGRES_DB: eps_streaming
     ports:
-      - "5434:5432"
+      - "5435:5432"
     volumes:
       - streaming-pgdata:/var/lib/postgresql/data
     healthcheck:
