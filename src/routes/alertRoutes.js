@@ -1,6 +1,8 @@
 const express = require('express');
 const { getAlertTypes, getAlarmPage, getAlertFeed, getAlarmFilesById, getAlarmFilesByPage, getDevices } = require('../controllers/alertController');
 const { getActiveAlerts, getResolvedAlerts, getAlertById, getAlertScreenshots, getAlertMedia, acknowledgeAlert, resolveAlert, escalateAlert, markFalseAlert, uploadDocumentToAlert } = require('../controllers/dbAlertController');
+const db = require('../db');
+const apiClient = require('../helpers/apiClient');
 
 const router = express.Router();
 
@@ -15,6 +17,30 @@ router.get('/active', getActiveAlerts);
 router.get('/resolved', getResolvedAlerts);
 router.get('/:id/screenshots', getAlertScreenshots);
 router.get('/:id/media', getAlertMedia);
+router.post('/:id/capture', async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!id) return res.status(400).json({ success: false, message: 'Alert ID required' });
+
+    let group = await db.getAlertGroupByAlertId(id);
+    const alertId = group ? group.last_alert_id : id;
+    const alert = await db.getAlertWithMedia(alertId);
+    if (!alert) return res.status(404).json({ success: false, message: 'Alert not found' });
+
+    const devId = alert.deviceId || alert.device_id || '';
+    if (!devId) return res.status(400).json({ success: false, message: 'No device ID on this alert' });
+
+    const results = await Promise.allSettled([
+      apiClient.makeRequest('/gallery/capture', { deviceId: devId, channelId: 1 }),
+      apiClient.makeRequest('/gallery/capture', { deviceId: devId, channelId: 2 }),
+    ]);
+
+    const succeeded = results.filter((r) => r.status === 'fulfilled').length;
+    res.json({ success: true, requested: 2, succeeded, deviceId: devId });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
 router.post('/:id/acknowledge', acknowledgeAlert);
 router.post('/:id/close', resolveAlert);
 router.post('/:id/escalate', escalateAlert);

@@ -227,8 +227,25 @@ async function getAlertMedia(req, res) {
     const media = alert.media || [];
     const images = media.filter((m) => m.file_type === '00' || !m.file_type || m.file_type === '01');
     const videoFiles = media.filter((m) => m.file_type === '02');
+    const hasScreenshots = images.length > 0;
 
-    // If ensureMedia and no media found, fetch on-demand
+    // If ensureMedia and no screenshots, trigger a fresh capture from the device
+    if (ensureMedia && !hasScreenshots) {
+      const devId = alert.deviceId || alert.device_id || '';
+      if (devId) {
+        console.log(`[ALERT] Triggering capture for alert ${id}, device ${devId}`);
+        const apiClient = require('../helpers/apiClient');
+        const capturePromises = [1, 2].map((channelId) =>
+          apiClient.makeRequest('/gallery/capture', { deviceId: devId, channelId }).catch((err) => {
+            console.warn(`[ALERT] Capture ch${channelId} failed for ${devId}: ${err.message}`);
+            return null;
+          })
+        );
+        await Promise.all(capturePromises);
+      }
+    }
+
+    // If ensureMedia and no media at all (no screenshots, no video), fetch on-demand
     if (ensureMedia && media.length === 0) {
       let rawAlert = null;
       if (group) {
