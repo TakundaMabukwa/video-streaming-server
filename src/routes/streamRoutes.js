@@ -93,17 +93,22 @@ router.get('/stream/proxy', async (req, res) => {
       response.data.on('error', () => { if (!res.destroyed) res.end(); });
       res.on('close', () => response.data.destroy());
     } else {
-      res.setHeader('Content-Type', mime);
-      res.setHeader('Cache-Control', 'public, max-age=3600');
-      res.setHeader('Access-Control-Allow-Origin', '*');
-
       const response = await axios.get(url, {
         responseType: 'stream',
         timeout: 15000,
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
+        },
+        validateStatus: () => true,
       });
+
+      if (response.status < 200 || response.status >= 300) {
+        return sendError(res, 'Upstream returned ' + response.status, 502);
+      }
+
+      res.setHeader('Content-Type', mime);
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('Access-Control-Allow-Origin', '*');
 
       response.data.pipe(res);
     }

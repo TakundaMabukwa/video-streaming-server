@@ -193,7 +193,7 @@ router.get('/image-proxy', async (req, res) => {
 
     const contentType = response.headers['content-type'] || 'image/jpeg';
     res.setHeader('Content-Type', contentType);
-    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.setHeader('Cache-Control', 'no-store');
     res.setHeader('Access-Control-Allow-Origin', '*');
 
     response.data.pipe(res);
