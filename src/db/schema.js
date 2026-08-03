@@ -106,6 +106,42 @@ const MIGRATIONS_SQL = `
   -- Add resolved_at / resolved_by columns to alert_groups
   ALTER TABLE alert_groups ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ;
   ALTER TABLE alert_groups ADD COLUMN IF NOT EXISTS resolved_by TEXT;
+
+  -- Alert definitions: custom alert types users can create
+  CREATE TABLE IF NOT EXISTS alert_definitions (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    category TEXT NOT NULL CHECK (category IN ('telematics', 'video')),
+    description TEXT DEFAULT '',
+    signal_code TEXT DEFAULT '',
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  );
+
+  -- Alert group configs: user-defined groupings of alert definitions with severity
+  CREATE TABLE IF NOT EXISTS alert_group_configs (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    severity INTEGER NOT NULL CHECK (severity BETWEEN 1 AND 10),
+    description TEXT DEFAULT '',
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  );
+
+  -- Junction: which alert definitions belong to which group config
+  CREATE TABLE IF NOT EXISTS alert_group_config_members (
+    id SERIAL PRIMARY KEY,
+    group_config_id INTEGER NOT NULL REFERENCES alert_group_configs(id) ON DELETE CASCADE,
+    alert_definition_id INTEGER NOT NULL REFERENCES alert_definitions(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(group_config_id, alert_definition_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_alert_definitions_category ON alert_definitions(category);
+  CREATE INDEX IF NOT EXISTS idx_alert_group_configs_severity ON alert_group_configs(severity);
+  CREATE INDEX IF NOT EXISTS idx_alert_group_config_members_group ON alert_group_config_members(group_config_id);
 `;
 
 async function initializeDatabase() {

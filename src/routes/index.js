@@ -5,6 +5,7 @@ const streamRoutes = require('./streamRoutes');
 const galleryRoutes = require('./galleryRoutes');
 const playbackRoutes = require('./playbackRoutes');
 const alertRoutes = require('./alertRoutes');
+const alertConfigRoutes = require('./alertConfigRoutes');
 
 const router = express.Router();
 
@@ -14,5 +15,6 @@ router.use('/stream', streamRoutes);
 router.use('/gallery', galleryRoutes);
 router.use('/playback', playbackRoutes);
 router.use('/alerts', alertRoutes);
+router.use('/alert-config', alertConfigRoutes);
 
 module.exports = router;
