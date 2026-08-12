@@ -113,6 +113,20 @@ async function getResolvedAlerts(req, res) {
   }
 }
 
+async function getActiveAlertsAll(req, res) {
+  try {
+    const limit = parseInt(req.query.limit) || 2000;
+
+    const groups = await db.getActiveAlertGroupsAll({ limit });
+
+    const alerts = groups.map(transformDbAlert);
+
+    res.json({ success: true, alerts, count: alerts.length, total: alerts.length, source: 'eps-db' });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+}
+
 async function getAlertById(req, res) {
   try {
     const { id } = req.params;
@@ -209,65 +223,58 @@ async function getAlertMedia(req, res) {
     const alertId = group ? group.last_alert_id : id;
 
     let alert = await db.getAlertWithMedia(alertId);
-    if (!alert) {
-      // If ensureMedia, try to fetch on-demand even if alert not in DB yet
-      if (ensureMedia) {
-        const dbAlert = await db.query('SELECT * FROM alerts WHERE id = $1', [id]);
-        if (dbAlert.rows.length > 0) {
-          console.log(`[ALERT] On-demand media fetch (ensureMedia) for alert ${id}`);
-          const newMedia = await syncService.fetchMediaOnDemand(dbAlert.rows[0]);
-          alert = { ...dbAlert.rows[0], media: newMedia };
-        }
-      }
-      if (!alert) {
-        return res.json({ success: true, alert: null, screenshots: [], videos: [], captures: [], clipUrls: {}, source: 'eps-db' });
-      }
-    }
+    const media = alert?.media || [];
 
-    const media = alert.media || [];
-    const images = media.filter((m) => m.file_type === '00' || !m.file_type || m.file_type === '01');
-    const videoFiles = media.filter((m) => m.file_type === '02');
-    const hasScreenshots = images.length > 0;
-
-    // If ensureMedia and no screenshots, trigger a fresh capture from the device
-    if (ensureMedia && !hasScreenshots) {
-      const devId = alert.deviceId || alert.device_id || '';
-      if (devId) {
-        console.log(`[ALERT] Triggering capture for alert ${id}, device ${devId}`);
-        const apiClient = require('../helpers/apiClient');
-        const capturePromises = [1, 2].map((channelId) =>
-          apiClient.makeRequest('/gallery/capture', { deviceId: devId, channelId }).catch((err) => {
-            console.warn(`[ALERT] Capture ch${channelId} failed for ${devId}: ${err.message}`);
-            return null;
-          })
-        );
-        await Promise.all(capturePromises);
-      }
-    }
-
-    // If ensureMedia and no media at all (no screenshots, no video), fetch on-demand
+    // If ensureMedia and no media, fetch on-demand from skycamx API
     if (ensureMedia && media.length === 0) {
+      console.log(`[ALERT] ensureMedia=true, no media found for alert ${id}, fetching from skycamx API...`);
+      
+      // Try to find raw alert record
       let rawAlert = null;
       if (group) {
-        rawAlert = await db.query('SELECT * FROM alerts WHERE id = $1', [alert.last_alert_id || id]);
+        // Use group info to construct a minimal alert record for API call
+        rawAlert = await db.query('SELECT * FROM alerts WHERE id = $1', [alertId]);
+        if (rawAlert.rows.length > 0) {
+          rawAlert = rawAlert.rows[0];
+        } else {
+          // Alert not in alerts table but group exists - construct from group
+          rawAlert = {
+            id: alertId,
+            deviceId: group.device_id,
+            deviceName: group.device_name,
+            alarmType: group.alarm_type,
+            alarmTs: group.last_alert_ts,
+          };
+        }
       } else {
         rawAlert = await db.query('SELECT * FROM alerts WHERE id = $1', [id]);
+        if (rawAlert.rows.length > 0) {
+          rawAlert = rawAlert.rows[0];
+        }
       }
-      if (rawAlert && rawAlert.rows.length > 0) {
-        console.log(`[ALERT] On-demand media fetch (ensureMedia, empty) for alert ${id}`);
-        const newMedia = await syncService.fetchMediaOnDemand(rawAlert.rows[0]);
+
+      if (rawAlert) {
+        console.log(`[ALERT] Calling skycamx /alarm/file/id for alarmId=${rawAlert.id}, device=${rawAlert.deviceId}`);
+        const newMedia = await syncService.fetchMediaOnDemand(rawAlert);
         if (newMedia.length > 0) {
-          alert.media = newMedia;
+          console.log(`[ALERT] Got ${newMedia.length} media files from skycamx API`);
+          if (alert) {
+            alert.media = newMedia;
+          } else {
+            alert = { ...rawAlert, media: newMedia };
+          }
+        } else {
+          console.log(`[ALERT] No media returned from skycamx API for alarmId=${rawAlert.id}`);
         }
       }
     }
 
-    const finalMedia = alert.media || [];
+    const finalMedia = alert?.media || [];
     const finalImages = finalMedia.filter((m) => m.file_type === '00' || !m.file_type || m.file_type === '01');
     const finalVideoFiles = finalMedia.filter((m) => m.file_type === '02');
 
-    const transformed = transformDbAlert(alert);
-    if (group) transformed.count = group.count;
+    const transformed = alert ? transformDbAlert(alert) : null;
+    if (group && transformed) transformed.count = group.count;
 
     const screenshots = finalImages.map((m, i) => ({
       id: m.id || `shot-${i}`,
@@ -457,6 +464,7 @@ module.exports = {
   getDevices,
   getAlertTypes,
   getActiveAlerts,
+  getActiveAlertsAll,
   getResolvedAlerts,
   getAlertById,
   getAlertScreenshots,

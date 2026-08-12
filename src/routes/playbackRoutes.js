@@ -103,11 +103,17 @@ router.get('/flv-proxy', async (req, res) => {
     const { url } = req.query;
     if (!url) return sendError(res, 'url query parameter required', 400);
 
-    const response = await axios.get(url, {
+    const isSkycamx = url.includes('skycamx.co.za');
+    const axiosOpts = {
       responseType: 'stream',
       timeout: 30000,
       headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-    });
+    };
+    if (isSkycamx) {
+      axiosOpts.httpsAgent = new (require('https').Agent)({ rejectUnauthorized: false });
+    }
+
+    const response = await axios.get(url, axiosOpts);
 
     if (response.status < 200 || response.status >= 300) {
       return sendError(res, 'Upstream returned ' + response.status, 502);
@@ -117,10 +123,11 @@ router.get('/flv-proxy', async (req, res) => {
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Transfer-Encoding', 'chunked');
 
     response.data.pipe(res);
     response.data.on('error', () => { if (!res.destroyed) res.end(); });
-    res.on('close', () => response.data.destroy());
+    res.on('close', () => { try { response.data.destroy(); } catch(e) {} });
   } catch (error) {
     if (!res.headersSent) {
       sendError(res, 'FLV proxy failed: ' + error.message, 500);
@@ -181,11 +188,17 @@ router.get('/image-proxy', async (req, res) => {
     const { url } = req.query;
     if (!url) return sendError(res, 'url query parameter required', 400);
 
-    const response = await axios.get(url, {
+    const isSkycamx = url.includes('skycamx.co.za');
+    const axiosOpts = {
       responseType: 'stream',
       timeout: 15000,
       headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-    });
+    };
+    if (isSkycamx) {
+      axiosOpts.httpsAgent = new (require('https').Agent)({ rejectUnauthorized: false });
+    }
+
+    const response = await axios.get(url, axiosOpts);
 
     if (response.status < 200 || response.status >= 300) {
       return sendError(res, 'Upstream returned ' + response.status, 502);

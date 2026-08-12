@@ -62,43 +62,93 @@ const MIME_MAP = {
 
 router.get('/stream/proxy', async (req, res) => {
   try {
-    const { url } = req.query;
+    let { url } = req.query;
     if (!url) {
       return sendError(res, 'Stream URL required', 400);
+    }
+
+    // Unwrap recursive proxy URLs
+    if (url.includes('/playback/flv-proxy?url=') || url.includes('/playback/image-proxy?url=')) {
+      const innerMatch = url.match(/url=([^&]+)/)
+      if (innerMatch) {
+        url = decodeURIComponent(innerMatch[1])
+      }
+    }
+    if (url.includes('/stream/stream/proxy?url=')) {
+      const innerMatch = url.match(/url=([^&]+)/)
+      if (innerMatch) {
+        url = decodeURIComponent(innerMatch[1])
+      }
     }
 
     const ext = (url.match(/\.(\w+)(?:\?|$)/) || [])[0]?.toLowerCase() || '';
     const mime = MIME_MAP[ext] || 'application/octet-stream';
     const isStream = mime === 'video/x-flv';
+    const isSkycamx = url.includes('skycamx.co.za');
+    const axiosOpts = {
+      responseType: 'stream',
+      timeout: 15000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      }
+    };
+    if (isSkycamx) {
+      axiosOpts.httpsAgent = new (require('https').Agent)({ rejectUnauthorized: false });
+    }
 
     if (isStream) {
-      const response = await axios.get(url, {
-        responseType: 'stream',
-        timeout: 15000,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-      });
-
-      if (response.status < 200 || response.status >= 300) {
-        return sendError(res, 'Upstream returned ' + response.status, 502);
-      }
-
+      console.log(`[STREAM PROXY] Live FLV request to: ${url}`);
       res.setHeader('Content-Type', 'video/x-flv');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
       res.setHeader('Access-Control-Allow-Origin', '*');
 
-      response.data.pipe(res);
-      response.data.on('error', () => { if (!res.destroyed) res.end(); });
-      res.on('close', () => response.data.destroy());
+      try {
+        const agent = new (require('https').Agent)({ rejectUnauthorized: false });
+        const parsedUrl = new URL(url);
+        
+        const options = {
+          hostname: parsedUrl.hostname,
+          port: 443,
+          path: parsedUrl.pathname + parsedUrl.search,
+          method: 'GET',
+          agent: agent,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': '*/*',
+          },
+          timeout: 15000,
+        };
+
+        const proxyReq = require('https').request(options, (proxyRes) => {
+          if (proxyRes.statusCode >= 300 && proxyRes.statusCode < 400 && proxyRes.headers.location) {
+            res.redirect(proxyRes.headers.location);
+            return;
+          }
+          if (proxyRes.statusCode < 200 || proxyRes.statusCode >= 300) {
+            sendError(res, 'Upstream returned ' + proxyRes.statusCode, 502);
+            return;
+          }
+          proxyRes.pipe(res);
+          proxyRes.on('error', () => { if (!res.destroyed) res.end(); });
+        });
+        
+        proxyReq.on('error', (err) => {
+          if (!res.headersSent) sendError(res, 'Stream error: ' + err.message, 500);
+        });
+        proxyReq.on('timeout', () => {
+          proxyReq.destroy();
+          if (!res.headersSent) sendError(res, 'Stream timeout', 504);
+        });
+        res.on('close', () => { try { proxyReq.destroy(); } catch(e) {} });
+        
+        proxyReq.end();
+      } catch (err) {
+        if (!res.headersSent) sendError(res, 'Stream setup error: ' + err.message, 500);
+      }
     } else {
       const response = await axios.get(url, {
-        responseType: 'stream',
-        timeout: 15000,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        },
+        ...axiosOpts,
         validateStatus: () => true,
       });
 

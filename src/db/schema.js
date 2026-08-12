@@ -142,6 +142,62 @@ const MIGRATIONS_SQL = `
   CREATE INDEX IF NOT EXISTS idx_alert_definitions_category ON alert_definitions(category);
   CREATE INDEX IF NOT EXISTS idx_alert_group_configs_severity ON alert_group_configs(severity);
   CREATE INDEX IF NOT EXISTS idx_alert_group_config_members_group ON alert_group_config_members(group_config_id);
+
+  -- Migrate severity from INTEGER to TEXT for alert_group_configs (idempotent)
+  DO $$
+  BEGIN
+    -- Check if severity column is INTEGER type
+    IF EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_name = 'alert_group_configs'
+      AND column_name = 'severity'
+      AND data_type = 'integer'
+    ) THEN
+      -- Add temporary column
+      ALTER TABLE alert_group_configs ADD COLUMN severity_text TEXT DEFAULT 'MEDIUM';
+      -- Copy values
+      UPDATE alert_group_configs SET severity_text = CASE
+        WHEN severity <= 2 THEN 'LOW'
+        WHEN severity <= 4 THEN 'MEDIUM'
+        WHEN severity <= 7 THEN 'HIGH'
+        ELSE 'CRITICAL'
+      END WHERE severity_text IS NULL;
+      -- Drop old column and rename
+      ALTER TABLE alert_group_configs DROP COLUMN severity;
+      ALTER TABLE alert_group_configs RENAME COLUMN severity_text TO severity;
+      ALTER TABLE alert_group_configs ALTER COLUMN severity SET DEFAULT 'MEDIUM';
+      ALTER TABLE alert_group_configs ALTER COLUMN severity SET NOT NULL;
+    END IF;
+  END $$;
+
+  -- Add severity to alert_definitions if not exists (idempotent)
+  DO $$
+  BEGIN
+    IF NOT EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_name = 'alert_definitions'
+      AND column_name = 'severity'
+    ) THEN
+      ALTER TABLE alert_definitions ADD COLUMN severity TEXT DEFAULT 'MEDIUM';
+      ALTER TABLE alert_definitions ALTER COLUMN severity SET NOT NULL;
+    END IF;
+  END $$;
+
+  -- Driver config criteria: driver behavior monitoring configuration
+  CREATE TABLE IF NOT EXISTS driver_config_criteria (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    selected_weighting NUMERIC DEFAULT 10,
+    actual_weighting NUMERIC DEFAULT 10,
+    risk_tiers INTEGER DEFAULT 4,
+    no_incidents INTEGER DEFAULT 0,
+    statuses TEXT[] DEFAULT '{}',
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_driver_config_criteria_name ON driver_config_criteria(name);
 `;
 
 async function initializeDatabase() {

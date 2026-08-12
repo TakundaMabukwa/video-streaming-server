@@ -11,15 +11,19 @@ const debugVehicleStreams = async (req, res) => {
 
     const id = deviceId || plateName;
 
-    // Try channels 1-4 directly
+    // Try channels 1-2 directly (most devices only have 2 cameras)
     const channelTests = [];
-    for (let channelId = 1; channelId <= 4; channelId++) {
+    for (let channelId = 1; channelId <= 2; channelId++) {
       try {
-        const streamResponse = await apiClient.tryNodesForStream(id, channelId, 1);
+        const streamResponse = await apiClient.makeRequest('/video/live', {
+          deviceId: id,
+          channelId,
+          bitstreamType: 1,
+        }, 10000);
 
         channelTests.push({
           channelId,
-          success: streamResponse.code === 0,
+          success: streamResponse.code === 0 && !!streamResponse.data,
           streamUrl: streamResponse.data || null,
           message: streamResponse.code === 0 ? 'OK' : (streamResponse.msg || 'Stream not available')
         });
