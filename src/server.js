@@ -60,6 +60,10 @@ async function waitForDb(retries = 30, delay = 2000) {
 
 async function shutdown(signal) {
   console.log(`[SERVER] Received ${signal}, shutting down gracefully...`);
+  try {
+    const syncService = require('./services/syncService');
+    syncService.stopAutoSync();
+  } catch {}
   server.close(async () => {
     await db.closePool();
     console.log('[SERVER] Shutdown complete');
@@ -75,8 +79,14 @@ let server;
 async function start() {
   try {
     await waitForDb();
-    server = app.listen(config.port, () => {
+    const syncService = require('./services/syncService');
+    server = app.listen(config.port, async () => {
       console.log(`Server running on port ${config.port} in ${config.nodeEnv} mode`);
+      try {
+        await syncService.startAutoSync(60000);
+      } catch (err) {
+        console.error(`[SYNC] Auto-sync failed to start: ${err.message}`);
+      }
     });
     server.setTimeout(30000);
   } catch (err) {
