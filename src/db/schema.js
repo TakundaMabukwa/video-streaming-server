@@ -198,6 +198,31 @@ const MIGRATIONS_SQL = `
   );
 
   CREATE INDEX IF NOT EXISTS idx_driver_config_criteria_name ON driver_config_criteria(name);
+
+  -- Telematics events from Geotab
+  CREATE TABLE IF NOT EXISTS telematics_events (
+    id SERIAL PRIMARY KEY,
+    device_id TEXT NOT NULL,
+    vehicle_id TEXT,
+    plate TEXT,
+    event_type TEXT NOT NULL,
+    event_code TEXT,
+    severity TEXT DEFAULT 'LOW',
+    latitude DOUBLE PRECISION,
+    longitude DOUBLE PRECISION,
+    speed DOUBLE PRECISION,
+    address TEXT,
+    driver_name TEXT,
+    description TEXT,
+    raw_data JSONB DEFAULT '{}'::jsonb,
+    event_time TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_telematics_events_device ON telematics_events(device_id);
+  CREATE INDEX IF NOT EXISTS idx_telematics_events_type ON telematics_events(event_type);
+  CREATE INDEX IF NOT EXISTS idx_telematics_events_time ON telematics_events(event_time DESC);
+  CREATE INDEX IF NOT EXISTS idx_telematics_events_plate ON telematics_events(plate);
 `;
 
 async function initializeDatabase() {
