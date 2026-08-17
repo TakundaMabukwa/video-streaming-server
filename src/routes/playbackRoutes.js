@@ -99,38 +99,55 @@ router.post('/history-replay', async (req, res) => {
 });
 
 router.get('/flv-proxy', async (req, res) => {
-  try {
-    const { url } = req.query;
-    if (!url) return sendError(res, 'url query parameter required', 400);
+  const MAX_ATTEMPTS = 2;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const { url } = req.query;
+      if (!url) return sendError(res, 'url query parameter required', 400);
 
-    const isSkycamx = url.includes('skycamx.co.za');
-    const axiosOpts = {
-      responseType: 'stream',
-      timeout: 30000,
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-    };
-    if (isSkycamx) {
-      axiosOpts.httpsAgent = new (require('https').Agent)({ rejectUnauthorized: false });
-    }
+      const isSkycamx = url.includes('skycamx.co.za');
+      const axiosOpts = {
+        responseType: 'stream',
+        timeout: 25000,
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+      };
+      if (isSkycamx) {
+        const https = require('https');
+        const fs = require('fs');
+        const path = require('path');
+        const certPath = path.join(__dirname, '../../certs/skycamx-ca-bundle.pem');
+        const agentOpts = { rejectUnauthorized: false };
+        if (fs.existsSync(certPath)) {
+          agentOpts.ca = [fs.readFileSync(certPath)];
+        }
+        axiosOpts.httpsAgent = new https.Agent(agentOpts);
+      }
 
-    const response = await axios.get(url, axiosOpts);
+      const response = await axios.get(url, axiosOpts);
 
-    if (response.status < 200 || response.status >= 300) {
-      return sendError(res, 'Upstream returned ' + response.status, 502);
-    }
+      if (response.status < 200 || response.status >= 300) {
+        return sendError(res, 'Upstream returned ' + response.status, 502);
+      }
 
-    res.setHeader('Content-Type', 'video/x-flv');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Transfer-Encoding', 'chunked');
+      res.setHeader('Content-Type', url.includes('.mp4') ? 'video/mp4' : 'video/x-flv');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Transfer-Encoding', 'chunked');
 
-    response.data.pipe(res);
-    response.data.on('error', () => { if (!res.destroyed) res.end(); });
-    res.on('close', () => { try { response.data.destroy(); } catch(e) {} });
-  } catch (error) {
-    if (!res.headersSent) {
-      sendError(res, 'FLV proxy failed: ' + error.message, 500);
+      response.data.pipe(res);
+      response.data.on('error', () => { if (!res.destroyed) res.end(); });
+      res.on('close', () => { try { response.data.destroy(); } catch(e) {} });
+      return;
+    } catch (error) {
+      if (attempt < MAX_ATTEMPTS) {
+        console.log(`[flv-proxy] Attempt ${attempt} failed, retrying... (${error.message})`);
+        await new Promise(r => setTimeout(r, 1000));
+        continue;
+      }
+      if (!res.headersSent) {
+        sendError(res, 'FLV proxy failed: ' + error.message, 500);
+      }
     }
   }
 });
@@ -229,12 +246,22 @@ router.get('/download-mp4', async (req, res) => {
 
     console.log('[download-mp4] Starting download from', url.slice(0, 80));
 
-    // Download FLV to temp file first
-    const response = await axios.get(url, {
+    const isSkycamx = url.includes('skycamx.co.za');
+    const dlOpts = {
       responseType: 'stream',
       timeout: 60000,
       headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-    });
+    };
+    if (isSkycamx) {
+      const agentOpts = { rejectUnauthorized: false };
+      const certPath = path.join(__dirname, '../../certs/skycamx-ca-bundle.pem');
+      if (fs.existsSync(certPath)) {
+        agentOpts.ca = [fs.readFileSync(certPath)];
+      }
+      dlOpts.httpsAgent = new (require('https').Agent)(agentOpts);
+    }
+
+    const response = await axios.get(url, dlOpts);
 
     if (response.status < 200 || response.status >= 300) {
       return sendError(res, 'Upstream returned ' + response.status, 502);

@@ -83,44 +83,26 @@ async function getAlertGroupByAlertId(alertId) {
 
 async function getActiveAlertGroupsWithMedia({ limit = 2000 } = {}) {
   const result = await query(
-    `SELECT g.*,
-            jsonb_agg(DISTINCT jsonb_build_object(
-              'id', m.id, 'file_url', m.file_url, 'file_type', m.file_type,
-              'file_size', m.file_size, 'created_at', m.created_at
-            )) FILTER (WHERE m.id IS NOT NULL) AS media
+    `SELECT g.*
      FROM alert_groups g
-     LEFT JOIN alert_media m ON m.alert_id = g.last_alert_id
      WHERE g.resolved = FALSE
-     GROUP BY g.id
      ORDER BY g.last_alert_ts DESC NULLS LAST
      LIMIT $1`,
     [limit]
   );
-  return result.rows.map(r => ({
-    ...r,
-    media: (r.media || []).filter(m => m.id !== null)
-  }));
+  return result.rows;
 }
 
 async function getActiveAlertGroupsAll({ limit = 2000 } = {}) {
   const result = await query(
-    `SELECT g.*,
-            jsonb_agg(DISTINCT jsonb_build_object(
-              'id', m.id, 'file_url', m.file_url, 'file_type', m.file_type,
-              'file_size', m.file_size, 'created_at', m.created_at
-            )) FILTER (WHERE m.id IS NOT NULL) AS media
+    `SELECT g.*
      FROM alert_groups g
-     LEFT JOIN alert_media m ON m.alert_id = g.last_alert_id
      WHERE g.resolved = FALSE
-     GROUP BY g.id
      ORDER BY g.last_alert_ts DESC NULLS LAST
      LIMIT $1`,
     [limit]
   );
-  return result.rows.map(r => ({
-    ...r,
-    media: (r.media || []).filter(m => m.id !== null)
-  }));
+  return result.rows;
 }
 
 async function getResolvedAlertGroupsWithMedia({ limit = 2000 } = {}) {

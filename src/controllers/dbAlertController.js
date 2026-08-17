@@ -271,7 +271,26 @@ async function getAlertMedia(req, res) {
 
     const finalMedia = alert?.media || [];
     const finalImages = finalMedia.filter((m) => m.file_type === '00' || !m.file_type || m.file_type === '01');
-    const finalVideoFiles = finalMedia.filter((m) => m.file_type === '02');
+    let finalVideoFiles = finalMedia.filter((m) => m.file_type === '02');
+
+    // Refetch replay URLs for video files — Mettax CDN signed URLs expire after ~30 min
+    if (ensureMedia && finalVideoFiles.length > 0) {
+      const staleVideo = finalVideoFiles[0];
+      const rawAlert = alert || await db.query('SELECT * FROM alerts WHERE id = $1', [alertId]).then(r => r.rows[0]);
+      if (rawAlert) {
+        const ts = rawAlert.alarmTs || rawAlert.alarm_ts || rawAlert.timestamp;
+        const devId = rawAlert.deviceId || rawAlert.device_id;
+        if (ts && devId) {
+          const tsDate = new Date(ts);
+          const tsEnd = new Date(tsDate.getTime() + 15 * 1000);
+          const freshUrl = await syncService.fetchReplayUrl(devId, 1, ts, tsEnd.toISOString().replace('T', ' ').slice(0, 19));
+          if (freshUrl) {
+            console.log(`[ALERT] Refreshed expired replay URL for alert ${alertId}`);
+            finalVideoFiles = [{ ...staleVideo, file_url: freshUrl }];
+          }
+        }
+      }
+    }
 
     const transformed = alert ? transformDbAlert(alert) : null;
     if (group && transformed) transformed.count = group.count;

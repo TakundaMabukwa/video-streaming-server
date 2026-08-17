@@ -1,0 +1,318 @@
+const { query } = require('./pool');
+
+// ── Helpers ──
+
+function extractFleetNumber(name) {
+  const cleaned = (name || '').trim();
+  const match = cleaned.match(/^([A-Za-z0-9]+)\s*[-–]/);
+  return match ? match[1] : (cleaned || null);
+}
+
+function parseDuration(durationStr) {
+  if (!durationStr) return null;
+  const parts = durationStr.split(':');
+  if (parts.length !== 3) return null;
+  const hours = parseFloat(parts[0]) || 0;
+  const minutes = parseFloat(parts[1]) || 0;
+  const seconds = parseFloat(parts[2]) || 0;
+  return hours * 3600 + minutes * 60 + seconds;
+}
+
+// ── Geotab Devices ──
+
+async function upsertGeotabDevices(devices) {
+  if (!devices || devices.length === 0) return;
+  const batchSize = 100;
+  for (let i = 0; i < devices.length; i += batchSize) {
+    const batch = devices.slice(i, i + batchSize);
+    const values = batch.map((_, idx) => {
+      const base = idx * 15;
+      return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}, $${base + 10}, $${base + 11}, $${base + 12}, $${base + 13}, $${base + 14}, $${base + 15})`;
+    }).join(', ');
+
+    const params = batch.flatMap(d => [
+      d.id,
+      d.name,
+      d.fleet_number || extractFleetNumber(d.name),
+      d.license_plate || null,
+      d.device_type || null,
+      d.vin || null,
+      d.serial_number || null,
+      d.fuel_tank_capacity || null,
+      d.timezone || null,
+      d.is_active !== false,
+      d.active_from || null,
+      d.active_to || null,
+      JSON.stringify(d.groups || []),
+      JSON.stringify(d.raw_data || {}),
+      new Date(),
+    ]);
+
+    await query(
+      `INSERT INTO geotab_devices
+       (id, name, fleet_number, license_plate, device_type, vin, serial_number,
+        fuel_tank_capacity, timezone, is_active, active_from, active_to,
+        groups, raw_data, last_synced)
+       VALUES ${values}
+       ON CONFLICT (id) DO UPDATE SET
+         name = EXCLUDED.name,
+         fleet_number = EXCLUDED.fleet_number,
+         license_plate = EXCLUDED.license_plate,
+         device_type = EXCLUDED.device_type,
+         vin = EXCLUDED.vin,
+         serial_number = EXCLUDED.serial_number,
+         fuel_tank_capacity = EXCLUDED.fuel_tank_capacity,
+         timezone = EXCLUDED.timezone,
+         is_active = EXCLUDED.is_active,
+         active_from = EXCLUDED.active_from,
+         active_to = EXCLUDED.active_to,
+         groups = EXCLUDED.groups,
+         raw_data = EXCLUDED.raw_data,
+         last_synced = EXCLUDED.last_synced,
+         updated_at = NOW()`,
+      params
+    );
+  }
+}
+
+async function getGeotabDevice(id) {
+  const result = await query('SELECT * FROM geotab_devices WHERE id = $1', [id]);
+  return result.rows[0] || null;
+}
+
+async function getGeotabDeviceByFleet(fleetNumber) {
+  const result = await query(
+    'SELECT * FROM geotab_devices WHERE fleet_number = $1 LIMIT 1',
+    [fleetNumber]
+  );
+  return result.rows[0] || null;
+}
+
+async function getGeotabDeviceByPlate(licensePlate) {
+  const result = await query(
+    'SELECT * FROM geotab_devices WHERE license_plate = $1 LIMIT 1',
+    [licensePlate.trim()]
+  );
+  return result.rows[0] || null;
+}
+
+async function getAllGeotabDevices() {
+  const result = await query('SELECT * FROM geotab_devices ORDER BY name');
+  return result.rows;
+}
+
+async function getActiveGeotabDevices() {
+  const result = await query(
+    `SELECT * FROM geotab_devices
+     WHERE is_active = TRUE AND (active_to IS NULL OR active_to > NOW())
+     ORDER BY name`
+  );
+  return result.rows;
+}
+
+// ── Geotab Groups ──
+
+async function upsertGeotabGroups(groups) {
+  if (!groups || groups.length === 0) return;
+  const values = groups.map((_, idx) => {
+    const base = idx * 6;
+    return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6})`;
+  }).join(', ');
+
+  const params = groups.flatMap(g => [
+    g.id,
+    g.name,
+    g.parent_id || null,
+    g.is_global || false,
+    JSON.stringify(g.raw_data || {}),
+    new Date(),
+  ]);
+
+  await query(
+    `INSERT INTO geotab_groups (id, name, parent_id, is_global, raw_data, last_synced)
+     VALUES ${values}
+     ON CONFLICT (id) DO UPDATE SET
+       name = EXCLUDED.name,
+       parent_id = EXCLUDED.parent_id,
+       is_global = EXCLUDED.is_global,
+       raw_data = EXCLUDED.raw_data,
+       last_synced = EXCLUDED.last_synced`,
+    params
+  );
+}
+
+async function getGeotabGroup(id) {
+  const result = await query('SELECT * FROM geotab_groups WHERE id = $1', [id]);
+  return result.rows[0] || null;
+}
+
+async function getAllGeotabGroups() {
+  const result = await query('SELECT * FROM geotab_groups ORDER BY name');
+  return result.rows;
+}
+
+// ── Exception Rules ──
+
+async function upsertExceptionRules(rules) {
+  if (!rules || rules.length === 0) return;
+  const values = rules.map((_, idx) => {
+    const base = idx * 5;
+    return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5})`;
+  }).join(', ');
+
+  const params = rules.flatMap(r => [
+    r.id,
+    r.name,
+    r.description || null,
+    JSON.stringify(r.raw_data || {}),
+    new Date(),
+  ]);
+
+  await query(
+    `INSERT INTO geotab_exception_rules (id, name, description, raw_data, last_synced)
+     VALUES ${values}
+     ON CONFLICT (id) DO UPDATE SET
+       name = EXCLUDED.name,
+       description = EXCLUDED.description,
+       raw_data = EXCLUDED.raw_data,
+       last_synced = EXCLUDED.last_synced`,
+    params
+  );
+}
+
+async function getExceptionRule(id) {
+  const result = await query('SELECT * FROM geotab_exception_rules WHERE id = $1', [id]);
+  return result.rows[0] || null;
+}
+
+// ── Diagnostics ──
+
+async function upsertDiagnostics(diagnostics) {
+  if (!diagnostics || diagnostics.length === 0) return;
+  const values = diagnostics.map((_, idx) => {
+    const base = idx * 5;
+    return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5})`;
+  }).join(', ');
+
+  const params = diagnostics.flatMap(d => [
+    d.id,
+    d.name,
+    d.unit || null,
+    JSON.stringify(d.raw_data || {}),
+    new Date(),
+  ]);
+
+  await query(
+    `INSERT INTO geotab_diagnostics (id, name, unit, raw_data, last_synced)
+     VALUES ${values}
+     ON CONFLICT (id) DO UPDATE SET
+       name = EXCLUDED.name,
+       unit = EXCLUDED.unit,
+       raw_data = EXCLUDED.raw_data,
+       last_synced = EXCLUDED.last_synced`,
+    params
+  );
+}
+
+async function getDiagnostic(id) {
+  if (!id || id === 'NoDiagnosticId') return null;
+  const result = await query('SELECT * FROM geotab_diagnostics WHERE id = $1', [id]);
+  return result.rows[0] || null;
+}
+
+// ── Fleet Vehicles (synced from Supabase) ──
+
+async function upsertFleetVehicles(vehicles) {
+  if (!vehicles || vehicles.length === 0) return;
+  const batchSize = 100;
+  for (let i = 0; i < vehicles.length; i += batchSize) {
+    const batch = vehicles.slice(i, i + batchSize);
+    const values = batch.map((_, idx) => {
+      const base = idx * 6;
+      return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6})`;
+    }).join(', ');
+
+    const params = batch.flatMap(v => [
+      v.fleet_number || null,
+      v.registration_number || null,
+      v.make || null,
+      v.model || null,
+      v.cost_center || null,
+      new Date(),
+    ]);
+
+    await query(
+      `INSERT INTO fleet_vehicles (fleet_number, registration_number, make, model, cost_center, last_synced)
+       VALUES ${values}
+       ON CONFLICT (fleet_number, registration_number) DO UPDATE SET
+         make = EXCLUDED.make,
+         model = EXCLUDED.model,
+         cost_center = EXCLUDED.cost_center,
+         last_synced = EXCLUDED.last_synced,
+         updated_at = NOW()`,
+      params
+    );
+  }
+}
+
+async function getFleetVehicleByFleet(fleetNumber) {
+  const result = await query(
+    'SELECT * FROM fleet_vehicles WHERE fleet_number = $1 LIMIT 1',
+    [fleetNumber]
+  );
+  return result.rows[0] || null;
+}
+
+async function getFleetVehicleByReg(registrationNumber) {
+  const result = await query(
+    'SELECT * FROM fleet_vehicles WHERE registration_number = $1 LIMIT 1',
+    [registrationNumber.trim()]
+  );
+  return result.rows[0] || null;
+}
+
+async function getAllFleetVehicles() {
+  const result = await query('SELECT * FROM fleet_vehicles ORDER BY fleet_number, registration_number');
+  return result.rows;
+}
+
+async function isFleetVehicle(fleetNumber, registrationNumber) {
+  if (fleetNumber) {
+    const result = await query(
+      'SELECT 1 FROM fleet_vehicles WHERE fleet_number = $1 LIMIT 1',
+      [fleetNumber]
+    );
+    if (result.rows.length > 0) return true;
+  }
+  if (registrationNumber) {
+    const result = await query(
+      'SELECT 1 FROM fleet_vehicles WHERE registration_number = $1 LIMIT 1',
+      [registrationNumber.trim()]
+    );
+    if (result.rows.length > 0) return true;
+  }
+  return false;
+}
+
+module.exports = {
+  extractFleetNumber,
+  parseDuration,
+  upsertGeotabDevices,
+  getGeotabDevice,
+  getGeotabDeviceByFleet,
+  getGeotabDeviceByPlate,
+  getAllGeotabDevices,
+  getActiveGeotabDevices,
+  upsertGeotabGroups,
+  getGeotabGroup,
+  getAllGeotabGroups,
+  upsertExceptionRules,
+  getExceptionRule,
+  upsertDiagnostics,
+  getDiagnostic,
+  upsertFleetVehicles,
+  getFleetVehicleByFleet,
+  getFleetVehicleByReg,
+  getAllFleetVehicles,
+  isFleetVehicle,
+};

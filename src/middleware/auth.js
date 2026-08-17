@@ -1,0 +1,70 @@
+const { createClient } = require('@supabase/supabase-js');
+
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SRS_INTERNAL_KEY = process.env.SRS_INTERNAL_KEY;
+
+let supabaseAdmin = null;
+
+function getSupabaseAdmin() {
+  if (!supabaseAdmin && SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
+    supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+  }
+  return supabaseAdmin;
+}
+
+async function requireAuth(req, res, next) {
+  // Allow internal API key from SRS server-to-server calls
+  const internalKey = req.headers['x-internal-key'];
+  if (internalKey && internalKey === SRS_INTERNAL_KEY) {
+    req.user = { id: 'srs-internal', email: 'internal@srs.local' };
+    req.userRole = 'admin';
+    return next();
+  }
+
+  const supabase = getSupabaseAdmin();
+  if (!supabase) {
+    console.error('[AUTH] Supabase not configured');
+    return res.status(500).json({ success: false, message: 'Auth not configured' });
+  }
+
+  // Extract token from Authorization header or cookie
+  let token = null;
+  const authHeader = req.headers['authorization'];
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    token = authHeader.slice(7);
+  }
+  if (!token && req.cookies) {
+    token = req.cookies['access_token'];
+  }
+  if (!token) {
+    return res.status(401).json({ success: false, message: 'Not authenticated' });
+  }
+
+  try {
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+    if (error || !user) {
+      return res.status(401).json({ success: false, message: 'Invalid token' });
+    }
+
+    // Verify user exists in our users table
+    const { data: userRecord, error: userError } = await supabase
+      .from('users')
+      .select('id, role')
+      .eq('id', user.id)
+      .single();
+
+    if (userError || !userRecord) {
+      return res.status(401).json({ success: false, message: 'User not found' });
+    }
+
+    req.user = user;
+    req.userRole = userRecord.role;
+    next();
+  } catch (err) {
+    console.error('[AUTH] Error:', err.message);
+    return res.status(401).json({ success: false, message: 'Auth error' });
+  }
+}
+
+module.exports = { requireAuth };

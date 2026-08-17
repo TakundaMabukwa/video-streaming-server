@@ -3,9 +3,11 @@ const cors = require('cors');
 const helmet = require('helmet');
 const compression = require('compression');
 const rateLimit = require('express-rate-limit');
+const cookieParser = require('cookie-parser');
 const config = require('./config/config');
 const routes = require('./routes');
 const { sendError } = require('./helpers/response');
+const { requireAuth } = require('./middleware/auth');
 const db = require('./db');
 const app = express();
 
@@ -15,7 +17,8 @@ app.use(helmet({
   contentSecurityPolicy: false,
   crossOriginResourcePolicy: false,
 }));
-app.use(cors());
+app.use(cors({ origin: true, credentials: true }));
+app.use(cookieParser());
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 app.use(express.static('public', { maxAge: '1d' }));
@@ -27,7 +30,7 @@ const apiLimiter = rateLimit({
   legacyHeaders: false,
   message: { success: false, message: 'Too many requests, please try again later.' },
 });
-app.use('/api', apiLimiter, routes);
+app.use('/api', apiLimiter, requireAuth, routes);
 
 app.use('*', (req, res) => {
   sendError(res, 'Route not found', 404);

@@ -492,4 +492,5 @@ module.exports = {
   getStatus,
   refetchMissingMedia,
   fetchMediaOnDemand,
+  fetchReplayUrl,
 };
