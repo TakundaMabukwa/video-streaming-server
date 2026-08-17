@@ -61,7 +61,7 @@ function transformDbAlert(record) {
     escalated: false,
     device_id: deviceId,
     vehicleId: deviceId,
-    vehicle_registration: record.device_name || deviceId,
+    vehicle_registration: record.device_name || null,
     driver_name: null,
     timestamp: ts ? new Date(ts).toISOString() : new Date().toISOString(),
     created_at: record.created_at ? new Date(record.created_at).toISOString() : null,
