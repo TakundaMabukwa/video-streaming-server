@@ -19,7 +19,8 @@
     "express-rate-limit": "^8.5.2",
     "flv.js": "^1.6.2",
     "helmet": "^7.0.0",
-    "pg": "^8.21.0"
+    "pg": "^8.21.0",
+    "ws": "^8.21.3"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"

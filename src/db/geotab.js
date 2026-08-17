@@ -294,6 +294,170 @@ async function isFleetVehicle(fleetNumber, registrationNumber) {
   return false;
 }
 
+// ── Geotab Zones ──
+
+async function upsertGeotabZones(zones) {
+  if (!zones || zones.length === 0) return;
+  for (const zone of zones) {
+    const name = (zone.name || '').toUpperCase();
+    const isHighRisk = name.includes('HIGH RISK');
+    const isNoGo = name.includes('NO GO');
+    await query(
+      `INSERT INTO geotab_zones (id, name, points, zone_types, comment, is_high_risk, is_no_go, raw_data, last_synced)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+       ON CONFLICT (id) DO UPDATE SET
+         name = EXCLUDED.name, points = EXCLUDED.points, zone_types = EXCLUDED.zone_types,
+         comment = EXCLUDED.comment, is_high_risk = EXCLUDED.is_high_risk, is_no_go = EXCLUDED.is_no_go,
+         raw_data = EXCLUDED.raw_data, last_synced = NOW()`,
+      [
+        zone.id,
+        zone.name || null,
+        JSON.stringify(zone.points || []),
+        JSON.stringify(zone.zoneTypes || []),
+        zone.comment || null,
+        isHighRisk,
+        isNoGo,
+        JSON.stringify(zone),
+      ]
+    );
+  }
+}
+
+async function getGeotabZones() {
+  const result = await query('SELECT * FROM geotab_zones ORDER BY name');
+  return result.rows;
+}
+
+async function getHighRiskZones() {
+  const result = await query('SELECT * FROM geotab_zones WHERE is_high_risk = TRUE OR is_no_go = TRUE ORDER BY name');
+  return result.rows;
+}
+
+// ── Vehicle Log Records ──
+
+async function upsertVehicleLogRecords(records) {
+  if (!records || records.length === 0) return;
+  for (const rec of records) {
+    await query(
+      `INSERT INTO vehicle_log_records (device_id, latitude, longitude, speed, heading, odometer, record_time)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (device_id, record_time) DO NOTHING`,
+      [rec.deviceId, rec.latitude, rec.longitude, rec.speed, rec.heading, rec.odometer, rec.recordTime]
+    ).catch(() => {});
+  }
+}
+
+async function getVehicleLogRecords(deviceId, from, to) {
+  const result = await query(
+    'SELECT * FROM vehicle_log_records WHERE device_id = $1 AND record_time BETWEEN $2 AND $3 ORDER BY record_time ASC',
+    [deviceId, from, to]
+  );
+  return result.rows;
+}
+
+async function getLatestLogRecord(deviceId) {
+  const result = await query(
+    'SELECT * FROM vehicle_log_records WHERE device_id = $1 ORDER BY record_time DESC LIMIT 1',
+    [deviceId]
+  );
+  return result.rows[0] || null;
+}
+
+// ── Vehicle Status ──
+
+async function upsertVehicleStatus(deviceId, data) {
+  await query(
+    `INSERT INTO vehicle_status (device_id, plate, license_plate, fleet_number, engine_on, ignition_on, speed, latitude, longitude, last_log_time, last_update)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+     ON CONFLICT (device_id) DO UPDATE SET
+       plate = COALESCE(EXCLUDED.plate, vehicle_status.plate),
+       license_plate = COALESCE(EXCLUDED.license_plate, vehicle_status.license_plate),
+       fleet_number = COALESCE(EXCLUDED.fleet_number, vehicle_status.fleet_number),
+       engine_on = COALESCE(EXCLUDED.engine_on, vehicle_status.engine_on),
+       ignition_on = COALESCE(EXCLUDED.ignition_on, vehicle_status.ignition_on),
+       speed = COALESCE(EXCLUDED.speed, vehicle_status.speed),
+       latitude = COALESCE(EXCLUDED.latitude, vehicle_status.latitude),
+       longitude = COALESCE(EXCLUDED.longitude, vehicle_status.longitude),
+       last_log_time = COALESCE(EXCLUDED.last_log_time, vehicle_status.last_log_time),
+       last_update = NOW()`,
+    [
+      deviceId,
+      data.plate || null,
+      data.licensePlate || null,
+      data.fleetNumber || null,
+      data.engineOn ?? null,
+      data.ignitionOn ?? null,
+      data.speed ?? null,
+      data.latitude ?? null,
+      data.longitude ?? null,
+      data.lastLogTime || null,
+    ]
+  ).catch(() => {});
+}
+
+async function getVehicleStatus(deviceId) {
+  const result = await query('SELECT * FROM vehicle_status WHERE device_id = $1', [deviceId]);
+  return result.rows[0] || null;
+}
+
+async function getAllVehicleStatus() {
+  const result = await query('SELECT * FROM vehicle_status ORDER BY fleet_number, plate');
+  return result.rows;
+}
+
+// ── High Risk Zone Entries ──
+
+async function insertZoneEntry(entry) {
+  const result = await query(
+    `INSERT INTO high_risk_zone_entries (device_id, fleet_number, license_plate, zone_id, zone_name, risk_level, latitude, longitude, speed, entry_time, is_active)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE)
+     RETURNING id`,
+    [
+      entry.deviceId,
+      entry.fleetNumber || null,
+      entry.licensePlate || null,
+      entry.zoneId,
+      entry.zoneName,
+      entry.riskLevel,
+      entry.latitude,
+      entry.longitude,
+      entry.speed ?? null,
+      entry.entryTime,
+    ]
+  );
+  return result.rows[0] || null;
+}
+
+async function getActiveZoneEntries(deviceId) {
+  const result = await query(
+    'SELECT * FROM high_risk_zone_entries WHERE device_id = $1 AND is_active = TRUE ORDER BY entry_time DESC',
+    [deviceId]
+  );
+  return result.rows;
+}
+
+async function getZoneEntries(deviceId, from, to) {
+  let q = 'SELECT * FROM high_risk_zone_entries WHERE 1=1';
+  const params = [];
+  let idx = 1;
+  if (deviceId) { q += ` AND device_id = $${idx}`; params.push(deviceId); idx++; }
+  if (from) { q += ` AND entry_time >= $${idx}`; params.push(from); idx++; }
+  if (to) { q += ` AND entry_time <= $${idx}`; params.push(to); idx++; }
+  q += ' ORDER BY entry_time DESC';
+  const result = await query(q, params);
+  return result.rows;
+}
+
+async function getAllActiveZoneEntries() {
+  const result = await query(
+    `SELECT h.*, g.name as zone_name_full
+     FROM high_risk_zone_entries h
+     WHERE h.is_active = TRUE
+     ORDER BY h.entry_time DESC`
+  );
+  return result.rows;
+}
+
 module.exports = {
   extractFleetNumber,
   parseDuration,
@@ -315,4 +479,17 @@ module.exports = {
   getFleetVehicleByReg,
   getAllFleetVehicles,
   isFleetVehicle,
+  upsertGeotabZones,
+  getGeotabZones,
+  getHighRiskZones,
+  upsertVehicleLogRecords,
+  getVehicleLogRecords,
+  getLatestLogRecord,
+  upsertVehicleStatus,
+  getVehicleStatus,
+  getAllVehicleStatus,
+  insertZoneEntry,
+  getActiveZoneEntries,
+  getZoneEntries,
+  getAllActiveZoneEntries,
 };

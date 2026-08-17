@@ -67,6 +67,14 @@ async function shutdown(signal) {
     const syncService = require('./services/syncService');
     syncService.stopAutoSync();
   } catch {}
+  try {
+    const geotabPolling = require('./services/geotabPolling');
+    geotabPolling.stopPolling();
+  } catch {}
+  try {
+    const { stopWebSocket } = require('./services/websocket');
+    stopWebSocket();
+  } catch {}
   server.close(async () => {
     await db.closePool();
     console.log('[SERVER] Shutdown complete');
@@ -82,6 +90,24 @@ let server;
 async function start() {
   try {
     await waitForDb();
+
+    // Start WebSocket server
+    const { startWebSocket, broadcast } = require('./services/websocket');
+    try {
+      startWebSocket(3004);
+    } catch (err) {
+      console.error(`[WS] WebSocket failed to start: ${err.message}`);
+    }
+
+    // Start Geotab polling (connects WebSocket broadcast)
+    try {
+      const geotabPolling = require('./services/geotabPolling');
+      geotabPolling.setWsBroadcast(broadcast);
+      geotabPolling.startPolling(60000);
+    } catch (err) {
+      console.error(`[GEOTAB] Polling failed to start: ${err.message}`);
+    }
+
     const syncService = require('./services/syncService');
     server = app.listen(config.port, async () => {
       console.log(`Server running on port ${config.port} in ${config.nodeEnv} mode`);

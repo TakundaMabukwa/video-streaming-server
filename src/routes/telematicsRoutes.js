@@ -33,6 +33,37 @@ router.get('/vehicle/:deviceId', async (req, res) => {
   }
 });
 
+// Get telematics events in time window
+router.get('/events/:deviceId', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const { from, to, limit = 500 } = req.query;
+
+    let query = `SELECT * FROM telematics_events WHERE device_id = $1`;
+    const params = [deviceId];
+    let paramIdx = 2;
+
+    if (from) {
+      query += ` AND event_time >= $${paramIdx}`;
+      params.push(from);
+      paramIdx++;
+    }
+    if (to) {
+      query += ` AND event_time <= $${paramIdx}`;
+      params.push(to);
+      paramIdx++;
+    }
+
+    query += ` ORDER BY event_time ASC LIMIT $${paramIdx}`;
+    params.push(parseInt(limit));
+
+    const result = await db.query(query, params);
+    res.json({ success: true, data: result.rows, count: result.rows.length });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // Get all telematics events (for map plotting)
 router.get('/events', async (req, res) => {
   try {
@@ -120,6 +151,75 @@ router.post('/events', async (req, res) => {
     }
 
     res.json({ success: true, data: inserted, count: inserted.length });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ── Vehicle Status ──
+
+router.get('/vehicle-status/:deviceId', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const status = await db.getVehicleStatus(deviceId);
+    res.json({ success: true, data: status });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+router.get('/vehicle-status-all', async (req, res) => {
+  try {
+    const statuses = await db.getAllVehicleStatus();
+    res.json({ success: true, data: statuses, count: statuses.length });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ── Geotab Zones ──
+
+router.get('/zones', async (req, res) => {
+  try {
+    const zones = await db.getGeotabZones();
+    res.json({ success: true, data: zones, count: zones.length });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ── Zone Entries (breaches) ──
+
+router.get('/zone-entries', async (req, res) => {
+  try {
+    const { deviceId, from, to } = req.query;
+    const entries = await db.getZoneEntries(deviceId, from, to);
+    res.json({ success: true, data: entries, count: entries.length });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+router.get('/zone-entries-active', async (req, res) => {
+  try {
+    const entries = await db.getAllActiveZoneEntries();
+    res.json({ success: true, data: entries, count: entries.length });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ── Log Records (GPS positions) ──
+
+router.get('/log-records/:deviceId', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const { from, to } = req.query;
+    if (!from || !to) {
+      return res.status(400).json({ success: false, message: 'from and to query params required' });
+    }
+    const records = await db.getVehicleLogRecords(deviceId, from, to);
+    res.json({ success: true, data: records, count: records.length });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }

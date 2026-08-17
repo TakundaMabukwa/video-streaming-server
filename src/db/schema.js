@@ -223,6 +223,68 @@ const MIGRATIONS_SQL = `
   CREATE INDEX IF NOT EXISTS idx_telematics_events_type ON telematics_events(event_type);
   CREATE INDEX IF NOT EXISTS idx_telematics_events_time ON telematics_events(event_time DESC);
   CREATE INDEX IF NOT EXISTS idx_telematics_events_plate ON telematics_events(plate);
+
+  -- Add missing columns to telematics_events
+  ALTER TABLE telematics_events ADD COLUMN IF NOT EXISTS license_plate TEXT;
+  ALTER TABLE telematics_events ADD COLUMN IF NOT EXISTS fleet_number TEXT;
+  CREATE INDEX IF NOT EXISTS idx_telematics_events_device_time ON telematics_events(device_id, event_time);
+
+  -- Add missing columns to vehicle_status
+  ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS speed DOUBLE PRECISION;
+  ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION;
+  ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION;
+  ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS last_log_time TIMESTAMPTZ;
+
+  -- Geotab zones
+  CREATE TABLE IF NOT EXISTS geotab_zones (
+    id TEXT PRIMARY KEY,
+    name TEXT,
+    points JSONB DEFAULT '[]',
+    zone_types JSONB DEFAULT '[]',
+    comment TEXT,
+    is_high_risk BOOLEAN DEFAULT FALSE,
+    is_no_go BOOLEAN DEFAULT FALSE,
+    raw_data JSONB DEFAULT '{}',
+    last_synced TIMESTAMPTZ DEFAULT NOW()
+  );
+
+  -- High risk zone entries
+  CREATE TABLE IF NOT EXISTS high_risk_zone_entries (
+    id SERIAL PRIMARY KEY,
+    device_id TEXT NOT NULL,
+    fleet_number TEXT,
+    license_plate TEXT,
+    zone_id TEXT NOT NULL,
+    zone_name TEXT NOT NULL,
+    risk_level TEXT NOT NULL,
+    latitude DOUBLE PRECISION,
+    longitude DOUBLE PRECISION,
+    speed DOUBLE PRECISION,
+    entry_time TIMESTAMPTZ NOT NULL,
+    exit_time TIMESTAMPTZ,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_high_risk_zone_entries_device ON high_risk_zone_entries(device_id);
+  CREATE INDEX IF NOT EXISTS idx_high_risk_zone_entries_time ON high_risk_zone_entries(entry_time DESC);
+  CREATE INDEX IF NOT EXISTS idx_high_risk_zone_entries_active ON high_risk_zone_entries(is_active) WHERE is_active = TRUE;
+
+  -- Vehicle log records (GPS positions)
+  CREATE TABLE IF NOT EXISTS vehicle_log_records (
+    id SERIAL PRIMARY KEY,
+    device_id TEXT NOT NULL,
+    latitude DOUBLE PRECISION,
+    longitude DOUBLE PRECISION,
+    speed DOUBLE PRECISION,
+    heading DOUBLE PRECISION,
+    odometer DOUBLE PRECISION,
+    record_time TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(device_id, record_time)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_vehicle_log_records_device_time ON vehicle_log_records(device_id, record_time);
 `;
 
 async function initializeDatabase() {

@@ -402,6 +402,226 @@ async function syncGeotabEvents() {
 
 const apiClient = require('../helpers/apiClient');
 
+// ── WebSocket broadcast hook (set by websocket.js) ──
+let wsBroadcast = null;
+function setWsBroadcast(fn) { wsBroadcast = fn; }
+
+// ── Point-in-polygon test (ray casting) ──
+function isPointInPolygon(lat, lon, points) {
+  let inside = false;
+  for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
+    const xi = points[i].x, yi = points[i].y;
+    const xj = points[j].x, yj = points[j].y;
+    const intersect = ((yi > lat) !== (yj > lat)) &&
+      (lon < (xj - xi) * (lat - yi) / (yj - yi) + xi);
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+function getZoneAlertLevel(name) {
+  const upper = (name || '').toUpperCase();
+  if (upper.includes('NO GO')) return 'CRITICAL';
+  if (upper.includes('HIGH RISK')) return 'HIGH';
+  return 'INFO';
+}
+
+// ── Sync Geotab Zones ──
+
+async function syncGeotabZones() {
+  const database = process.env.GEOTAB_DATABASE;
+  const username = process.env.GEOTAB_USERNAME;
+  const password = process.env.GEOTAB_PASSWORD;
+  if (!database || !username || !password) return;
+
+  try {
+    const credentials = await geotabAuthenticate(database, username, password);
+    const response = await geotabFetch({
+      method: 'Get',
+      params: { typeName: 'Zone', credentials },
+      id: 10,
+      jsonrpc: '2.0',
+    });
+
+    if (response.error) {
+      console.error('[GEOTAB] Zone error:', response.error.message);
+      return;
+    }
+
+    const zones = response.result || [];
+    if (zones.length > 0) {
+      await db.upsertGeotabZones(zones);
+      const highRisk = zones.filter(z => (z.name || '').toUpperCase().includes('HIGH RISK'));
+      const noGo = zones.filter(z => (z.name || '').toUpperCase().includes('NO GO'));
+      console.log(`[GEOTAB] Synced ${zones.length} zones (${highRisk.length} high risk, ${noGo.length} no go)`);
+    }
+  } catch (error) {
+    console.error('[GEOTAB] Failed to sync zones:', error.message);
+  }
+}
+
+// ── Sync Log Records (GPS positions) ──
+
+let lastLogVersion = null;
+
+async function syncLogRecords() {
+  const database = process.env.GEOTAB_DATABASE;
+  const username = process.env.GEOTAB_USERNAME;
+  const password = process.env.GEOTAB_PASSWORD;
+  if (!database || !username || !password) return;
+
+  try {
+    const credentials = await geotabAuthenticate(database, username, password);
+    const fromVersion = lastLogVersion === null ? -1 : lastLogVersion;
+    const feed = await geotabGetFeed(credentials, 'LogRecord', fromVersion);
+
+    if (feed.error) {
+      console.error('[GEOTAB] LogRecord feed error:', feed.error.message);
+      return;
+    }
+
+    const result = feed.result || {};
+    const records = result.data || [];
+    if (result.toVersion) lastLogVersion = result.toVersion;
+
+    if (records.length === 0) return;
+
+    // Get today's midnight for filtering
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const logRecords = [];
+    const statusUpdates = new Map();
+
+    for (const rec of records) {
+      const deviceId = rec.device?.id || '';
+      if (!deviceId) continue;
+
+      const recTime = new Date(rec.dateTime);
+      if (recTime < today) continue; // Only store today's records
+
+      logRecords.push({
+        deviceId,
+        latitude: rec.latitude || null,
+        longitude: rec.longitude || null,
+        speed: rec.speed || null,
+        heading: rec.heading || null,
+        odometer: rec.odometer || null,
+        recordTime: rec.dateTime,
+      });
+
+      // Keep latest record per device for vehicle_status update
+      const existing = statusUpdates.get(deviceId);
+      if (!existing || recTime > new Date(existing.recordTime)) {
+        statusUpdates.set(deviceId, {
+          latitude: rec.latitude,
+          longitude: rec.longitude,
+          speed: rec.speed,
+          recordTime: rec.dateTime,
+        });
+      }
+    }
+
+    // Store log records
+    if (logRecords.length > 0) {
+      await db.upsertVehicleLogRecords(logRecords);
+      console.log(`[GEOTAB] Stored ${logRecords.length} log records`);
+    }
+
+    // Update vehicle_status with latest positions
+    for (const [deviceId, data] of statusUpdates) {
+      const geotabDevice = await db.getGeotabDevice(deviceId);
+      const fleetNumber = geotabDevice?.fleet_number || null;
+      const licensePlate = geotabDevice?.license_plate || null;
+
+      await db.upsertVehicleStatus(deviceId, {
+        plate: geotabDevice?.name || null,
+        licensePlate,
+        fleetNumber,
+        speed: data.speed,
+        latitude: data.latitude,
+        longitude: data.longitude,
+        lastLogTime: data.recordTime,
+      });
+
+      // Check zone breaches
+      if (data.latitude && data.longitude) {
+        await checkZoneBreaches(deviceId, data.latitude, data.longitude, data.speed, fleetNumber, licensePlate);
+      }
+    }
+  } catch (error) {
+    console.error('[GEOTAB] Failed to sync log records:', error.message);
+  }
+}
+
+// ── Zone Breach Detection ──
+
+async function checkZoneBreaches(deviceId, lat, lon, speed, fleetNumber, licensePlate) {
+  try {
+    const zones = await db.getHighRiskZones();
+    const activeEntries = await db.getActiveZoneEntries(deviceId);
+    const activeZoneIds = new Set(activeEntries.map(e => e.zone_id));
+
+    for (const zone of zones) {
+      let points = zone.points;
+      if (typeof points === 'string') {
+        try { points = JSON.parse(points); } catch { continue; }
+      }
+      if (!Array.isArray(points) || points.length < 3) continue;
+
+      const isInside = isPointInPolygon(lat, lon, points);
+      const wasInside = activeZoneIds.has(zone.id);
+
+      if (isInside && !wasInside) {
+        // Vehicle entered zone
+        const riskLevel = zone.is_no_go ? 'CRITICAL' : 'HIGH';
+        const entry = await db.insertZoneEntry({
+          deviceId,
+          fleetNumber,
+          licensePlate,
+          zoneId: zone.id,
+          zoneName: zone.name,
+          riskLevel,
+          latitude: lat,
+          longitude: lon,
+          speed,
+          entryTime: new Date().toISOString(),
+        });
+
+        console.log(`[GEOTAB] Zone breach: ${fleetNumber || deviceId} entered ${zone.name} (${riskLevel})`);
+
+        // Broadcast via WebSocket
+        if (wsBroadcast && entry) {
+          wsBroadcast('zone_breach', {
+            id: entry.id,
+            deviceId,
+            fleetNumber,
+            licensePlate,
+            zoneId: zone.id,
+            zoneName: zone.name,
+            riskLevel,
+            latitude: lat,
+            longitude: lon,
+            speed,
+            entryTime: new Date().toISOString(),
+          });
+        }
+      } else if (!isInside && wasInside) {
+        // Vehicle exited zone — mark as inactive
+        const existing = activeEntries.find(e => e.zone_id === zone.id);
+        if (existing) {
+          await db.query(
+            'UPDATE high_risk_zone_entries SET is_active = FALSE, exit_time = NOW() WHERE id = $1',
+            [existing.id]
+          );
+        }
+      }
+    }
+  } catch (error) {
+    console.error('[GEOTAB] Zone breach check failed:', error.message);
+  }
+}
+
 async function fetchAndStoreVehicleStatus() {
   try {
     const response = await apiClient.makeRequest('/device/page', {
@@ -456,6 +676,7 @@ async function initialSync() {
   await syncGeotabExceptionRules();
   await syncGeotabDiagnostics();
   await syncGeotabDevices();
+  await syncGeotabZones();
   console.log('[GEOTAB] Initial sync complete');
 }
 
@@ -474,6 +695,7 @@ function startPolling(intervalMs = 60000) {
   initialSync().then(() => {
     fetchAndStoreEvents();
     fetchAndStoreVehicleStatus();
+    syncLogRecords();
 
     pollingInterval = setInterval(async () => {
       await syncFleetVehicles();
@@ -482,8 +704,15 @@ function startPolling(intervalMs = 60000) {
       await syncGeotabDiagnostics();
       await syncGeotabDevices();
       await syncGeotabEvents();
+      await syncGeotabZones();
+      await syncLogRecords();
       await fetchAndStoreVehicleStatus();
     }, intervalMs);
+
+    // Sync zones less frequently (every 5 minutes)
+    setInterval(async () => {
+      await syncGeotabZones();
+    }, 5 * 60 * 1000);
 
     console.log(`[GEOTAB] Polling started every ${intervalMs / 1000}s`);
   });
@@ -500,4 +729,4 @@ function stopPolling() {
   }
 }
 
-module.exports = { startPolling, stopPolling, syncGeotabEvents, initialSync };
+module.exports = { startPolling, stopPolling, syncGeotabEvents, initialSync, setWsBroadcast };
