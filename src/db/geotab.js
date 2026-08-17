@@ -189,29 +189,34 @@ async function getExceptionRule(id) {
 
 async function upsertDiagnostics(diagnostics) {
   if (!diagnostics || diagnostics.length === 0) return;
-  const values = diagnostics.map((_, idx) => {
-    const base = idx * 5;
-    return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5})`;
-  }).join(', ');
+  const batchSize = 50;
+  for (let i = 0; i < diagnostics.length; i += batchSize) {
+    const batch = diagnostics.slice(i, i + batchSize).filter(d => d.id && d.name);
+    if (batch.length === 0) continue;
+    const values = batch.map((_, idx) => {
+      const base = idx * 5;
+      return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5})`;
+    }).join(', ');
 
-  const params = diagnostics.flatMap(d => [
-    d.id,
-    d.name,
-    d.unit || null,
-    JSON.stringify(d.raw_data || {}),
-    new Date(),
-  ]);
+    const params = batch.flatMap(d => [
+      d.id,
+      d.name,
+      d.unit || null,
+      JSON.stringify(d.raw_data || {}),
+      new Date(),
+    ]);
 
-  await query(
-    `INSERT INTO geotab_diagnostics (id, name, unit, raw_data, last_synced)
-     VALUES ${values}
-     ON CONFLICT (id) DO UPDATE SET
-       name = EXCLUDED.name,
-       unit = EXCLUDED.unit,
-       raw_data = EXCLUDED.raw_data,
-       last_synced = EXCLUDED.last_synced`,
-    params
-  );
+    await query(
+      `INSERT INTO geotab_diagnostics (id, name, unit, raw_data, last_synced)
+       VALUES ${values}
+       ON CONFLICT (id) DO UPDATE SET
+         name = EXCLUDED.name,
+         unit = EXCLUDED.unit,
+         raw_data = EXCLUDED.raw_data,
+         last_synced = EXCLUDED.last_synced`,
+      params
+    ).catch(err => console.error('[GEOTAB] Diagnostics batch error:', err.message));
+  }
 }
 
 async function getDiagnostic(id) {

@@ -134,17 +134,14 @@ async function syncGeotabGroups() {
 
   try {
     const credentials = await geotabAuthenticate(database, username, password);
-    const feed = await geotabMultiCall(credentials, [
-      { method: 'Get', params: { typeName: 'Group' } },
-    ]);
+    const response = await geotabGet(credentials, 'Group');
 
-    if (feed.error) {
-      console.error('[GEOTAB] Group error:', feed.error.message);
+    if (response.error) {
+      console.error('[GEOTAB] Group error:', response.error.message);
       return;
     }
 
-    const results = feed.result || [];
-    const groups = (Array.isArray(results) && results.length > 0) ? results[0] : [];
+    const groups = response.result || [];
 
     if (groups.length > 0) {
       const enriched = groups.map(g => ({
@@ -156,8 +153,6 @@ async function syncGeotabGroups() {
       }));
       await db.upsertGeotabGroups(enriched);
       console.log(`[GEOTAB] Synced ${groups.length} groups`);
-    } else {
-      console.log('[GEOTAB] No groups returned from MultiCall');
     }
   } catch (error) {
     console.error('[GEOTAB] Failed to sync groups:', error.message);
@@ -174,17 +169,14 @@ async function syncGeotabExceptionRules() {
 
   try {
     const credentials = await geotabAuthenticate(database, username, password);
-    const feed = await geotabMultiCall(credentials, [
-      { method: 'Get', params: { typeName: 'ExceptionRule' } },
-    ]);
+    const response = await geotabGet(credentials, 'Rule');
 
-    if (feed.error) {
-      console.error('[GEOTAB] ExceptionRule error:', feed.error.message);
+    if (response.error) {
+      console.error('[GEOTAB] ExceptionRule error:', response.error.message);
       return;
     }
 
-    const results = feed.result || [];
-    const rules = (Array.isArray(results) && results.length > 0) ? results[0] : [];
+    const rules = response.result || [];
 
     if (rules.length > 0) {
       const enriched = rules.map(r => ({
@@ -195,8 +187,6 @@ async function syncGeotabExceptionRules() {
       }));
       await db.upsertExceptionRules(enriched);
       console.log(`[GEOTAB] Synced ${rules.length} exception rules`);
-    } else {
-      console.log('[GEOTAB] No exception rules returned from MultiCall');
     }
   } catch (error) {
     console.error('[GEOTAB] Failed to sync exception rules:', error.message);
@@ -213,17 +203,14 @@ async function syncGeotabDiagnostics() {
 
   try {
     const credentials = await geotabAuthenticate(database, username, password);
-    const feed = await geotabMultiCall(credentials, [
-      { method: 'Get', params: { typeName: 'Diagnostic' } },
-    ]);
+    const response = await geotabGet(credentials, 'Diagnostic');
 
-    if (feed.error) {
-      console.error('[GEOTAB] Diagnostic error:', feed.error.message);
+    if (response.error) {
+      console.error('[GEOTAB] Diagnostic error:', response.error.message);
       return;
     }
 
-    const results = feed.result || [];
-    const diagnostics = (Array.isArray(results) && results.length > 0) ? results[0] : [];
+    const diagnostics = response.result || [];
 
     if (diagnostics.length > 0) {
       const enriched = diagnostics.map(d => ({
@@ -234,8 +221,6 @@ async function syncGeotabDiagnostics() {
       }));
       await db.upsertDiagnostics(enriched);
       console.log(`[GEOTAB] Synced ${diagnostics.length} diagnostics`);
-    } else {
-      console.log('[GEOTAB] No diagnostics returned from MultiCall');
     }
   } catch (error) {
     console.error('[GEOTAB] Failed to sync diagnostics:', error.message);
@@ -323,6 +308,12 @@ async function syncGeotabEvents() {
     const events = result.data || [];
     if (result.toVersion) lastEventVersion = result.toVersion;
 
+    // On first load, just set the version cursor — don't process millions of old events
+    if (fromVersion === -1) {
+      console.log(`[GEOTAB] ExceptionEvent: initialized version cursor (${events.length} total records, skipping historical)`);
+      return;
+    }
+
     if (events.length === 0) return;
 
     let inserted = 0;
@@ -333,21 +324,14 @@ async function syncGeotabEvents() {
         const ruleId = event.rule?.id || '';
         const diagnosticId = event.diagnostic?.id || null;
 
+        // Filter: only store events for devices we know about
         const device = await db.getGeotabDevice(geotabDeviceId);
-        const rule = await db.getExceptionRule(ruleId);
-        const diagnostic = diagnosticId ? await db.getDiagnostic(diagnosticId) : null;
-
+        if (!device) {
+          skipped++;
+          continue;
+        }
         const fleetNumber = device?.fleet_number || null;
         const licensePlate = device?.license_plate || null;
-
-        // Filter: only store events for fleet vehicles
-        if (fleetNumber || licensePlate) {
-          const isFleet = await db.isFleetVehicle(fleetNumber, licensePlate);
-          if (!isFleet) {
-            skipped++;
-            continue;
-          }
-        }
 
         const eventName = rule?.name || ruleId;
         const eventCode = ruleId;
@@ -471,6 +455,7 @@ async function syncLogRecords() {
   if (!database || !username || !password) return;
 
   try {
+    console.log('[GEOTAB] Syncing log records...');
     const credentials = await geotabAuthenticate(database, username, password);
     const fromVersion = lastLogVersion === null ? -1 : lastLogVersion;
     const feed = await geotabGetFeed(credentials, 'LogRecord', fromVersion);
@@ -484,7 +469,16 @@ async function syncLogRecords() {
     const records = result.data || [];
     if (result.toVersion) lastLogVersion = result.toVersion;
 
-    if (records.length === 0) return;
+    // On first load, just set the version cursor — don't process millions of old records
+    if (fromVersion === -1) {
+      console.log(`[GEOTAB] LogRecord: initialized version cursor (${records.length} total records, skipping historical)`);
+      return;
+    }
+
+    if (records.length === 0) {
+      console.log(`[GEOTAB] LogRecord feed: 0 records (fromVersion=${fromVersion})`);
+      return;
+    }
 
     // Get today's midnight for filtering
     const today = new Date();
