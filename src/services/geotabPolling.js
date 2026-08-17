@@ -227,6 +227,56 @@ async function syncGeotabDiagnostics() {
   }
 }
 
+// ── Sync: DeviceStatusInfo (current positions) ──
+
+async function syncDeviceStatus() {
+  const database = process.env.GEOTAB_DATABASE;
+  const username = process.env.GEOTAB_USERNAME;
+  const password = process.env.GEOTAB_PASSWORD;
+  if (!database || !username || !password) return;
+
+  try {
+    const credentials = await geotabAuthenticate(database, username, password);
+    const response = await geotabGet(credentials, 'DeviceStatusInfo');
+
+    if (response.error) {
+      console.error('[GEOTAB] DeviceStatusInfo error:', response.error.message);
+      return;
+    }
+
+    const devices = response.result || [];
+    let updated = 0;
+
+    for (const d of devices) {
+      const deviceId = d.device?.id || '';
+      if (!deviceId || !d.latitude || !d.longitude) continue;
+
+      const geotabDevice = await db.getGeotabDevice(deviceId);
+      if (!geotabDevice) continue; // Only update known fleet devices
+
+      await db.upsertVehicleStatus(deviceId, {
+        plate: geotabDevice.name || null,
+        licensePlate: geotabDevice.license_plate || null,
+        fleetNumber: geotabDevice.fleet_number || null,
+        speed: d.speed || null,
+        latitude: d.latitude,
+        longitude: d.longitude,
+        lastLogTime: d.dateTime || null,
+      });
+
+      // Check zone breaches
+      if (d.latitude && d.longitude) {
+        await checkZoneBreaches(deviceId, d.latitude, d.longitude, d.speed, geotabDevice.fleet_number, geotabDevice.license_plate);
+      }
+      updated++;
+    }
+
+    if (updated > 0) console.log(`[GEOTAB] DeviceStatusInfo: updated ${updated} vehicle positions`);
+  } catch (error) {
+    console.error('[GEOTAB] Failed to sync device status:', error.message);
+  }
+}
+
 // ── Sync: Devices ──
 
 async function syncGeotabDevices() {
@@ -469,9 +519,31 @@ async function syncLogRecords() {
     const records = result.data || [];
     if (result.toVersion) lastLogVersion = result.toVersion;
 
-    // On first load, just set the version cursor — don't process millions of old records
+    // On first load, process records but only keep latest per device for vehicle_status
     if (fromVersion === -1) {
-      console.log(`[GEOTAB] LogRecord: initialized version cursor (${records.length} total records, skipping historical)`);
+      const latestPerDevice = new Map();
+      for (const rec of records) {
+        const deviceId = rec.device?.id || '';
+        if (!deviceId || !rec.latitude || !rec.longitude) continue;
+        const existing = latestPerDevice.get(deviceId);
+        if (!existing || new Date(rec.dateTime) > new Date(existing.dateTime)) {
+          latestPerDevice.set(deviceId, rec);
+        }
+      }
+      // Update vehicle_status with latest positions
+      for (const [deviceId, rec] of latestPerDevice) {
+        const geotabDevice = await db.getGeotabDevice(deviceId);
+        await db.upsertVehicleStatus(deviceId, {
+          plate: geotabDevice?.name || null,
+          licensePlate: geotabDevice?.license_plate || null,
+          fleetNumber: geotabDevice?.fleet_number || null,
+          speed: rec.speed,
+          latitude: rec.latitude,
+          longitude: rec.longitude,
+          lastLogTime: rec.dateTime,
+        });
+      }
+      console.log(`[GEOTAB] LogRecord: initialized version cursor, updated ${latestPerDevice.size} vehicle positions from ${records.length} historical records`);
       return;
     }
 
@@ -690,6 +762,7 @@ function startPolling(intervalMs = 60000) {
     fetchAndStoreEvents();
     fetchAndStoreVehicleStatus();
     syncLogRecords();
+    syncDeviceStatus();
 
     pollingInterval = setInterval(async () => {
       await syncFleetVehicles();
@@ -700,6 +773,7 @@ function startPolling(intervalMs = 60000) {
       await syncGeotabEvents();
       await syncGeotabZones();
       await syncLogRecords();
+      await syncDeviceStatus();
       await fetchAndStoreVehicleStatus();
     }, intervalMs);
 
