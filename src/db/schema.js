@@ -230,6 +230,19 @@ const MIGRATIONS_SQL = `
   CREATE INDEX IF NOT EXISTS idx_telematics_events_device_time ON telematics_events(device_id, event_time);
 
   -- Add missing columns to vehicle_status
+  CREATE TABLE IF NOT EXISTS vehicle_status (
+    device_id TEXT PRIMARY KEY,
+    plate TEXT,
+    license_plate TEXT,
+    fleet_number TEXT,
+    engine_on BOOLEAN,
+    ignition_on BOOLEAN,
+    speed DOUBLE PRECISION,
+    latitude DOUBLE PRECISION,
+    longitude DOUBLE PRECISION,
+    last_log_time TIMESTAMPTZ,
+    last_update TIMESTAMPTZ DEFAULT NOW()
+  );
   ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS speed DOUBLE PRECISION;
   ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION;
   ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION;
