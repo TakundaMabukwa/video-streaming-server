@@ -441,13 +441,14 @@ async function syncGeotabEvents() {
           }
         }
 
-        await db.query(
+        const insertResult = await db.query(
           `INSERT INTO telematics_events
            (device_id, vehicle_id, license_plate, fleet_number, plate,
             event_type, event_code, severity, latitude, longitude, speed,
             address, driver_name, description, raw_data, event_time)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
-           ON CONFLICT DO NOTHING`,
+           ON CONFLICT DO NOTHING
+           RETURNING id`,
           [
             geotabDeviceId,
             geotabDeviceId,
@@ -468,6 +469,26 @@ async function syncGeotabEvents() {
           ]
         );
         inserted++;
+
+        // Broadcast real-time event to connected frontends
+        if (wsBroadcast && insertResult.rows.length > 0) {
+          const row = insertResult.rows[0];
+          wsBroadcast('new_event', {
+            id: row.id,
+            deviceId: geotabDeviceId,
+            fleetNumber,
+            licensePlate,
+            eventType: eventName,
+            eventCode,
+            severity,
+            latitude: evtLat,
+            longitude: evtLon,
+            speed: evtSpeed,
+            driverName,
+            description: diagName,
+            eventTime: event.activeFrom || event.lastModifiedDateTime || new Date().toISOString(),
+          });
+        }
       } catch (err) {
         // skip individual event errors
       }
