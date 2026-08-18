@@ -185,6 +185,11 @@ async function getExceptionRule(id) {
   return result.rows[0] || null;
 }
 
+async function getAllExceptionRules() {
+  const result = await query('SELECT * FROM geotab_exception_rules ORDER BY name');
+  return result.rows;
+}
+
 // ── Diagnostics ──
 
 async function upsertDiagnostics(diagnostics) {
@@ -487,6 +492,7 @@ module.exports = {
   getAllGeotabGroups,
   upsertExceptionRules,
   getExceptionRule,
+  getAllExceptionRules,
   upsertDiagnostics,
   getDiagnostic,
   upsertFleetVehicles,

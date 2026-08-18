@@ -13,6 +13,16 @@ let credentialsExpiry = null;
 let lastDeviceVersion = null;
 let lastEventVersion = null;
 let lastDiagnosticsVersion = null;
+let lastLogVersion = null;
+
+// In-memory cache of Geotab rule names keyed by rule id
+const ruleNameCache = new Map();
+
+function getRuleName(ruleId) {
+  if (!ruleId) return null;
+  if (ruleNameCache.has(ruleId)) return ruleNameCache.get(ruleId);
+  return ruleId;
+}
 
 // Prevent feed backlogs from overwhelming the DB on a single poll cycle
 const MAX_EVENTS_PER_POLL = 1000;
@@ -78,9 +88,13 @@ async function geotabAuthenticate(database, userName, password) {
 }
 
 function geotabGetFeed(credentials, typeName, fromVersion) {
+  const params = { typeName, credentials };
+  if (fromVersion !== null && fromVersion !== undefined) {
+    params.fromVersion = fromVersion;
+  }
   return geotabFetch({
     method: 'GetFeed',
-    params: { typeName, fromVersion, credentials },
+    params,
     id: 10,
     jsonrpc: '2.0',
   });
@@ -191,10 +205,26 @@ async function syncGeotabExceptionRules() {
         raw_data: r,
       }));
       await db.upsertExceptionRules(enriched);
+      // Update in-memory rule name cache
+      for (const r of enriched) {
+        ruleNameCache.set(r.id, r.name);
+      }
       console.log(`[GEOTAB] Synced ${rules.length} exception rules`);
     }
   } catch (error) {
     console.error('[GEOTAB] Failed to sync exception rules:', error.message);
+  }
+}
+
+async function loadRuleNameCache() {
+  try {
+    const rules = await db.getAllExceptionRules ? await db.getAllExceptionRules() : [];
+    for (const r of rules) {
+      ruleNameCache.set(r.id, r.name || r.id);
+    }
+    console.log(`[GEOTAB] Loaded ${ruleNameCache.size} rule names from DB`);
+  } catch (err) {
+    console.error('[GEOTAB] Failed to load rule cache:', err.message);
   }
 }
 
@@ -366,8 +396,8 @@ async function syncGeotabEvents() {
 
   try {
     const credentials = await geotabAuthenticate(database, username, password);
-    const fromVersion = lastEventVersion === null ? -1 : lastEventVersion;
-    const feed = await geotabGetFeed(credentials, 'ExceptionEvent', fromVersion);
+    // Use null for first call; Geotab returns only new records and a toVersion cursor
+    const feed = await geotabGetFeed(credentials, 'ExceptionEvent', lastEventVersion);
 
     if (feed.error) {
       console.error('[GEOTAB] ExceptionEvent feed error:', feed.error.message);
@@ -378,13 +408,14 @@ async function syncGeotabEvents() {
     let events = result.data || [];
     if (result.toVersion) lastEventVersion = result.toVersion;
 
-    // On first load, just set the version cursor — don't process millions of old events
-    if (fromVersion === -1) {
-      console.log(`[GEOTAB] ExceptionEvent: initialized version cursor (${events.length} total records, skipping historical)`);
+    if (events.length === 0) {
+      if (lastEventVersion === null) {
+        console.log('[GEOTAB] ExceptionEvent: no new records, cursor not yet set');
+      }
       return;
     }
 
-    if (events.length === 0) return;
+    console.log(`[GEOTAB] ExceptionEvent: received ${events.length} new records`);
 
     // Cap per-cycle processing to protect the DB from large backlogs
     let dropped = 0;
@@ -403,7 +434,6 @@ async function syncGeotabEvents() {
       try {
         const geotabDeviceId = event.device?.id || '';
         const ruleId = event.rule?.id || '';
-        const diagnosticId = event.diagnostic?.id || null;
 
         // Filter: only store events for devices we know about
         const device = await db.getGeotabDevice(geotabDeviceId);
@@ -414,10 +444,12 @@ async function syncGeotabEvents() {
         const fleetNumber = device?.fleet_number || null;
         const licensePlate = device?.license_plate || null;
 
-        const eventName = event.rule?.name || ruleId;
+        // Resolve human-readable rule name from cache or event payload
+        const eventName = getRuleName(ruleId) || event.rule?.name || ruleId;
         const eventCode = ruleId;
         const severity = getSeverity(eventName);
         const durationSeconds = db.parseDuration(event.duration);
+        const distance = typeof event.distance === 'number' ? event.distance : null;
 
         const driverName = typeof event.driver === 'object' && event.driver?.name
           ? event.driver.name
@@ -441,12 +473,14 @@ async function syncGeotabEvents() {
           }
         }
 
+        const eventTime = event.activeFrom || event.lastModifiedDateTime || new Date();
+
         const insertResult = await db.query(
           `INSERT INTO telematics_events
            (device_id, vehicle_id, license_plate, fleet_number, plate,
             event_type, event_code, severity, latitude, longitude, speed,
-            address, driver_name, description, raw_data, event_time)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+            address, driver_name, description, distance, duration_seconds, raw_data, event_time)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
            ON CONFLICT DO NOTHING
            RETURNING id`,
           [
@@ -464,8 +498,10 @@ async function syncGeotabEvents() {
             evtAddress,
             driverName,
             diagName,
+            distance,
+            durationSeconds,
             JSON.stringify(event),
-            event.activeFrom || event.lastModifiedDateTime || new Date(),
+            eventTime,
           ]
         );
         inserted++;
@@ -484,9 +520,11 @@ async function syncGeotabEvents() {
             latitude: evtLat,
             longitude: evtLon,
             speed: evtSpeed,
+            distance,
+            durationSeconds,
             driverName,
             description: diagName,
-            eventTime: event.activeFrom || event.lastModifiedDateTime || new Date().toISOString(),
+            eventTime: new Date(eventTime).toISOString(),
           });
         }
       } catch (err) {
@@ -565,8 +603,6 @@ async function syncGeotabZones() {
 }
 
 // ── Sync Log Records (GPS positions) ──
-
-let lastLogVersion = null;
 
 async function syncLogRecords() {
   const database = process.env.GEOTAB_DATABASE;
@@ -810,6 +846,7 @@ async function initialSync() {
   await syncFleetVehicles();
   await syncGeotabGroups();
   await syncGeotabExceptionRules();
+  await loadRuleNameCache();
   await syncGeotabDiagnostics();
   await syncGeotabDevices();
   await syncGeotabZones();
