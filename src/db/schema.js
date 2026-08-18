@@ -140,6 +140,7 @@ const MIGRATIONS_SQL = `
   );
 
   CREATE INDEX IF NOT EXISTS idx_alert_definitions_category ON alert_definitions(category);
+  ALTER TABLE alert_definitions ADD CONSTRAINT IF NOT EXISTS alert_definitions_signal_code_unique UNIQUE (signal_code);
   CREATE INDEX IF NOT EXISTS idx_alert_group_configs_severity ON alert_group_configs(severity);
   CREATE INDEX IF NOT EXISTS idx_alert_group_config_members_group ON alert_group_config_members(group_config_id);
 
