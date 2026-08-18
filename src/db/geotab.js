@@ -385,6 +385,8 @@ async function getLatestLogRecord(deviceId) {
 // ── Vehicle Status ──
 
 async function upsertVehicleStatus(deviceId, data) {
+  // Upsert only the fields provided in `data`. Because all dynamic fields use COALESCE,
+  // missing/null values keep the last known value instead of blanking the row.
   await query(
     `INSERT INTO vehicle_status (device_id, plate, license_plate, fleet_number, engine_on, ignition_on, speed, latitude, longitude, last_log_time, last_update)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
