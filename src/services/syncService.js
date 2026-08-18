@@ -364,19 +364,11 @@ async function syncAlerts(deviceIds, startTime, endTime) {
     }
   }
 
+  // Media fetching disabled during auto-sync — frontend no longer uses pre-fetched media.
+  // On-demand media fetch is still available via fetchMediaOnDemand().
   let mediaCount = 0;
   if (allNewRecords.length > 0) {
-    const groupMap = {};
-    for (const r of allNewRecords) {
-      const key = `${r.deviceId}:${r.alarmType}`.toLowerCase();
-      if (!groupMap[key] || new Date(r.alarmTs || 0) > new Date(groupMap[key].alarmTs || 0)) {
-        groupMap[key] = r;
-      }
-    }
-    const latestPerGroup = Object.values(groupMap);
-    console.log(`[SYNC] ${allNewRecords.length} new alerts across ${latestPerGroup.length} groups — fetching media per group`);
-    mediaCount = await fetchMediaForAlerts(latestPerGroup, {});
-    console.log(`[SYNC] Media fetch done: ${mediaCount} files`);
+    console.log(`[SYNC] ${allNewRecords.length} new alerts synced (media fetch disabled)`);
   }
 
   return { newCount: allNewRecords.length, mediaCount };
@@ -470,12 +462,11 @@ function getStatus() {
 
 async function startAutoSync(intervalMs = 60000) {
   await runSync();
-  await refetchMissingMedia();
+  // Media refetch disabled — alerts are synced without constant media fetching.
   syncState.syncInterval = setInterval(async () => {
     await runSync();
-    await refetchMissingMedia();
   }, intervalMs);
-  console.log(`[SYNC] Auto-sync every ${intervalMs / 1000}s with media refetch`);
+  console.log(`[SYNC] Auto-sync every ${intervalMs / 1000}s (media fetch disabled)`);
 }
 
 function stopAutoSync() {
