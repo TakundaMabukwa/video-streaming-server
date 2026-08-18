@@ -229,9 +229,18 @@ async function getDiagnostic(id) {
 
 async function upsertFleetVehicles(vehicles) {
   if (!vehicles || vehicles.length === 0) return;
+
+  // Deduplicate by fleet_number + registration_number (keep last occurrence)
+  const uniqueMap = new Map();
+  for (const v of vehicles) {
+    const key = `${v.fleet_number || ''}:${v.registration_number || ''}`;
+    uniqueMap.set(key, v);
+  }
+  const uniqueVehicles = Array.from(uniqueMap.values());
+
   const batchSize = 100;
-  for (let i = 0; i < vehicles.length; i += batchSize) {
-    const batch = vehicles.slice(i, i + batchSize);
+  for (let i = 0; i < uniqueVehicles.length; i += batchSize) {
+    const batch = uniqueVehicles.slice(i, i + batchSize);
     const values = batch.map((_, idx) => {
       const base = idx * 6;
       return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6})`;
