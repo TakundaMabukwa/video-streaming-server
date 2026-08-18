@@ -199,6 +199,71 @@ const MIGRATIONS_SQL = `
 
   CREATE INDEX IF NOT EXISTS idx_driver_config_criteria_name ON driver_config_criteria(name);
 
+  -- Geotab devices
+  CREATE TABLE IF NOT EXISTS geotab_devices (
+    id TEXT PRIMARY KEY,
+    name TEXT,
+    fleet_number TEXT,
+    license_plate TEXT,
+    device_type TEXT,
+    vin TEXT,
+    serial_number TEXT,
+    fuel_tank_capacity DOUBLE PRECISION,
+    timezone TEXT,
+    is_active BOOLEAN DEFAULT TRUE,
+    active_from TIMESTAMPTZ,
+    active_to TIMESTAMPTZ,
+    groups JSONB DEFAULT '[]',
+    raw_data JSONB DEFAULT '{}',
+    last_synced TIMESTAMPTZ DEFAULT NOW(),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  );
+  CREATE INDEX IF NOT EXISTS idx_geotab_devices_fleet ON geotab_devices(fleet_number);
+  CREATE INDEX IF NOT EXISTS idx_geotab_devices_plate ON geotab_devices(license_plate);
+
+  -- Geotab groups
+  CREATE TABLE IF NOT EXISTS geotab_groups (
+    id TEXT PRIMARY KEY,
+    name TEXT,
+    parent_id TEXT,
+    is_global BOOLEAN DEFAULT FALSE,
+    raw_data JSONB DEFAULT '{}',
+    last_synced TIMESTAMPTZ DEFAULT NOW()
+  );
+
+  -- Geotab exception rules
+  CREATE TABLE IF NOT EXISTS geotab_exception_rules (
+    id TEXT PRIMARY KEY,
+    name TEXT,
+    description TEXT,
+    raw_data JSONB DEFAULT '{}',
+    last_synced TIMESTAMPTZ DEFAULT NOW()
+  );
+
+  -- Geotab diagnostics
+  CREATE TABLE IF NOT EXISTS geotab_diagnostics (
+    id TEXT PRIMARY KEY,
+    name TEXT,
+    unit TEXT,
+    raw_data JSONB DEFAULT '{}',
+    last_synced TIMESTAMPTZ DEFAULT NOW()
+  );
+
+  -- Fleet vehicles (synced from Supabase)
+  CREATE TABLE IF NOT EXISTS fleet_vehicles (
+    fleet_number TEXT,
+    registration_number TEXT,
+    make TEXT,
+    model TEXT,
+    cost_center TEXT,
+    last_synced TIMESTAMPTZ DEFAULT NOW(),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(fleet_number, registration_number)
+  );
+  CREATE INDEX IF NOT EXISTS idx_fleet_vehicles_fleet ON fleet_vehicles(fleet_number);
+
   -- Telematics events from Geotab
   CREATE TABLE IF NOT EXISTS telematics_events (
     id SERIAL PRIMARY KEY,

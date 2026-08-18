@@ -383,7 +383,7 @@ async function syncGeotabEvents() {
         const fleetNumber = device?.fleet_number || null;
         const licensePlate = device?.license_plate || null;
 
-        const eventName = rule?.name || ruleId;
+        const eventName = event.rule?.name || ruleId;
         const eventCode = ruleId;
         const severity = getSeverity(eventName);
         const durationSeconds = db.parseDuration(event.duration);
@@ -391,6 +391,24 @@ async function syncGeotabEvents() {
         const driverName = typeof event.driver === 'object' && event.driver?.name
           ? event.driver.name
           : null;
+
+        const diagName = typeof event.diagnostic === 'object' && event.diagnostic?.name
+          ? event.diagnostic.name
+          : null;
+
+        let evtLat = event.latitude || null;
+        let evtLon = event.longitude || null;
+        let evtSpeed = event.speed || null;
+        let evtAddress = event.address || null;
+
+        if (!evtLat || !evtLon) {
+          const vehiclePos = await db.getVehicleStatus(geotabDeviceId);
+          if (vehiclePos) {
+            evtLat = evtLat || vehiclePos.latitude;
+            evtLon = evtLon || vehiclePos.longitude;
+            evtSpeed = evtSpeed || vehiclePos.speed;
+          }
+        }
 
         await db.query(
           `INSERT INTO telematics_events
@@ -408,12 +426,12 @@ async function syncGeotabEvents() {
             eventName,
             eventCode,
             severity,
-            event.latitude || null,
-            event.longitude || null,
-            event.speed || null,
-            event.address || null,
+            evtLat,
+            evtLon,
+            evtSpeed,
+            evtAddress,
             driverName,
-            diagnostic?.name || null,
+            diagName,
             JSON.stringify(event),
             event.activeFrom || event.lastModifiedDateTime || new Date(),
           ]

@@ -64,12 +64,12 @@ router.get('/events/:deviceId', async (req, res) => {
   }
 });
 
-// Get all telematics events (for map plotting)
+// Get all telematics events
 router.get('/events', async (req, res) => {
   try {
     const { deviceId, type, days = 30, limit = 500 } = req.query;
 
-    let query = `SELECT * FROM telematics_events WHERE latitude IS NOT NULL AND longitude IS NOT NULL`;
+    let query = `SELECT * FROM telematics_events WHERE 1=1`;
     const params = [];
     let paramIdx = 1;
 

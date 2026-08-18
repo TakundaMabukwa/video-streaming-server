@@ -455,8 +455,9 @@ async function getZoneEntries(deviceId, from, to) {
 
 async function getAllActiveZoneEntries() {
   const result = await query(
-    `SELECT h.*, g.name as zone_name_full
+    `SELECT h.*, gz.name as zone_name_full
      FROM high_risk_zone_entries h
+     LEFT JOIN geotab_zones gz ON gz.id = h.zone_id
      WHERE h.is_active = TRUE
      ORDER BY h.entry_time DESC`
   );
