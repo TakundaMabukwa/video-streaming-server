@@ -14,6 +14,10 @@ let lastDeviceVersion = null;
 let lastEventVersion = null;
 let lastDiagnosticsVersion = null;
 
+// Prevent feed backlogs from overwhelming the DB on a single poll cycle
+const MAX_EVENTS_PER_POLL = 1000;
+const MAX_DIAGNOSTICS_PER_POLL = 5000;
+
 // ── Geotab HTTP helpers ──
 
 function geotabFetch(body) {
@@ -213,7 +217,7 @@ async function syncGeotabDiagnostics() {
     }
 
     const result = feed.result || {};
-    const diagnostics = result.data || [];
+    let diagnostics = result.data || [];
     if (result.toVersion) lastDiagnosticsVersion = result.toVersion;
 
     // On first load, just set the version cursor — don't process millions of old records
@@ -224,6 +228,12 @@ async function syncGeotabDiagnostics() {
 
     if (diagnostics.length === 0) return;
 
+    let diagDropped = 0;
+    if (diagnostics.length > MAX_DIAGNOSTICS_PER_POLL) {
+      diagDropped = diagnostics.length - MAX_DIAGNOSTICS_PER_POLL;
+      diagnostics = diagnostics.slice(0, MAX_DIAGNOSTICS_PER_POLL);
+    }
+
     const enriched = diagnostics.map(d => ({
       id: d.id,
       name: d.name || d.id,
@@ -231,7 +241,7 @@ async function syncGeotabDiagnostics() {
       raw_data: d,
     }));
     await db.upsertDiagnostics(enriched);
-    console.log(`[GEOTAB] Synced ${diagnostics.length} diagnostics`);
+    console.log(`[GEOTAB] Synced ${diagnostics.length} diagnostics${diagDropped > 0 ? ` (${diagDropped} dropped - backlog limit)` : ''}`);
   } catch (error) {
     console.error('[GEOTAB] Failed to sync diagnostics:', error.message);
   }
@@ -365,7 +375,7 @@ async function syncGeotabEvents() {
     }
 
     const result = feed.result || {};
-    const events = result.data || [];
+    let events = result.data || [];
     if (result.toVersion) lastEventVersion = result.toVersion;
 
     // On first load, just set the version cursor — don't process millions of old events
@@ -375,6 +385,17 @@ async function syncGeotabEvents() {
     }
 
     if (events.length === 0) return;
+
+    // Cap per-cycle processing to protect the DB from large backlogs
+    let dropped = 0;
+    if (events.length > MAX_EVENTS_PER_POLL) {
+      dropped = events.length - MAX_EVENTS_PER_POLL;
+      // Keep the most recent events (real-time dashboard only cares about recent ones)
+      events = events
+        .slice()
+        .sort((a, b) => new Date(b.activeFrom || b.lastModifiedDateTime || 0) - new Date(a.activeFrom || a.lastModifiedDateTime || 0))
+        .slice(0, MAX_EVENTS_PER_POLL);
+    }
 
     let inserted = 0;
     let skipped = 0;
@@ -452,8 +473,8 @@ async function syncGeotabEvents() {
       }
     }
 
-    if (inserted > 0 || skipped > 0) {
-      console.log(`[GEOTAB] Stored ${inserted} telematics events (${skipped} skipped - not fleet)`);
+    if (inserted > 0 || skipped > 0 || dropped > 0) {
+      console.log(`[GEOTAB] Stored ${inserted} telematics events (${skipped} skipped - not fleet${dropped > 0 ? `, ${dropped} dropped - backlog limit` : ''})`);
     }
   } catch (error) {
     console.error('[GEOTAB] Failed to sync events:', error.message);
