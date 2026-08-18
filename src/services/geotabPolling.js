@@ -24,6 +24,28 @@ function getRuleName(ruleId) {
   return ruleId;
 }
 
+async function resolveRuleName(credentials, ruleId) {
+  if (!ruleId || ruleNameCache.has(ruleId)) return getRuleName(ruleId);
+  try {
+    const response = await geotabGetById(credentials, 'Rule', ruleId);
+    if (response.error) return ruleId;
+    const rules = response.result || [];
+    const rule = rules.find((r) => r.id === ruleId);
+    if (rule?.name) {
+      ruleNameCache.set(ruleId, rule.name);
+      // Also persist to DB asynchronously (fire-and-forget)
+      db.upsertExceptionRules([{
+        id: rule.id,
+        name: rule.name,
+        description: rule.description || null,
+        raw_data: rule,
+      }]).catch(() => {});
+      return rule.name;
+    }
+  } catch {}
+  return ruleId;
+}
+
 // Prevent feed backlogs from overwhelming the DB on a single poll cycle
 const MAX_EVENTS_PER_POLL = 1000;
 const MAX_DIAGNOSTICS_PER_POLL = 5000;
@@ -104,6 +126,15 @@ function geotabGet(credentials, typeName) {
   return geotabFetch({
     method: 'Get',
     params: { typeName, credentials },
+    id: 10,
+    jsonrpc: '2.0',
+  });
+}
+
+function geotabGetById(credentials, typeName, id) {
+  return geotabFetch({
+    method: 'Get',
+    params: { typeName, credentials, search: { id } },
     id: 10,
     jsonrpc: '2.0',
   });
@@ -444,8 +475,9 @@ async function syncGeotabEvents() {
         const fleetNumber = device?.fleet_number || null;
         const licensePlate = device?.license_plate || null;
 
-        // Resolve human-readable rule name from cache or event payload
-        const eventName = getRuleName(ruleId) || event.rule?.name || ruleId;
+        // Resolve human-readable rule name from cache, DB, or Geotab on demand
+        const resolvedRuleName = await resolveRuleName(credentials, ruleId);
+        const eventName = resolvedRuleName || event.rule?.name || ruleId;
         const eventCode = ruleId;
         const severity = getSeverity(eventName);
         const durationSeconds = db.parseDuration(event.duration);
