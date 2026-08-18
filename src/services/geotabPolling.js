@@ -12,6 +12,7 @@ let credentialsExpiry = null;
 
 let lastDeviceVersion = null;
 let lastEventVersion = null;
+let lastDiagnosticsVersion = null;
 
 // ── Geotab HTTP helpers ──
 
@@ -203,25 +204,34 @@ async function syncGeotabDiagnostics() {
 
   try {
     const credentials = await geotabAuthenticate(database, username, password);
-    const response = await geotabGet(credentials, 'Diagnostic');
+    const fromVersion = lastDiagnosticsVersion === null ? -1 : lastDiagnosticsVersion;
+    const feed = await geotabGetFeed(credentials, 'Diagnostic', fromVersion);
 
-    if (response.error) {
-      console.error('[GEOTAB] Diagnostic error:', response.error.message);
+    if (feed.error) {
+      console.error('[GEOTAB] Diagnostic feed error:', feed.error.message);
       return;
     }
 
-    const diagnostics = response.result || [];
+    const result = feed.result || {};
+    const diagnostics = result.data || [];
+    if (result.toVersion) lastDiagnosticsVersion = result.toVersion;
 
-    if (diagnostics.length > 0) {
-      const enriched = diagnostics.map(d => ({
-        id: d.id,
-        name: d.name || d.id,
-        unit: d.unit || null,
-        raw_data: d,
-      }));
-      await db.upsertDiagnostics(enriched);
-      console.log(`[GEOTAB] Synced ${diagnostics.length} diagnostics`);
+    // On first load, just set the version cursor — don't process millions of old records
+    if (fromVersion === -1) {
+      console.log(`[GEOTAB] Diagnostic: initialized version cursor (${diagnostics.length} total records, skipping historical)`);
+      return;
     }
+
+    if (diagnostics.length === 0) return;
+
+    const enriched = diagnostics.map(d => ({
+      id: d.id,
+      name: d.name || d.id,
+      unit: d.unit || null,
+      raw_data: d,
+    }));
+    await db.upsertDiagnostics(enriched);
+    console.log(`[GEOTAB] Synced ${diagnostics.length} diagnostics`);
   } catch (error) {
     console.error('[GEOTAB] Failed to sync diagnostics:', error.message);
   }
