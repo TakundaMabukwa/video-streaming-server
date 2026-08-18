@@ -140,7 +140,16 @@ const MIGRATIONS_SQL = `
   );
 
   CREATE INDEX IF NOT EXISTS idx_alert_definitions_category ON alert_definitions(category);
-  ALTER TABLE alert_definitions ADD CONSTRAINT IF NOT EXISTS alert_definitions_signal_code_unique UNIQUE (signal_code);
+  DO $$
+  BEGIN
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_constraint
+      WHERE conname = 'alert_definitions_signal_code_unique'
+      AND conrelid = 'alert_definitions'::regclass
+    ) THEN
+      ALTER TABLE alert_definitions ADD CONSTRAINT alert_definitions_signal_code_unique UNIQUE (signal_code);
+    END IF;
+  END $$;
   CREATE INDEX IF NOT EXISTS idx_alert_group_configs_severity ON alert_group_configs(severity);
   CREATE INDEX IF NOT EXISTS idx_alert_group_config_members_group ON alert_group_config_members(group_config_id);
 
