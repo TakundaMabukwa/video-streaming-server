@@ -3,6 +3,7 @@ const syncService = require('../services/syncService');
 const { sendSuccess, sendError } = require('../helpers/response');
 const { uploadDocument } = require('../helpers/storage');
 const { transformDbAlert } = require('../helpers/transform');
+const { getVideoSeverityMap } = require('../db/alert_definitions');
 
 async function getAlertsList(req, res) {
   try {
@@ -87,11 +88,12 @@ async function getAlertTypes(req, res) {
 async function getActiveAlerts(req, res) {
   try {
     const limit = parseInt(req.query.limit) || 2000;
+    const severityMap = await getVideoSeverityMap();
 
     // Read from alert_groups for grouped view
     const groups = await db.getActiveAlertGroupsWithMedia({ limit });
 
-    const alerts = groups.map(transformDbAlert);
+    const alerts = groups.map((g) => transformDbAlert(g, severityMap));
 
     res.json({ success: true, alerts, count: alerts.length, total: alerts.length, source: 'eps-db' });
   } catch (error) {
@@ -102,10 +104,11 @@ async function getActiveAlerts(req, res) {
 async function getResolvedAlerts(req, res) {
   try {
     const limit = parseInt(req.query.limit) || 2000;
+    const severityMap = await getVideoSeverityMap();
 
     const groups = await db.getResolvedAlertGroupsWithMedia({ limit });
 
-    const alerts = groups.map(transformDbAlert);
+    const alerts = groups.map((g) => transformDbAlert(g, severityMap));
 
     res.json({ success: true, alerts, count: alerts.length, total: alerts.length, source: 'eps-db' });
   } catch (error) {
@@ -116,10 +119,11 @@ async function getResolvedAlerts(req, res) {
 async function getActiveAlertsAll(req, res) {
   try {
     const limit = parseInt(req.query.limit) || 2000;
+    const severityMap = await getVideoSeverityMap();
 
     const groups = await db.getActiveAlertGroupsAll({ limit });
 
-    const alerts = groups.map(transformDbAlert);
+    const alerts = groups.map((g) => transformDbAlert(g, severityMap));
 
     res.json({ success: true, alerts, count: alerts.length, total: alerts.length, source: 'eps-db' });
   } catch (error) {
@@ -131,6 +135,7 @@ async function getAlertById(req, res) {
   try {
     const { id } = req.params;
     if (!id) return sendError(res, 'Alert ID required', 400);
+    const severityMap = await getVideoSeverityMap();
 
     // Try group lookup first, fall back to individual alert
     let alert = await db.getAlertGroupByAlertId(id);
@@ -154,7 +159,7 @@ async function getAlertById(req, res) {
       alert.media = media || [];
     }
 
-    const transformed = transformDbAlert(alert);
+    const transformed = transformDbAlert(alert, severityMap);
     transformed.count = alert.count || 1;
     const media = alert.media || [];
     transformed.screenshots = media
@@ -217,6 +222,7 @@ async function getAlertMedia(req, res) {
     const { id } = req.params;
     const ensureMedia = req.query.ensureMedia === 'true';
     if (!id) return sendError(res, 'Alert ID required', 400);
+    const severityMap = await getVideoSeverityMap();
 
     // Try group lookup, fall back to individual alert
     let group = await db.getAlertGroupByAlertId(id);
@@ -292,7 +298,7 @@ async function getAlertMedia(req, res) {
       }
     }
 
-    const transformed = alert ? transformDbAlert(alert) : null;
+    const transformed = alert ? transformDbAlert(alert, severityMap) : null;
     if (group && transformed) transformed.count = group.count;
 
     const screenshots = finalImages.map((m, i) => ({

@@ -1,5 +1,6 @@
 const db = require('../db');
 const { sendSuccess, sendError } = require('../helpers/response');
+const { invalidateCache } = require('../db/alert_definitions');
 
 // ── Alert Definitions CRUD ──
 
@@ -32,6 +33,7 @@ async function createAlertDefinition(req, res) {
       [name.trim(), category, description, signal_code]
     );
     sendSuccess(res, result.rows[0], 'Alert definition created');
+    if (category === 'video') invalidateCache();
   } catch (error) {
     sendError(res, error.message, 500);
   }
@@ -40,7 +42,7 @@ async function createAlertDefinition(req, res) {
 async function updateAlertDefinition(req, res) {
   try {
     const { id } = req.params;
-    const { name, category, description, signal_code, is_active } = req.body;
+    const { name, category, description, signal_code, is_active, severity } = req.body;
     const fields = [];
     const values = [];
     let idx = 1;
@@ -52,6 +54,7 @@ async function updateAlertDefinition(req, res) {
     }
     if (description !== undefined) { fields.push(`description = $${idx++}`); values.push(description); }
     if (signal_code !== undefined) { fields.push(`signal_code = $${idx++}`); values.push(signal_code); }
+    if (severity !== undefined) { fields.push(`severity = $${idx++}`); values.push(String(severity).toUpperCase()); }
     if (is_active !== undefined) { fields.push(`is_active = $${idx++}`); values.push(is_active); }
     fields.push(`updated_at = NOW()`);
 
@@ -63,6 +66,7 @@ async function updateAlertDefinition(req, res) {
     );
     if (result.rows.length === 0) return sendError(res, 'Not found', 404);
     sendSuccess(res, result.rows[0], 'Alert definition updated');
+    invalidateCache();
   } catch (error) {
     sendError(res, error.message, 500);
   }
@@ -73,6 +77,7 @@ async function deleteAlertDefinition(req, res) {
     const { id } = req.params;
     await db.query('DELETE FROM alert_definitions WHERE id = $1', [id]);
     sendSuccess(res, { id }, 'Alert definition deleted');
+    invalidateCache();
   } catch (error) {
     sendError(res, error.message, 500);
   }

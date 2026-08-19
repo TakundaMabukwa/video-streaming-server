@@ -24,9 +24,16 @@ function toTitle(str) {
     .trim() || 'Alert';
 }
 
-function transformDbAlert(record) {
+/**
+ * Transform a raw alert_groups record into a frontend-friendly alert object.
+ * @param {object} record - raw DB row from alert_groups
+ * @param {object} [severityMap] - optional signal_code → severity map from alert_definitions.
+ *   When provided, severity is looked up from this map first.
+ *   Falls back to hardcoded PRIORITY_MAP if not found.
+ */
+function transformDbAlert(record, severityMap) {
   const alarmType = record.alarm_type || '';
-  const priority = PRIORITY_MAP[alarmType] || 'medium';
+  const priority = (severityMap && severityMap[alarmType]) || PRIORITY_MAP[alarmType] || 'medium';
   const documents = Array.isArray(record.documents) ? record.documents : [];
   const ts = record.last_alert_ts || record.alarm_ts;
   const id = record.last_alert_id || record.id;
