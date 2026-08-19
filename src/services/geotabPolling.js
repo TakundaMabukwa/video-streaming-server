@@ -680,6 +680,20 @@ async function syncLogRecords() {
           longitude: rec.longitude,
           lastLogTime: rec.dateTime,
         });
+
+        // Broadcast position update to fleet map
+        if (wsBroadcast && rec.latitude && rec.longitude) {
+          wsBroadcast('vehicle_position', {
+            device_id: deviceId,
+            plate: geotabDevice?.name || null,
+            license_plate: geotabDevice?.license_plate || null,
+            fleet_number: geotabDevice?.fleet_number || null,
+            speed: rec.speed,
+            latitude: rec.latitude,
+            longitude: rec.longitude,
+            last_log_time: rec.dateTime,
+          });
+        }
       }
       console.log(`[GEOTAB] LogRecord: initialized version cursor, updated ${latestPerDevice.size} vehicle positions from ${records.length} historical records`);
       return;
@@ -747,6 +761,20 @@ async function syncLogRecords() {
         longitude: data.longitude,
         lastLogTime: data.recordTime,
       });
+
+      // Broadcast position update to fleet map
+      if (wsBroadcast && data.latitude && data.longitude) {
+        wsBroadcast('vehicle_position', {
+          device_id: deviceId,
+          plate: geotabDevice?.name || null,
+          license_plate: licensePlate,
+          fleet_number: fleetNumber,
+          speed: data.speed,
+          latitude: data.latitude,
+          longitude: data.longitude,
+          last_log_time: data.recordTime,
+        });
+      }
 
       // Check zone breaches
       if (data.latitude && data.longitude) {
