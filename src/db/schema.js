@@ -123,7 +123,7 @@ const MIGRATIONS_SQL = `
   CREATE TABLE IF NOT EXISTS alert_group_configs (
     id SERIAL PRIMARY KEY,
     name TEXT NOT NULL,
-    severity INTEGER NOT NULL CHECK (severity BETWEEN 1 AND 10),
+    severity TEXT NOT NULL DEFAULT 'MEDIUM',
     description TEXT DEFAULT '',
     is_active BOOLEAN DEFAULT TRUE,
     created_at TIMESTAMPTZ DEFAULT NOW(),

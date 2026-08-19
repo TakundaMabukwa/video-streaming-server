@@ -109,16 +109,19 @@ async function listAlertGroupConfigs(req, res) {
   }
 }
 
+const VALID_SEVERITY = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'];
+
 async function createAlertGroupConfig(req, res) {
   try {
     const { name, severity, description = '', member_ids = [] } = req.body;
     if (!name) return sendError(res, 'name required', 400);
-    if (!Number.isFinite(severity) || severity < 1 || severity > 10) return sendError(res, 'severity must be 1-10', 400);
+    const sev = (severity || 'MEDIUM').toUpperCase();
+    if (!VALID_SEVERITY.includes(sev)) return sendError(res, 'severity must be CRITICAL, HIGH, MEDIUM, or LOW', 400);
 
     const groupResult = await db.query(
       `INSERT INTO alert_group_configs (name, severity, description)
        VALUES ($1, $2, $3) RETURNING *`,
-      [name.trim(), severity, description]
+      [name.trim(), sev, description]
     );
     const group = groupResult.rows[0];
 
@@ -153,8 +156,9 @@ async function updateAlertGroupConfig(req, res) {
 
     if (name !== undefined) { fields.push(`name = $${idx++}`); values.push(name.trim()); }
     if (severity !== undefined) {
-      if (severity < 1 || severity > 10) return sendError(res, 'severity must be 1-10', 400);
-      fields.push(`severity = $${idx++}`); values.push(severity);
+      const sev = String(severity).toUpperCase();
+      if (!VALID_SEVERITY.includes(sev)) return sendError(res, 'severity must be CRITICAL, HIGH, MEDIUM, or LOW', 400);
+      fields.push(`severity = $${idx++}`); values.push(sev);
     }
     if (description !== undefined) { fields.push(`description = $${idx++}`); values.push(description); }
     if (is_active !== undefined) { fields.push(`is_active = $${idx++}`); values.push(is_active); }
