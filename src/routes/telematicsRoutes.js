@@ -225,4 +225,78 @@ router.get('/log-records/:deviceId', async (req, res) => {
   }
 });
 
+// ── Priority Zones (high-risk + no-go first) ──
+
+router.get('/zones-priority', async (req, res) => {
+  try {
+    const allZones = await db.getGeotabZones();
+    const priority = allZones.filter(z => z.is_high_risk || z.is_no_go);
+    const rest = allZones.filter(z => !z.is_high_risk && !z.is_no_go);
+    res.json({ success: true, priority, rest, total: allZones.length });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ── Today's Events for a vehicle (from midnight) ──
+
+router.get('/events-today/:deviceId', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const result = await db.query(
+      `SELECT * FROM telematics_events
+       WHERE device_id = $1 AND event_time >= (NOW() AT TIME ZONE 'UTC')::date
+       ORDER BY event_time ASC`,
+      [deviceId]
+    );
+    res.json({ success: true, data: result.rows, count: result.rows.length });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ── Vehicle alert counts (active unresolved alerts per device) ──
+
+router.get('/vehicle-alerts', async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT device_id, COUNT(*) as alert_count,
+              MAX(alarm_ts) as latest_alert_ts,
+              ARRAY_AGG(DISTINCT alarm_type) as alert_types
+       FROM alerts
+       WHERE resolved = FALSE AND false_alert = FALSE
+       GROUP BY device_id`
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ── Vehicle status with enriched alert data ──
+
+router.get('/vehicle-status-all-enriched', async (req, res) => {
+  try {
+    const statuses = await db.query(
+      `SELECT vs.*,
+              COALESCE(a.alert_count, 0)::int as alert_count,
+              a.latest_alert_ts,
+              a.alert_types
+       FROM vehicle_status vs
+       LEFT JOIN (
+         SELECT device_id, COUNT(*) as alert_count,
+                MAX(alarm_ts) as latest_alert_ts,
+                ARRAY_AGG(DISTINCT alarm_type) as alert_types
+         FROM alerts
+         WHERE resolved = FALSE AND false_alert = FALSE
+         GROUP BY device_id
+       ) a ON vs.device_id = a.device_id
+       ORDER BY vs.fleet_number`
+    );
+    res.json({ success: true, data: statuses.rows, count: statuses.rows.length });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 module.exports = router;
