@@ -304,6 +304,7 @@ const MIGRATIONS_SQL = `
   ALTER TABLE telematics_events ADD COLUMN IF NOT EXISTS fleet_number TEXT;
   ALTER TABLE telematics_events ADD COLUMN IF NOT EXISTS distance DOUBLE PRECISION;
   ALTER TABLE telematics_events ADD COLUMN IF NOT EXISTS duration_seconds INTEGER;
+  ALTER TABLE telematics_events ADD COLUMN IF NOT EXISTS zone_name TEXT;
   CREATE INDEX IF NOT EXISTS idx_telematics_events_device_time ON telematics_events(device_id, event_time);
 
   -- Add missing columns to vehicle_status

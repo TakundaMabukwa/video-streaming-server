@@ -491,6 +491,11 @@ async function syncGeotabEvents() {
           ? event.diagnostic.name
           : null;
 
+        // Extract zone name from Geotab exception events
+        const zoneNameFromEvent = Array.isArray(event.zones) && event.zones.length > 0
+          ? event.zones.map(z => z.name).filter(Boolean).join(', ')
+          : null;
+
         let evtLat = event.latitude || null;
         let evtLon = event.longitude || null;
         let evtSpeed = event.speed || null;
@@ -511,8 +516,8 @@ async function syncGeotabEvents() {
           `INSERT INTO telematics_events
            (device_id, vehicle_id, license_plate, fleet_number, plate,
             event_type, event_code, severity, latitude, longitude, speed,
-            address, driver_name, description, distance, duration_seconds, raw_data, event_time)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+            address, driver_name, description, distance, duration_seconds, zone_name, raw_data, event_time)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
            ON CONFLICT DO NOTHING
            RETURNING id`,
           [
@@ -532,6 +537,7 @@ async function syncGeotabEvents() {
             diagName,
             distance,
             durationSeconds,
+            zoneNameFromEvent,
             JSON.stringify(event),
             eventTime,
           ]
@@ -556,6 +562,7 @@ async function syncGeotabEvents() {
             durationSeconds,
             driverName,
             description: diagName,
+            zoneName: zoneNameFromEvent,
             eventTime: new Date(eventTime).toISOString(),
           });
         }
