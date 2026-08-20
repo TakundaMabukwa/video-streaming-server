@@ -188,6 +188,18 @@ router.get('/zones', async (req, res) => {
   }
 });
 
+// Lightweight zones (no raw_data) for fast map rendering
+router.get('/zones-lite', async (req, res) => {
+  try {
+    const result = await db.query(
+      'SELECT id, name, points, is_high_risk, is_no_go FROM geotab_zones ORDER BY name'
+    );
+    res.json({ success: true, data: result.rows, count: result.rows.length });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // ── Zone Entries (breaches) ──
 
 router.get('/zone-entries', async (req, res) => {

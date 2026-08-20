@@ -600,6 +600,24 @@ function getZoneAlertLevel(name) {
   return 'INFO';
 }
 
+// Cache for all zones (refreshed every 5 minutes with syncGeotabZones)
+let cachedAllZones = [];
+function setCachedAllZones(zones) { cachedAllZones = zones; }
+
+function findCurrentZone(lat, lon) {
+  for (const zone of cachedAllZones) {
+    let points = zone.points;
+    if (typeof points === 'string') {
+      try { points = JSON.parse(points); } catch { continue; }
+    }
+    if (!Array.isArray(points) || points.length < 3) continue;
+    if (isPointInPolygon(lat, lon, points)) {
+      return { zone_id: zone.id, zone_name: zone.name, is_high_risk: zone.is_high_risk, is_no_go: zone.is_no_go };
+    }
+  }
+  return null;
+}
+
 // ── Sync Geotab Zones ──
 
 async function syncGeotabZones() {
@@ -629,6 +647,9 @@ async function syncGeotabZones() {
       const noGo = zones.filter(z => (z.name || '').toUpperCase().includes('NO GO'));
       console.log(`[GEOTAB] Synced ${zones.length} zones (${highRisk.length} high risk, ${noGo.length} no go)`);
     }
+    // Refresh cached zones for WS enrichment
+    const allZones = await db.getGeotabZones();
+    setCachedAllZones(allZones);
   } catch (error) {
     console.error('[GEOTAB] Failed to sync zones:', error.message);
   }
@@ -683,6 +704,7 @@ async function syncLogRecords() {
 
         // Broadcast position update to fleet map
         if (wsBroadcast && rec.latitude && rec.longitude) {
+          const currentZone = findCurrentZone(rec.latitude, rec.longitude);
           wsBroadcast('vehicle_position', {
             device_id: deviceId,
             plate: geotabDevice?.name || null,
@@ -692,6 +714,7 @@ async function syncLogRecords() {
             latitude: rec.latitude,
             longitude: rec.longitude,
             last_log_time: rec.dateTime,
+            current_zone: currentZone,
           });
         }
       }
@@ -764,6 +787,7 @@ async function syncLogRecords() {
 
       // Broadcast position update to fleet map
       if (wsBroadcast && data.latitude && data.longitude) {
+        const currentZone = findCurrentZone(data.latitude, data.longitude);
         wsBroadcast('vehicle_position', {
           device_id: deviceId,
           plate: geotabDevice?.name || null,
@@ -773,6 +797,7 @@ async function syncLogRecords() {
           latitude: data.latitude,
           longitude: data.longitude,
           last_log_time: data.recordTime,
+          current_zone: currentZone,
         });
       }
 
