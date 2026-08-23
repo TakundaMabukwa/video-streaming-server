@@ -1,10 +1,10 @@
 const { query } = require('./pool');
 
 async function upsertAlert(alert) {
-  const { id, deviceId, deviceName, alarmType, alarmTs, alarmTsEnd, lat, lon, alarmText, serialNo, fenceId, alarmExtension } = alert;
+  const { id, deviceId, deviceName, alarmType, alarmTs, alarmTsEnd, lat, lon, alarmText, serialNo, fenceId, alarmExtension, sourceType = 'video' } = alert;
   const result = await query(
-    `INSERT INTO alerts (id, device_id, device_name, alarm_type, alarm_ts, alarm_ts_end, lat, lon, alarm_text, serial_no, fence_id, alarm_extension)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+    `INSERT INTO alerts (id, device_id, device_name, alarm_type, alarm_ts, alarm_ts_end, lat, lon, alarm_text, serial_no, fence_id, alarm_extension, source_type)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
      ON CONFLICT (id) DO UPDATE SET
        device_name = EXCLUDED.device_name,
        alarm_type = EXCLUDED.alarm_type,
@@ -16,9 +16,10 @@ async function upsertAlert(alert) {
        serial_no = EXCLUDED.serial_no,
        fence_id = EXCLUDED.fence_id,
        alarm_extension = EXCLUDED.alarm_extension,
+       source_type = EXCLUDED.source_type,
        updated_at = NOW()
      RETURNING id`,
-    [id, deviceId, deviceName, alarmType, alarmTs, alarmTsEnd, lat, lon, alarmText, serialNo, fenceId, alarmExtension]
+    [id, deviceId, deviceName, alarmType, alarmTs, alarmTsEnd, lat, lon, alarmText, serialNo, fenceId, alarmExtension, sourceType]
   );
   return result.rows[0];
 }

@@ -1,10 +1,10 @@
 const { query } = require('./pool');
 
-async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, alertId, alarmTs, lat, lon }) {
+async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, alertId, alarmTs, lat, lon, sourceType = 'video' }) {
   const groupKey = `${deviceId}:${alarmType}`.toLowerCase();
   const result = await query(
-    `INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon)
-     VALUES ($1, $2, $3, $4, $5, 1, $6, $7, $8, $9)
+    `INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon, source_type)
+     VALUES ($1, $2, $3, $4, $5, 1, $6, $7, $8, $9, $10)
      ON CONFLICT (group_key) DO UPDATE SET
        count = alert_groups.count + 1,
        last_alert_id = $6,
@@ -15,7 +15,7 @@ async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, al
        alarm_text = COALESCE(NULLIF($5, ''), alert_groups.alarm_text),
        updated_at = NOW()
      RETURNING id`,
-    [groupKey, deviceId, deviceName, alarmType, alarmText, alertId, alarmTs, lat, lon]
+    [groupKey, deviceId, deviceName, alarmType, alarmText, alertId, alarmTs, lat, lon, sourceType]
   );
   return result.rows[0];
 }

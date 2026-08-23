@@ -1,6 +1,7 @@
 const db = require('../db');
 const https = require('https');
 const { fetchVehiclesFromSupabase } = require('../helpers/supabaseClient');
+const { getTelematicsSeverityMap } = require('../db/alert_definitions');
 
 const GEOTAB_URL = 'https://my.geotab.com/apiv1';
 
@@ -543,6 +544,58 @@ async function syncGeotabEvents() {
           ]
         );
         inserted++;
+
+        // Also store as alert in alerts + alert_groups tables (telematics source)
+        try {
+          const telematicsSeverityMap = await getTelematicsSeverityMap();
+          const eventLower = (eventName || '').toLowerCase();
+          // Map event name to a signal_code for alert_definitions lookup
+          let signalCode = 'exceptionEvent';
+          if (eventLower.includes('speed')) signalCode = 'speeding';
+          else if (eventLower.includes('braking') || eventLower.includes('harsh')) signalCode = 'harshBraking';
+          else if (eventLower.includes('cornering')) signalCode = 'harshCornering';
+          else if (eventLower.includes('acceleration') || eventLower.includes('rapid')) signalCode = 'rapidAcceleration';
+          else if (eventLower.includes('no go') || eventLower.includes('nogo')) signalCode = 'noGoZoneEntry';
+          else if (eventLower.includes('high risk') || eventLower.includes('highrisk')) signalCode = 'highRiskZoneEntry';
+          else if (eventLower.includes('zone') || eventLower.includes('fence')) signalCode = 'zoneBreach';
+          else if (eventLower.includes('idle')) signalCode = 'idling';
+          else if (eventLower.includes('tow')) signalCode = 'tow';
+          else if (eventLower.includes('battery')) signalCode = 'batteryLow';
+          else if (eventLower.includes('remov') || eventLower.includes('tamper')) signalCode = 'deviceRemoved';
+          else if (eventLower.includes('seatbelt')) signalCode = 'seatBelt';
+
+          const alertSeverity = (telematicsSeverityMap[signalCode] || severity || 'MEDIUM').toLowerCase();
+          const alertId = `tel-${geotabDeviceId}-${Date.now()}-${inserted}`;
+          const deviceName = fleetNumber ? `${fleetNumber}${licensePlate ? ' - ' + licensePlate : ''}` : geotabDeviceId;
+
+          // Insert into alerts table
+          await db.upsertAlert({
+            id: alertId,
+            deviceId: geotabDeviceId,
+            deviceName,
+            alarmType: signalCode,
+            alarmTs: eventTime,
+            lat: evtLat,
+            lon: evtLon,
+            alarmText: `${eventName}${zoneNameFromEvent ? ' in zone ' + zoneNameFromEvent : ''}`,
+            sourceType: 'telematics',
+          });
+
+          // Upsert into alert_groups
+          await db.upsertAlertGroup({
+            deviceId: geotabDeviceId,
+            deviceName,
+            alarmType: signalCode,
+            alarmText: `${eventName}${zoneNameFromEvent ? ' in zone ' + zoneNameFromEvent : ''}`,
+            alertId,
+            alarmTs: eventTime,
+            lat: evtLat,
+            lon: evtLon,
+            sourceType: 'telematics',
+          });
+        } catch (alertErr) {
+          // Non-critical: don't fail event processing if alert creation fails
+        }
 
         // Broadcast real-time event to connected frontends
         if (wsBroadcast && insertResult.rows.length > 0) {

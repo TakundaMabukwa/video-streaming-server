@@ -307,6 +307,29 @@ const MIGRATIONS_SQL = `
   ALTER TABLE telematics_events ADD COLUMN IF NOT EXISTS zone_name TEXT;
   CREATE INDEX IF NOT EXISTS idx_telematics_events_device_time ON telematics_events(device_id, event_time);
 
+  -- Add source_type to alerts and alert_groups (video vs telematics)
+  ALTER TABLE alerts ADD COLUMN IF NOT EXISTS source_type TEXT DEFAULT 'video';
+  ALTER TABLE alert_groups ADD COLUMN IF NOT EXISTS source_type TEXT DEFAULT 'video';
+  CREATE INDEX IF NOT EXISTS idx_alerts_source_type ON alerts(source_type);
+  CREATE INDEX IF NOT EXISTS idx_alert_groups_source_type ON alert_groups(source_type);
+
+  -- Seed telematics alert_definitions (Geotab exception events)
+  INSERT INTO alert_definitions (name, category, signal_code, severity, description, is_active) VALUES
+  ('Speeding', 'telematics', 'speeding', 'HIGH', 'Vehicle exceeding speed limit (Geotab)', true),
+  ('Harsh Braking', 'telematics', 'harshBraking', 'MEDIUM', 'Sudden deceleration detected', true),
+  ('Harsh Cornering', 'telematics', 'harshCornering', 'MEDIUM', 'Aggressive turn detected', true),
+  ('Rapid Acceleration', 'telematics', 'rapidAcceleration', 'MEDIUM', 'Aggressive acceleration detected', true),
+  ('Zone Breach', 'telematics', 'zoneBreach', 'HIGH', 'Vehicle entered restricted zone', true),
+  ('No-Go Zone Entry', 'telematics', 'noGoZoneEntry', 'CRITICAL', 'Vehicle entered no-go zone', true),
+  ('High-Risk Zone Entry', 'telematics', 'highRiskZoneEntry', 'HIGH', 'Vehicle entered high-risk zone', true),
+  ('Idling', 'telematics', 'idling', 'LOW', 'Vehicle idling for extended period', true),
+  ('Engine Hours', 'telematics', 'engineHours', 'LOW', 'Excessive engine hours detected', true),
+  ('Battery Low', 'telematics', 'batteryLow', 'MEDIUM', 'Device battery low', true),
+  ('Tow Detected', 'telematics', 'tow', 'HIGH', 'Vehicle being towed', true),
+  ('Device Removed', 'telematics', 'deviceRemoved', 'CRITICAL', 'Tracking device tampered/removed', true),
+  ('Exception Event', 'telematics', 'exceptionEvent', 'MEDIUM', 'General Geotab exception event', true)
+  ON CONFLICT (signal_code) DO NOTHING;
+
   -- Add missing columns to vehicle_status
   CREATE TABLE IF NOT EXISTS vehicle_status (
     device_id TEXT PRIMARY KEY,

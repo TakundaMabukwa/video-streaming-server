@@ -4,6 +4,9 @@ let cachedMap = null;
 let cacheTime = 0;
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
+let cachedTelematicsMap = null;
+let telematicsCacheTime = 0;
+
 /**
  * Load video alert definitions and return a signal_code → severity map.
  * Results are cached in memory for 5 minutes.
@@ -36,9 +39,41 @@ async function getVideoSeverityMap() {
   }
 }
 
+/**
+ * Load telematics alert definitions and return a signal_code → severity map.
+ */
+async function getTelematicsSeverityMap() {
+  const now = Date.now();
+  if (cachedTelematicsMap && now - telematicsCacheTime < CACHE_TTL_MS) {
+    return cachedTelematicsMap;
+  }
+
+  try {
+    const result = await db.query(
+      `SELECT signal_code, severity FROM alert_definitions WHERE category = 'telematics' AND is_active = true`
+    );
+
+    const map = {};
+    for (const row of result.rows) {
+      if (row.signal_code) {
+        map[row.signal_code] = (row.severity || 'MEDIUM').toLowerCase();
+      }
+    }
+
+    cachedTelematicsMap = map;
+    telematicsCacheTime = now;
+    return map;
+  } catch (error) {
+    console.error('[alert_definitions] Failed to load telematics severity map:', error.message);
+    return cachedTelematicsMap || {};
+  }
+}
+
 function invalidateCache() {
   cachedMap = null;
   cacheTime = 0;
+  cachedTelematicsMap = null;
+  telematicsCacheTime = 0;
 }
 
-module.exports = { getVideoSeverityMap, invalidateCache };
+module.exports = { getVideoSeverityMap, getTelematicsSeverityMap, invalidateCache };
