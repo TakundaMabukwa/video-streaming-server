@@ -161,6 +161,25 @@ async function getAlertById(req, res) {
 
     const transformed = transformDbAlert(alert, severityMap);
     transformed.count = alert.count || 1;
+
+    // For telematics alerts, fetch speed from telematics_events
+    if (transformed.source_type === 'telematics' && transformed.device_id) {
+      try {
+        const speedResult = await db.query(
+          `SELECT speed, distance, duration_seconds FROM telematics_events
+           WHERE device_id = $1 AND event_time IS NOT NULL
+           ORDER BY event_time DESC LIMIT 1`,
+          [transformed.device_id]
+        );
+        if (speedResult.rows.length > 0) {
+          transformed.speed = speedResult.rows[0].speed;
+          transformed.distance = speedResult.rows[0].distance;
+          transformed.duration_seconds = speedResult.rows[0].duration_seconds;
+          transformed.metadata = { ...transformed.metadata, speed: speedResult.rows[0].speed };
+        }
+      } catch (e) { /* non-critical */ }
+    }
+
     const media = alert.media || [];
     transformed.screenshots = media
       .filter((m) => m.file_type === '00' || !m.file_type || m.file_type === '01')

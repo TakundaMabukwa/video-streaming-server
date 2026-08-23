@@ -473,8 +473,19 @@ async function syncGeotabEvents() {
           skipped++;
           continue;
         }
-        const fleetNumber = device?.fleet_number || null;
-        const licensePlate = device?.license_plate || null;
+        let fleetNumber = device?.fleet_number || null;
+        let licensePlate = device?.license_plate || null;
+
+        // If fleet_number looks like a Geotab short ID (e.g. "b59"), resolve proper name from vehicle_status
+        if (fleetNumber && /^b?[0-9a-f]+$/i.test(fleetNumber) && fleetNumber.length < 10) {
+          try {
+            const vs = await db.getVehicleStatus(geotabDeviceId);
+            if (vs) {
+              fleetNumber = vs.fleet_number || fleetNumber;
+              licensePlate = vs.license_plate || vs.plate || licensePlate;
+            }
+          } catch (e) { /* non-critical */ }
+        }
 
         // Resolve human-readable rule name from cache, DB, or Geotab on demand
         const resolvedRuleName = await resolveRuleName(credentials, ruleId);
