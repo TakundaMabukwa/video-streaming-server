@@ -594,7 +594,7 @@ async function syncGeotabEvents() {
             sourceType: 'telematics',
           });
         } catch (alertErr) {
-          // Non-critical: don't fail event processing if alert creation fails
+          console.error('[GEOTAB] Failed to create telematics alert:', alertErr.message);
         }
 
         // Broadcast real-time event to connected frontends
