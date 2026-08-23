@@ -505,7 +505,19 @@ async function followUpAlert(req, res) {
     const { id } = req.params;
     const { originalSeverity } = req.body || {};
 
-    const group = await db.getAlertGroupByAlertId(id);
+    // Try group lookup by last_alert_id first
+    let group = await db.getAlertGroupByAlertId(id);
+
+    // If not found, try to find via the alerts table (telematics alerts may not match group last_alert_id)
+    if (!group) {
+      const alertRow = await db.query('SELECT device_id, alarm_type FROM alerts WHERE id = $1', [id]);
+      if (alertRow.rows.length > 0) {
+        const { device_id, alarm_type } = alertRow.rows[0];
+        const groupKey = `${device_id}:${alarm_type}`.toLowerCase();
+        group = await db.getAlertGroupByKey(groupKey);
+      }
+    }
+
     if (!group) {
       return res.status(404).json({ success: false, message: `Alert ${id} not found` });
     }
@@ -532,7 +544,17 @@ async function followUpAlert(req, res) {
 async function clearFollowUp(req, res) {
   try {
     const { id } = req.params;
-    const group = await db.getAlertGroupByAlertId(id);
+
+    let group = await db.getAlertGroupByAlertId(id);
+    if (!group) {
+      const alertRow = await db.query('SELECT device_id, alarm_type FROM alerts WHERE id = $1', [id]);
+      if (alertRow.rows.length > 0) {
+        const { device_id, alarm_type } = alertRow.rows[0];
+        const groupKey = `${device_id}:${alarm_type}`.toLowerCase();
+        group = await db.getAlertGroupByKey(groupKey);
+      }
+    }
+
     if (!group) {
       return res.status(404).json({ success: false, message: `Alert ${id} not found` });
     }
