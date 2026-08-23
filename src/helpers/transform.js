@@ -39,6 +39,17 @@ function transformDbAlert(record, severityMap) {
   const id = record.last_alert_id || record.id;
   const deviceId = record.device_id;
 
+  // Follow-up: if follow_up is active and within 15 minutes, override severity to low
+  let effectiveSeverity = priority;
+  if (record.follow_up && record.follow_up_at) {
+    const followUpTime = new Date(record.follow_up_at).getTime();
+    const elapsed = Date.now() - followUpTime;
+    const FIFTEEN_MIN_MS = 15 * 60 * 1000;
+    if (elapsed < FIFTEEN_MIN_MS) {
+      effectiveSeverity = 'low';
+    }
+  }
+
   const media = Array.isArray(record.media) ? record.media : [];
   const screenshotEntries = media
     .filter((m) => m.file_type === '00' || !m.file_type || m.file_type === '01')
@@ -54,8 +65,11 @@ function transformDbAlert(record, severityMap) {
     id,
     alert_type: alarmType,
     type: alarmType,
-    priority,
-    severity: priority,
+    priority: effectiveSeverity,
+    severity: effectiveSeverity,
+    original_severity: record.follow_up ? priority : null,
+    follow_up: !!record.follow_up,
+    follow_up_at: record.follow_up_at ? new Date(record.follow_up_at).toISOString() : null,
     status: record.resolved ? 'resolved' : (record.status || 'new'),
     title: toTitle(alarmType),
     resolved: !!record.resolved,

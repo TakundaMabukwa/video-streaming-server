@@ -313,6 +313,11 @@ const MIGRATIONS_SQL = `
   CREATE INDEX IF NOT EXISTS idx_alerts_source_type ON alerts(source_type);
   CREATE INDEX IF NOT EXISTS idx_alert_groups_source_type ON alert_groups(source_type);
 
+  -- Follow-up: temporarily lower severity for 15 minutes
+  ALTER TABLE alert_groups ADD COLUMN IF NOT EXISTS follow_up BOOLEAN DEFAULT FALSE;
+  ALTER TABLE alert_groups ADD COLUMN IF NOT EXISTS follow_up_at TIMESTAMPTZ;
+  ALTER TABLE alert_groups ADD COLUMN IF NOT EXISTS original_severity TEXT;
+
   -- Seed telematics alert_definitions (Geotab exception events)
   INSERT INTO alert_definitions (name, category, signal_code, severity, description, is_active) VALUES
   ('Speeding', 'telematics', 'speeding', 'HIGH', 'Vehicle exceeding speed limit (Geotab)', true),

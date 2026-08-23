@@ -500,6 +500,54 @@ async function uploadDocumentToAlert(req, res) {
   }
 }
 
+async function followUpAlert(req, res) {
+  try {
+    const { id } = req.params;
+    const { originalSeverity } = req.body || {};
+
+    const group = await db.getAlertGroupByAlertId(id);
+    if (!group) {
+      return res.status(404).json({ success: false, message: `Alert ${id} not found` });
+    }
+
+    await db.resolveAlertGroup(group.group_key, {
+      follow_up: true,
+      follow_up_at: new Date().toISOString(),
+      original_severity: originalSeverity || group.original_severity || null,
+    });
+
+    res.json({
+      success: true,
+      alertId: id,
+      action: 'follow-up',
+      follow_up: true,
+      follow_up_at: new Date().toISOString(),
+      message: `Alert ${id} set to follow-up (15 min low priority)`,
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+}
+
+async function clearFollowUp(req, res) {
+  try {
+    const { id } = req.params;
+    const group = await db.getAlertGroupByAlertId(id);
+    if (!group) {
+      return res.status(404).json({ success: false, message: `Alert ${id} not found` });
+    }
+
+    await db.resolveAlertGroup(group.group_key, {
+      follow_up: false,
+      follow_up_at: null,
+    });
+
+    res.json({ success: true, alertId: id, action: 'clear-follow-up' });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+}
+
 module.exports = {
   getAlertsList,
   getAlertDetail,
@@ -518,4 +566,6 @@ module.exports = {
   escalateAlert,
   markFalseAlert,
   uploadDocumentToAlert,
+  followUpAlert,
+  clearFollowUp,
 };

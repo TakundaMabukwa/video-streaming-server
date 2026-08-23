@@ -156,6 +156,18 @@ async function resolveAlertGroup(groupKey, updates) {
     sets.push(`status = $${idx++}`);
     params.push(updates.status);
   }
+  if (updates.follow_up !== undefined) {
+    sets.push(`follow_up = $${idx++}`);
+    params.push(updates.follow_up);
+  }
+  if (updates.follow_up_at !== undefined) {
+    sets.push(`follow_up_at = $${idx++}`);
+    params.push(updates.follow_up_at);
+  }
+  if (updates.original_severity !== undefined) {
+    sets.push(`original_severity = $${idx++}`);
+    params.push(updates.original_severity);
+  }
   sets.push(`updated_at = NOW()`);
 
   params.push(groupKey.toLowerCase());

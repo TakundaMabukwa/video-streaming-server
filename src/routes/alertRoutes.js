@@ -1,6 +1,6 @@
 const express = require('express');
 const { getAlertTypes, getAlarmPage, getAlertFeed, getAlarmFilesById, getAlarmFilesByPage, getDevices } = require('../controllers/alertController');
-const { getActiveAlerts, getActiveAlertsAll, getResolvedAlerts, getAlertById, getAlertScreenshots, getAlertMedia, acknowledgeAlert, resolveAlert, escalateAlert, markFalseAlert, uploadDocumentToAlert } = require('../controllers/dbAlertController');
+const { getActiveAlerts, getActiveAlertsAll, getResolvedAlerts, getAlertById, getAlertScreenshots, getAlertMedia, acknowledgeAlert, resolveAlert, escalateAlert, markFalseAlert, uploadDocumentToAlert, followUpAlert, clearFollowUp } = require('../controllers/dbAlertController');
 const db = require('../db');
 const apiClient = require('../helpers/apiClient');
 
@@ -46,6 +46,8 @@ router.post('/:id/acknowledge', acknowledgeAlert);
 router.post('/:id/close', resolveAlert);
 router.post('/:id/escalate', escalateAlert);
 router.post('/:id/mark-false', markFalseAlert);
+router.post('/:id/follow-up', followUpAlert);
+router.post('/:id/clear-follow-up', clearFollowUp);
 router.post('/:id/documents', uploadDocumentToAlert);
 router.get('/:id', getAlertById);
 
