@@ -593,8 +593,9 @@ async function syncGeotabEvents() {
             lon: evtLon,
             sourceType: 'telematics',
           });
+          console.log(`[GEOTAB] Telematics alert created: ${alertId} (${signalCode}) for device ${geotabDeviceId}`);
         } catch (alertErr) {
-          console.error('[GEOTAB] Failed to create telematics alert:', alertErr.message);
+          console.error('[GEOTAB] Failed to create telematics alert:', alertErr.message, alertErr.stack);
         }
 
         // Broadcast real-time event to connected frontends

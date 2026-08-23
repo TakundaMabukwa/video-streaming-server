@@ -19,7 +19,7 @@ async function upsertAlert(alert) {
        source_type = EXCLUDED.source_type,
        updated_at = NOW()
      RETURNING id`,
-    [id, deviceId, deviceName, alarmType, alarmTs, alarmTsEnd, lat, lon, alarmText, serialNo, fenceId, alarmExtension, sourceType]
+    [id, deviceId, deviceName, alarmType, alarmTs || null, alarmTsEnd || null, lat || null, lon || null, alarmText, serialNo || null, fenceId || null, alarmExtension || null, sourceType]
   );
   return result.rows[0];
 }
