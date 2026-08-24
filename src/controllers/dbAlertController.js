@@ -580,7 +580,7 @@ async function resolveAlertsBulk(req, res) {
     const results = [];
     for (const id of alertIds) {
       try {
-        const updates = { resolved: true, false_alert: closureType === 'false_alert' };
+        const updates = { resolved: true, false_alert: closureType === 'false_alert', resolved_at: new Date().toISOString() };
         if (notes) updates.notes = notes;
         const alert = await db.updateAlertStatus(id, updates);
         if (!alert) { results.push({ id, success: false, message: 'Not found' }); continue; }
