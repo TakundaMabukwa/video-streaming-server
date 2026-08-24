@@ -8,6 +8,7 @@ const alertRoutes = require('./alertRoutes');
 const alertConfigRoutes = require('./alertConfigRoutes');
 const driverConfigRoutes = require('./driverConfigRoutes');
 const telematicsRoutes = require('./telematicsRoutes');
+const policeRoutes = require('./policeRoutes');
 
 const router = express.Router();
 
@@ -20,5 +21,6 @@ router.use('/alerts', alertRoutes);
 router.use('/alert-config', alertConfigRoutes);
 router.use('/driver-config', driverConfigRoutes);
 router.use('/telematics', telematicsRoutes);
+router.use('/police', policeRoutes);
 
 module.exports = router;

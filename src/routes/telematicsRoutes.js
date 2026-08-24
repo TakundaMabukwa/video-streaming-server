@@ -285,6 +285,24 @@ router.get('/vehicle-alerts', async (req, res) => {
   }
 });
 
+// All unresolved alert groups for a specific device (used by resolve modal)
+router.get('/vehicle-alerts/:deviceId', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const result = await db.query(
+      `SELECT ag.*, a.lat, a.lon, a.driver_name, a.device_name
+       FROM alert_groups ag
+       LEFT JOIN alerts a ON a.id = ag.last_alert_id
+       WHERE ag.device_id = $1 AND ag.resolved = FALSE AND ag.false_alert = FALSE
+       ORDER BY ag.last_alert_ts DESC`,
+      [deviceId]
+    );
+    res.json({ success: true, data: result.rows, count: result.rows.length });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // ── Vehicle status with enriched alert data ──
 
 router.get('/vehicle-status-all-enriched', async (req, res) => {

@@ -6,6 +6,8 @@ const apiClient = require('../helpers/apiClient');
 
 const router = express.Router();
 
+const { resolveAlertsBulk } = require('../controllers/dbAlertController');
+
 router.get('/types', getAlertTypes);
 router.post('/page', getAlarmPage);
 router.get('/feed', getAlertFeed);
@@ -16,6 +18,7 @@ router.get('/devices', getDevices);
 router.get('/active', getActiveAlerts);
 router.get('/active-all', getActiveAlertsAll);
 router.get('/resolved', getResolvedAlerts);
+router.post('/bulk-close', resolveAlertsBulk);
 router.get('/:id/screenshots', getAlertScreenshots);
 router.get('/:id/media', getAlertMedia);
 router.post('/:id/capture', async (req, res) => {

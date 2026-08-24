@@ -570,6 +570,44 @@ async function clearFollowUp(req, res) {
   }
 }
 
+async function resolveAlertsBulk(req, res) {
+  try {
+    const { alertIds, userId, notes, closureType = 'resolved', documents: docData } = req.body || {};
+    if (!Array.isArray(alertIds) || alertIds.length === 0) {
+      return res.status(400).json({ success: false, message: 'alertIds array is required' });
+    }
+
+    const results = [];
+    for (const id of alertIds) {
+      try {
+        const updates = { resolved: true, false_alert: closureType === 'false_alert' };
+        if (notes) updates.notes = notes;
+        const alert = await db.updateAlertStatus(id, updates);
+        if (!alert) { results.push({ id, success: false, message: 'Not found' }); continue; }
+
+        const group = await db.getAlertGroupByAlertId(id);
+        if (group) {
+          await db.resolveAlertGroup(group.group_key, { resolved: true, false_alert: closureType === 'false_alert', resolved_by: userId || null, resolved_at: new Date().toISOString(), notes: notes || null });
+        }
+
+        if (docData && docData.length > 0) {
+          const docs = docData.map(d => ({ type: d.type, timestamp: d.timestamp || new Date().toISOString(), filled_by: d.filled_by || userId || 'unknown', link: d.link })).filter(d => d.type && d.link);
+          if (docs.length > 0) await db.addAlertDocument(id, docs);
+        }
+
+        results.push({ id, success: true });
+      } catch (e) {
+        results.push({ id, success: false, message: e.message });
+      }
+    }
+
+    const resolved = results.filter(r => r.success).length;
+    res.json({ success: true, resolved, total: alertIds.length, results, message: `${resolved}/${alertIds.length} alerts resolved` });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+}
+
 module.exports = {
   getAlertsList,
   getAlertDetail,
@@ -585,6 +623,7 @@ module.exports = {
   getAlertMedia,
   acknowledgeAlert,
   resolveAlert,
+  resolveAlertsBulk,
   escalateAlert,
   markFalseAlert,
   uploadDocumentToAlert,
