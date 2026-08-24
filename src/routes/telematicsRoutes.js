@@ -300,7 +300,7 @@ router.get('/vehicle-alerts/:deviceId', async (req, res) => {
     let paramIdx = 1;
 
     // Match by device_id or fleet number in device_name
-    if (deviceId) {
+    if (deviceId && deviceId !== 'none') {
       query += ` AND (ag.device_id = $${paramIdx} OR ag.device_name ILIKE $${paramIdx + 1})`;
       params.push(deviceId, `%${deviceId}%`);
       paramIdx += 2;
@@ -309,6 +309,10 @@ router.get('/vehicle-alerts/:deviceId', async (req, res) => {
       query += ` AND ag.device_name ILIKE $${paramIdx}`;
       params.push(`%${fleet}%`);
       paramIdx++;
+    }
+
+    if (params.length === 0) {
+      return res.json({ success: true, alerts: [], count: 0 });
     }
 
     query += ` ORDER BY ag.last_alert_ts DESC`;
