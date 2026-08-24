@@ -290,7 +290,7 @@ router.get('/vehicle-alerts/:deviceId', async (req, res) => {
   try {
     const { deviceId } = req.params;
     const result = await db.query(
-      `SELECT ag.*, a.lat, a.lon, a.driver_name, a.device_name
+      `SELECT ag.*, a.lat, a.lon, a.device_name
        FROM alert_groups ag
        LEFT JOIN alerts a ON a.id = ag.last_alert_id
        WHERE ag.device_id = $1 AND ag.resolved = FALSE AND ag.false_alert = FALSE
