@@ -30,9 +30,8 @@ router.post('/rules', async (req, res) => {
         await client.query(`
           INSERT INTO rtms_rules (module, rule_name, system_constraint, audit_focus, max_value, min_value, unit, enabled)
           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-          ON CONFLICT (id) DO UPDATE SET
+          ON CONFLICT (rule_name) DO UPDATE SET
             module = EXCLUDED.module,
-            rule_name = EXCLUDED.rule_name,
             system_constraint = EXCLUDED.system_constraint,
             audit_focus = EXCLUDED.audit_focus,
             max_value = EXCLUDED.max_value,

@@ -233,7 +233,7 @@ const MIGRATIONS_SQL = `
   CREATE TABLE IF NOT EXISTS rtms_rules (
     id SERIAL PRIMARY KEY,
     module TEXT NOT NULL,
-    rule_name TEXT NOT NULL,
+    rule_name TEXT NOT NULL UNIQUE,
     system_constraint TEXT DEFAULT '',
     audit_focus TEXT DEFAULT '',
     max_value NUMERIC DEFAULT 0,
