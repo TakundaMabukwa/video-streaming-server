@@ -18,8 +18,24 @@ router.get('/rules', async (req, res) => {
 router.post('/rules', async (req, res) => {
   try {
     const { rules } = req.body;
+
+    // Single rule creation with duplicate check
+    if (!Array.isArray(rules) && req.body.rule_name) {
+      const { module, rule_name, system_constraint, audit_focus, max_value, min_value, unit, enabled } = req.body;
+      const existing = await query('SELECT id FROM rtms_rules WHERE rule_name = $1', [rule_name]);
+      if (existing.rows.length > 0) {
+        return res.status(409).json({ success: false, message: `Rule "${rule_name}" already exists` });
+      }
+      const result = await query(`
+        INSERT INTO rtms_rules (module, rule_name, system_constraint, audit_focus, max_value, min_value, unit, enabled)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *
+      `, [module, rule_name, system_constraint || '', audit_focus || '', max_value || 0, min_value || 0, unit || '', enabled !== false]);
+      return res.json({ success: true, rule: result.rows[0] });
+    }
+
+    // Bulk upsert
     if (!Array.isArray(rules) || rules.length === 0) {
-      return res.status(400).json({ success: false, message: 'rules array required' });
+      return res.status(400).json({ success: false, message: 'rules array or rule_name required' });
     }
 
     const client = await getClient();
