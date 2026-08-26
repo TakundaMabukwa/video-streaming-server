@@ -985,6 +985,9 @@ async function fetchAndStoreVehicleStatus() {
         const fleetNumber = geotabDevice?.fleet_number || null;
         const licensePlate = geotabDevice?.license_plate || null;
 
+        const wasEngineOn = prevStatus?.engine_on || false;
+        const isEngineOn = isOnline;
+
         await db.query(
           `INSERT INTO vehicle_status (device_id, plate, license_plate, fleet_number, engine_on, ignition_on, last_update)
            VALUES ($1, $2, $3, $4, $5, $6, NOW())
@@ -995,6 +998,27 @@ async function fetchAndStoreVehicleStatus() {
              engine_on = $5, ignition_on = $6, last_update = NOW()`,
           [record.id, record.deviceName || null, licensePlate, fleetNumber, isOnline, isOnline]
         );
+
+        // RTMS: Log engine on/off transitions
+        try {
+          const rtmsService = require('./rtmsService');
+          if (isEngineOn && !wasEngineOn) {
+            const { query: rtmsQuery } = require('../db');
+            await rtmsQuery(
+              'INSERT INTO rtms_driving_sessions (device_id, fleet_number, registration_number, engine_on_at) VALUES ($1, $2, $3, NOW())',
+              [record.id, fleetNumber, licensePlate]
+            );
+          } else if (!isEngineOn && wasEngineOn) {
+            const { query: rtmsQuery } = require('../db');
+            await rtmsQuery(
+              "UPDATE rtms_driving_sessions SET engine_off_at = NOW() WHERE device_id = $1 AND engine_off_at IS NULL",
+              [record.id]
+            );
+          }
+        } catch (rtmsErr) {
+          // silent fail for RTMS logging
+        }
+
         updated++;
       } catch (err) {
         // skip

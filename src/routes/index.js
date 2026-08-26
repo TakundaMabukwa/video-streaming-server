@@ -8,6 +8,7 @@ const alertRoutes = require('./alertRoutes');
 const alertConfigRoutes = require('./alertConfigRoutes');
 const driverConfigRoutes = require('./driverConfigRoutes');
 const driverScoringRoutes = require('./driverScoringRoutes');
+const rtmsRoutes = require('./rtmsRoutes');
 const telematicsRoutes = require('./telematicsRoutes');
 const policeRoutes = require('./policeRoutes');
 
@@ -22,6 +23,7 @@ router.use('/alerts', alertRoutes);
 router.use('/alert-config', alertConfigRoutes);
 router.use('/driver-config', driverConfigRoutes);
 router.use('/driver-scoring', driverScoringRoutes);
+router.use('/rtms', rtmsRoutes);
 router.use('/telematics', telematicsRoutes);
 router.use('/police', policeRoutes);
 

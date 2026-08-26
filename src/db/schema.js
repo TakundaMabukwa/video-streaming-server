@@ -229,6 +229,44 @@ const MIGRATIONS_SQL = `
   CREATE INDEX IF NOT EXISTS idx_driver_scoring_fleet ON driver_scoring(fleet_number);
   CREATE INDEX IF NOT EXISTS idx_driver_scoring_registration ON driver_scoring(registration_number);
 
+  -- RTMS rules configuration
+  CREATE TABLE IF NOT EXISTS rtms_rules (
+    id SERIAL PRIMARY KEY,
+    module TEXT NOT NULL,
+    rule_name TEXT NOT NULL,
+    system_constraint TEXT DEFAULT '',
+    audit_focus TEXT DEFAULT '',
+    max_value NUMERIC DEFAULT 0,
+    min_value NUMERIC DEFAULT 0,
+    unit TEXT DEFAULT '',
+    enabled BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_rtms_rules_module ON rtms_rules(module);
+
+  -- RTMS driving sessions (engine on/off tracking)
+  CREATE TABLE IF NOT EXISTS rtms_driving_sessions (
+    id SERIAL PRIMARY KEY,
+    device_id TEXT NOT NULL,
+    fleet_number TEXT,
+    registration_number TEXT,
+    engine_on_at TIMESTAMPTZ NOT NULL,
+    engine_off_at TIMESTAMPTZ,
+    duration_minutes NUMERIC GENERATED ALWAYS AS (
+      CASE WHEN engine_off_at IS NOT NULL
+        THEN EXTRACT(EPOCH FROM (engine_off_at - engine_on_at)) / 60
+        ELSE NULL
+      END
+    ) STORED,
+    alert_sent BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_rtms_sessions_device ON rtms_driving_sessions(device_id);
+  CREATE INDEX IF NOT EXISTS idx_rtms_sessions_active ON rtms_driving_sessions(engine_off_at) WHERE engine_off_at IS NULL;
+
   -- Geotab devices
   CREATE TABLE IF NOT EXISTS geotab_devices (
     id TEXT PRIMARY KEY,

@@ -104,6 +104,17 @@ async function start() {
       console.error(`[DriverScoring] Init failed: ${err.message}`);
     }
 
+    // Start RTMS driving time monitoring
+    try {
+      const rtmsService = require('./services/rtmsService');
+      rtmsService.startMonitoring(60000);
+      // Pass broadcast to RTMS after websocket starts
+      const { broadcast } = require('./services/websocket');
+      rtmsService.setBroadcast(broadcast);
+    } catch (err) {
+      console.error(`[RTMS] Init failed: ${err.message}`);
+    }
+
     // Start WebSocket server
     const { startWebSocket, broadcast } = require('./services/websocket');
     try {
