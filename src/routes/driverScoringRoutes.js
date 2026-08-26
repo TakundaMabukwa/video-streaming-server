@@ -24,12 +24,12 @@ router.get('/lookup', async (req, res) => {
       return res.status(400).json({ success: false, message: 'fleet_number and alert_type required' });
     }
 
-    // Find criteria where alert_type is in statuses and nrc_deduction = false
+    // Find criteria where alert_type is in statuses (case-insensitive) and nrc_deduction = false
     const criteriaResult = await query(
       `SELECT id, name, selected_weighting, incidents_threshold, nrc_deduction 
        FROM driver_config_criteria 
        WHERE is_active = true AND nrc_deduction = false 
-       AND $1 = ANY(statuses)`,
+       AND EXISTS (SELECT 1 FROM unnest(statuses) s WHERE LOWER(s) = LOWER($1))`,
       [alert_type]
     );
 

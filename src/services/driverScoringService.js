@@ -46,12 +46,12 @@ async function processAlertDeduction(fleet_number, alert_type) {
   try {
     await client.query('BEGIN');
 
-    // Find matching criteria where alert_type is in statuses and nrc_deduction = false
+    // Find matching criteria where alert_type is in statuses (case-insensitive) and nrc_deduction = false
     const criteriaResult = await client.query(
       `SELECT id, name, selected_weighting, incidents_threshold 
        FROM driver_config_criteria 
        WHERE is_active = true AND nrc_deduction = false 
-       AND $1 = ANY(statuses)`,
+       AND EXISTS (SELECT 1 FROM unnest(statuses) s WHERE LOWER(s) = LOWER($1))`,
       [alert_type]
     );
 
