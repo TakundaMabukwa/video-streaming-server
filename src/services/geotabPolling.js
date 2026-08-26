@@ -985,7 +985,9 @@ async function fetchAndStoreVehicleStatus() {
         const fleetNumber = geotabDevice?.fleet_number || null;
         const licensePlate = geotabDevice?.license_plate || null;
 
-        const wasEngineOn = prevStatus?.engine_on || false;
+        // Get previous engine state for transition detection
+        const prevResult = await db.query('SELECT engine_on FROM vehicle_status WHERE device_id = $1', [record.id]);
+        const wasEngineOn = prevResult.rows.length > 0 ? (prevResult.rows[0].engine_on || false) : false;
         const isEngineOn = isOnline;
 
         await db.query(
