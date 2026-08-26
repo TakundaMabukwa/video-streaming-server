@@ -2,6 +2,7 @@ const db = require('../db');
 const https = require('https');
 const { fetchVehiclesFromSupabase } = require('../helpers/supabaseClient');
 const { getTelematicsSeverityMap } = require('../db/alert_definitions');
+const { processAlertDeduction } = require('./driverScoringService');
 
 const GEOTAB_URL = 'https://my.geotab.com/apiv1';
 
@@ -555,6 +556,15 @@ async function syncGeotabEvents() {
           ]
         );
         inserted++;
+
+        // Process automatic deduction (NCR = no path)
+        if (fleetNumber && eventName) {
+          try {
+            await processAlertDeduction(fleetNumber, eventName);
+          } catch (deductErr) {
+            console.error('[Geotab] Deduction error:', deductErr.message);
+          }
+        }
 
         // Also store as alert in alerts + alert_groups tables (telematics source)
         try {

@@ -209,6 +209,26 @@ const MIGRATIONS_SQL = `
 
   CREATE INDEX IF NOT EXISTS idx_driver_config_criteria_name ON driver_config_criteria(name);
 
+  -- Add columns to driver_config_criteria
+  ALTER TABLE driver_config_criteria ADD COLUMN IF NOT EXISTS nrc_deduction BOOLEAN DEFAULT FALSE;
+  ALTER TABLE driver_config_criteria ADD COLUMN IF NOT EXISTS incidents_threshold INTEGER DEFAULT 1;
+  CREATE INDEX IF NOT EXISTS idx_driver_config_criteria_nrc ON driver_config_criteria(nrc_deduction);
+
+  -- Driver scoring: per-vehicle/driver score tracking
+  CREATE TABLE IF NOT EXISTS driver_scoring (
+    id SERIAL PRIMARY KEY,
+    registration_number TEXT,
+    fleet_number TEXT NOT NULL UNIQUE,
+    driver TEXT,
+    score NUMERIC DEFAULT 100 CHECK (score >= 0),
+    alert_types JSONB DEFAULT '[]'::jsonb,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_driver_scoring_fleet ON driver_scoring(fleet_number);
+  CREATE INDEX IF NOT EXISTS idx_driver_scoring_registration ON driver_scoring(registration_number);
+
   -- Geotab devices
   CREATE TABLE IF NOT EXISTS geotab_devices (
     id TEXT PRIMARY KEY,

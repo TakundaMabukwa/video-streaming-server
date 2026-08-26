@@ -35,12 +35,12 @@ router.get('/criteria/:id', async (req, res) => {
 // Create criterion
 router.post('/criteria', async (req, res) => {
   try {
-    const { name, selected_weighting, actual_weighting, risk_tiers, no_incidents, statuses } = req.body;
+    const { name, selected_weighting, actual_weighting, risk_tiers, no_incidents, statuses, nrc_deduction, incidents_threshold } = req.body;
     if (!name) return res.status(400).json({ success: false, message: 'Name is required' });
 
     const result = await db.query(
-      `INSERT INTO driver_config_criteria (name, selected_weighting, actual_weighting, risk_tiers, no_incidents, statuses)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      `INSERT INTO driver_config_criteria (name, selected_weighting, actual_weighting, risk_tiers, no_incidents, statuses, nrc_deduction, incidents_threshold)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
       [
         name,
         selected_weighting || 10,
@@ -48,6 +48,8 @@ router.post('/criteria', async (req, res) => {
         risk_tiers || 4,
         no_incidents || 0,
         statuses || [],
+        nrc_deduction || false,
+        incidents_threshold || 1,
       ]
     );
     res.json({ success: true, data: result.rows[0] });
@@ -63,7 +65,7 @@ router.post('/criteria', async (req, res) => {
 router.put('/criteria/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, selected_weighting, actual_weighting, risk_tiers, no_incidents, statuses, is_active } = req.body;
+    const { name, selected_weighting, actual_weighting, risk_tiers, no_incidents, statuses, is_active, nrc_deduction, incidents_threshold } = req.body;
 
     const result = await db.query(
       `UPDATE driver_config_criteria
@@ -74,9 +76,11 @@ router.put('/criteria/:id', async (req, res) => {
            no_incidents = COALESCE($5, no_incidents),
            statuses = COALESCE($6, statuses),
            is_active = COALESCE($7, is_active),
+           nrc_deduction = COALESCE($8, nrc_deduction),
+           incidents_threshold = COALESCE($9, incidents_threshold),
            updated_at = NOW()
-       WHERE id = $8 RETURNING *`,
-      [name, selected_weighting, actual_weighting, risk_tiers, no_incidents, statuses, is_active, id]
+       WHERE id = $10 RETURNING *`,
+      [name, selected_weighting, actual_weighting, risk_tiers, no_incidents, statuses, is_active, nrc_deduction, incidents_threshold, id]
     );
 
     if (result.rows.length === 0) {

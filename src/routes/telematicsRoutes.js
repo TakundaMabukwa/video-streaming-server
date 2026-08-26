@@ -1,5 +1,6 @@
 const express = require('express');
 const db = require('../db');
+const { processAlertDeduction } = require('../services/driverScoringService');
 
 const router = express.Router();
 
@@ -148,6 +149,22 @@ router.post('/events', async (req, res) => {
         ]
       );
       inserted.push(result.rows[0]);
+
+      // Process automatic deduction (NCR = no path)
+      if (event.plate) {
+        try {
+          // Look up fleet_number from vehiclesc using plate
+          const fleetResult = await db.query(
+            'SELECT fleet_number FROM vehiclesc WHERE registration_number = $1 OR plate = $1 OR license_plate = $1 LIMIT 1',
+            [event.plate]
+          );
+          if (fleetResult.rows.length > 0 && fleetResult.rows[0].fleet_number) {
+            await processAlertDeduction(fleetResult.rows[0].fleet_number, event.event_type);
+          }
+        } catch (deductErr) {
+          console.error('[Telematics] Deduction error:', deductErr.message);
+        }
+      }
     }
 
     res.json({ success: true, data: inserted, count: inserted.length });

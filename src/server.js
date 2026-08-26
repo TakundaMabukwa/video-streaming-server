@@ -75,6 +75,10 @@ async function shutdown(signal) {
     const { stopWebSocket } = require('./services/websocket');
     stopWebSocket();
   } catch {}
+  try {
+    const { stopMidnightCron } = require('./services/driverScoringService');
+    stopMidnightCron();
+  } catch {}
   server.close(async () => {
     await db.closePool();
     console.log('[SERVER] Shutdown complete');
@@ -90,6 +94,15 @@ let server;
 async function start() {
   try {
     await waitForDb();
+
+    // Initialize driver scoring from vehiclesc + drivers
+    try {
+      const { initializeDriverScoring, startMidnightCron } = require('./services/driverScoringService');
+      await initializeDriverScoring();
+      startMidnightCron();
+    } catch (err) {
+      console.error(`[DriverScoring] Init failed: ${err.message}`);
+    }
 
     // Start WebSocket server
     const { startWebSocket, broadcast } = require('./services/websocket');

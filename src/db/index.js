@@ -1,4 +1,4 @@
-const { query, closePool } = require('./pool');
+const { query, getClient, closePool } = require('./pool');
 const { initializeDatabase } = require('./schema');
 const alerts = require('./alerts');
 const media = require('./media');
@@ -8,6 +8,7 @@ const geotab = require('./geotab');
 
 module.exports = {
   query,
+  getClient,
   closePool,
   initializeDatabase,
   ...alerts,
