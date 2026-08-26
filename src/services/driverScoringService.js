@@ -1,6 +1,43 @@
 const { query, getClient } = require('../db');
+const { fetchVehiclesFromSupabase } = require('../helpers/supabaseClient');
+
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 let midnightInterval = null;
+
+async function fetchDriversFromSupabase() {
+  if (!SUPABASE_URL || !SUPABASE_KEY) return [];
+  const url = `${SUPABASE_URL}/rest/v1/drivers?select=id,first_name,surname,fleet_number&fleet_number=not.is.null`;
+  try {
+    const res = await fetch(url, {
+      headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return Array.isArray(data) ? data : [];
+  } catch { return []; }
+}
+
+async function fetchVehiclesWithDrivers() {
+  const [vehicles, drivers] = await Promise.all([
+    fetchVehiclesFromSupabase(),
+    fetchDriversFromSupabase()
+  ]);
+
+  const driverMap = new Map();
+  for (const d of drivers) {
+    if (d.fleet_number) driverMap.set(d.fleet_number.toUpperCase(), `${d.first_name || ''} ${d.surname || ''}`.trim());
+  }
+
+  return vehicles
+    .filter(v => v.fleet_number && v.fleet_number.trim())
+    .map(v => ({
+      fleet_number: v.fleet_number,
+      registration_number: v.registration_number || '',
+      driver_name: driverMap.get(v.fleet_number.toUpperCase()) || null
+    }));
+}
 
 async function processAlertDeduction(fleet_number, alert_type) {
   if (!fleet_number || !alert_type) return;
@@ -82,25 +119,20 @@ async function processAlertDeduction(fleet_number, alert_type) {
 }
 
 async function initializeDriverScoring() {
-  console.log('[DriverScoring] Initializing from vehiclesc + drivers...');
-  
+  console.log('[DriverScoring] Initializing from Supabase (vehiclesc + drivers)...');
+
+  const vehicles = await fetchVehiclesWithDrivers();
+  if (vehicles.length === 0) {
+    console.log('[DriverScoring] No vehicles found in Supabase');
+    return { synced: 0, total: 0 };
+  }
+
   const client = await getClient();
   try {
     await client.query('BEGIN');
 
-    // Get vehicles with their drivers from Supabase tables
-    const vehiclesResult = await client.query(`
-      SELECT 
-        v.fleet_number,
-        v.registration_number,
-        CONCAT(d.first_name, ' ', d.surname) as driver_name
-      FROM vehiclesc v
-      LEFT JOIN drivers d ON d.fleet_number = v.fleet_number
-      WHERE v.fleet_number IS NOT NULL AND v.fleet_number != ''
-    `);
-
     let synced = 0;
-    for (const vehicle of vehiclesResult.rows) {
+    for (const v of vehicles) {
       const result = await client.query(`
         INSERT INTO driver_scoring (fleet_number, registration_number, driver, score, alert_types)
         VALUES ($1, $2, $3, 100, '[]'::jsonb)
@@ -109,14 +141,14 @@ async function initializeDriverScoring() {
             driver = COALESCE(EXCLUDED.driver, driver_scoring.driver),
             updated_at = NOW()
         RETURNING id
-      `, [vehicle.fleet_number, vehicle.registration_number, vehicle.driver_name]);
+      `, [v.fleet_number, v.registration_number, v.driver_name]);
 
       if (result.rows.length > 0) synced++;
     }
 
     await client.query('COMMIT');
-    console.log(`[DriverScoring] Initialized ${synced}/${vehiclesResult.rows.length} vehicles`);
-    return { synced, total: vehiclesResult.rows.length };
+    console.log(`[DriverScoring] Initialized ${synced}/${vehicles.length} vehicles`);
+    return { synced, total: vehicles.length };
   } catch (err) {
     await client.query('ROLLBACK');
     console.error('[DriverScoring] Init error:', err.message);
@@ -127,38 +159,30 @@ async function initializeDriverScoring() {
 }
 
 async function syncNewVehicles() {
-  console.log('[DriverScoring] Syncing new vehicles...');
-  
+  console.log('[DriverScoring] Syncing new vehicles from Supabase...');
+
+  const vehicles = await fetchVehiclesWithDrivers();
+  if (vehicles.length === 0) return 0;
+
   const client = await getClient();
   try {
     await client.query('BEGIN');
 
-    // Get vehicles not in driver_scoring
-    const vehiclesResult = await client.query(`
-      SELECT 
-        v.fleet_number,
-        v.registration_number,
-        CONCAT(d.first_name, ' ', d.surname) as driver_name
-      FROM vehiclesc v
-      LEFT JOIN drivers d ON d.fleet_number = v.fleet_number
-      WHERE v.fleet_number IS NOT NULL 
-        AND v.fleet_number != ''
-        AND v.fleet_number NOT IN (SELECT fleet_number FROM driver_scoring WHERE fleet_number IS NOT NULL)
-    `);
+    const existingResult = await client.query('SELECT fleet_number FROM driver_scoring');
+    const existingSet = new Set(existingResult.rows.map(r => r.fleet_number));
 
     let synced = 0;
-    for (const vehicle of vehiclesResult.rows) {
+    for (const v of vehicles) {
+      if (existingSet.has(v.fleet_number)) continue;
       await client.query(`
         INSERT INTO driver_scoring (fleet_number, registration_number, driver, score, alert_types)
         VALUES ($1, $2, $3, 100, '[]'::jsonb)
-      `, [vehicle.fleet_number, vehicle.registration_number, vehicle.driver_name]);
+      `, [v.fleet_number, v.registration_number, v.driver_name]);
       synced++;
     }
 
     await client.query('COMMIT');
-    if (synced > 0) {
-      console.log(`[DriverScoring] Synced ${synced} new vehicles`);
-    }
+    if (synced > 0) console.log(`[DriverScoring] Synced ${synced} new vehicles`);
     return synced;
   } catch (err) {
     await client.query('ROLLBACK');

@@ -200,45 +200,9 @@ router.post('/increment', async (req, res) => {
 // POST /api/driver-scoring/init - Initialize/sync all vehicles and drivers into driver_scoring
 router.post('/init', async (req, res) => {
   try {
-    const client = await getClient();
-    try {
-      await client.query('BEGIN');
-
-      // Get vehicles with their drivers from Supabase via foreign tables or direct query
-      // Since vehiclesc and drivers are Supabase tables, we query them directly
-      const vehiclesResult = await client.query(`
-        SELECT 
-          v.fleet_number,
-          v.registration_number,
-          CONCAT(d.first_name, ' ', d.surname) as driver_name
-        FROM vehiclesc v
-        LEFT JOIN drivers d ON d.fleet_number = v.fleet_number
-        WHERE v.fleet_number IS NOT NULL AND v.fleet_number != ''
-      `);
-
-      let synced = 0;
-      for (const vehicle of vehiclesResult.rows) {
-        const result = await client.query(`
-          INSERT INTO driver_scoring (fleet_number, registration_number, driver, score, alert_types)
-          VALUES ($1, $2, $3, 100, '[]'::jsonb)
-          ON CONFLICT (fleet_number) DO UPDATE 
-          SET registration_number = EXCLUDED.registration_number,
-              driver = COALESCE(EXCLUDED.driver, driver_scoring.driver),
-              updated_at = NOW()
-          RETURNING id
-        `, [vehicle.fleet_number, vehicle.registration_number, vehicle.driver_name]);
-
-        if (result.rows.length > 0) synced++;
-      }
-
-      await client.query('COMMIT');
-      res.json({ success: true, count: synced, total: vehiclesResult.rows.length });
-    } catch (err) {
-      await client.query('ROLLBACK');
-      throw err;
-    } finally {
-      client.release();
-    }
+    const { initializeDriverScoring } = require('../services/driverScoringService');
+    const result = await initializeDriverScoring();
+    res.json({ success: true, count: result.synced, total: result.total });
   } catch (err) {
     console.error('[DriverScoring] Init error:', err.message);
     res.status(500).json({ success: false, message: err.message });
@@ -248,40 +212,9 @@ router.post('/init', async (req, res) => {
 // POST /api/driver-scoring/sync - Add only new vehicles not in driver_scoring
 router.post('/sync', async (req, res) => {
   try {
-    const client = await getClient();
-    try {
-      await client.query('BEGIN');
-
-      // Get vehicles not in driver_scoring
-      const vehiclesResult = await client.query(`
-        SELECT 
-          v.fleet_number,
-          v.registration_number,
-          CONCAT(d.first_name, ' ', d.surname) as driver_name
-        FROM vehiclesc v
-        LEFT JOIN drivers d ON d.fleet_number = v.fleet_number
-        WHERE v.fleet_number IS NOT NULL 
-          AND v.fleet_number != ''
-          AND v.fleet_number NOT IN (SELECT fleet_number FROM driver_scoring WHERE fleet_number IS NOT NULL)
-      `);
-
-      let synced = 0;
-      for (const vehicle of vehiclesResult.rows) {
-        await client.query(`
-          INSERT INTO driver_scoring (fleet_number, registration_number, driver, score, alert_types)
-          VALUES ($1, $2, $3, 100, '[]'::jsonb)
-        `, [vehicle.fleet_number, vehicle.registration_number, vehicle.driver_name]);
-        synced++;
-      }
-
-      await client.query('COMMIT');
-      res.json({ success: true, count: synced });
-    } catch (err) {
-      await client.query('ROLLBACK');
-      throw err;
-    } finally {
-      client.release();
-    }
+    const { syncNewVehicles } = require('../services/driverScoringService');
+    const synced = await syncNewVehicles();
+    res.json({ success: true, count: synced });
   } catch (err) {
     console.error('[DriverScoring] Sync error:', err.message);
     res.status(500).json({ success: false, message: err.message });
