@@ -171,8 +171,10 @@ async function getAlertById(req, res) {
       fleetNum = parts[0]?.trim();
     }
     const alertTime = transformed.timestamp || alert.alarm_ts;
+    
     if (fleetNum && alertTime) {
       try {
+        console.log(`[SPEED] Looking up speed for fleet: ${fleetNum}, time: ${alertTime}`);
         const speedResult = await db.query(
           `SELECT speed, distance, duration_seconds FROM telematics_events
            WHERE fleet_number = $1 AND speed IS NOT NULL 
@@ -182,13 +184,15 @@ async function getAlertById(req, res) {
            LIMIT 1`,
           [fleetNum, alertTime]
         );
+        console.log(`[SPEED] Result: ${speedResult.rows.length} rows`);
         if (speedResult.rows.length > 0) {
           transformed.speed = speedResult.rows[0].speed;
           transformed.distance = speedResult.rows[0].distance;
           transformed.duration_seconds = speedResult.rows[0].duration_seconds;
           transformed.metadata = { ...transformed.metadata, speed: speedResult.rows[0].speed };
+          console.log(`[SPEED] Set speed: ${speedResult.rows[0].speed} for fleet ${fleetNum}`);
         }
-      } catch (e) { /* non-critical */ }
+      } catch (e) { console.log(`[SPEED] Error: ${e.message}`); }
     } else if (fleetNum) {
       // Fallback: get most recent speed for this fleet
       try {
