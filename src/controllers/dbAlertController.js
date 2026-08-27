@@ -202,15 +202,6 @@ async function getAlertById(req, res) {
       } catch (e) { /* non-critical */ }
     }
 
-        if (speedResult && speedResult.rows.length > 0) {
-          transformed.speed = speedResult.rows[0].speed;
-          transformed.distance = speedResult.rows[0].distance;
-          transformed.duration_seconds = speedResult.rows[0].duration_seconds;
-          transformed.metadata = { ...transformed.metadata, speed: speedResult.rows[0].speed };
-        }
-      } catch (e) { /* non-critical */ }
-    }
-
     const media = alert.media || [];
     transformed.screenshots = media
       .filter((m) => m.file_type === '00' || !m.file_type || m.file_type === '01')
