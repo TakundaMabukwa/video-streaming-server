@@ -93,7 +93,41 @@ async function getActiveAlerts(req, res) {
     // Read from alert_groups for grouped view
     const groups = await db.getActiveAlertGroupsWithMedia({ limit });
 
-    const alerts = groups.map((g) => transformDbAlert(g, severityMap));
+    const alerts = [];
+    for (const g of groups) {
+      const transformed = transformDbAlert(g, severityMap);
+      
+      // Fetch speed from telematics_events using fleet_number
+      let fleetNum = transformed.fleet_number || g.fleet_number;
+      if (!fleetNum && transformed.vehicle_registration) {
+        const parts = transformed.vehicle_registration.split(' - ');
+        fleetNum = parts[0]?.trim();
+      }
+      const alertTime = transformed.timestamp || g.last_alert_ts || g.alarm_ts;
+      
+      if (fleetNum && alertTime) {
+        try {
+          const speedResult = await db.query(
+            `SELECT speed, distance, duration_seconds FROM telematics_events
+             WHERE fleet_number = $1 AND speed IS NOT NULL 
+             AND event_time >= $2::timestamptz - INTERVAL '5 minutes'
+             AND event_time <= $2::timestamptz + INTERVAL '5 minutes'
+             ORDER BY ABS(EXTRACT(EPOCH FROM (event_time - $2::timestamptz))) ASC
+             LIMIT 1`,
+            [fleetNum, alertTime]
+          );
+          if (speedResult.rows.length > 0) {
+            transformed.speed = speedResult.rows[0].speed;
+            transformed.distance = speedResult.rows[0].distance;
+            transformed.duration_seconds = speedResult.rows[0].duration_seconds;
+            transformed.metadata = { ...transformed.metadata, speed: speedResult.rows[0].speed };
+          }
+        } catch (e) { /* non-critical */ }
+      }
+      
+      transformed.count = g.count || 1;
+      alerts.push(transformed);
+    }
 
     res.json({ success: true, alerts, count: alerts.length, total: alerts.length, source: 'eps-db' });
   } catch (error) {
