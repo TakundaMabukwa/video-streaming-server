@@ -210,8 +210,6 @@ async function getAlertById(req, res) {
         }
       } catch (e) { /* non-critical */ }
     }
-      } catch (e) { /* non-critical */ }
-    }
 
     const media = alert.media || [];
     transformed.screenshots = media
