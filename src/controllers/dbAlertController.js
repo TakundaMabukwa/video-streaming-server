@@ -162,8 +162,9 @@ async function getAlertById(req, res) {
     const transformed = transformDbAlert(alert, severityMap);
     transformed.count = alert.count || 1;
 
-    // For telematics alerts, fetch speed from telematics_events
-    if (transformed.source_type === 'telematics' && transformed.device_id) {
+    // Fetch speed from telematics_events for any alert with a device_id
+    // This works for both telematics and video alerts
+    if (transformed.device_id) {
       try {
         const speedResult = await db.query(
           `SELECT speed, distance, duration_seconds FROM telematics_events
