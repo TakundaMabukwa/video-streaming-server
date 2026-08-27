@@ -164,7 +164,12 @@ async function getAlertById(req, res) {
 
     // Fetch speed from telematics_events using fleet_number and alert timestamp
     // Look within 5 minute range of the video alert
-    const fleetNum = transformed.fleet_number || alert.fleet_number;
+    // Extract fleet_number from vehicle_registration (e.g., "EX69 - LDR067MP" -> "EX69")
+    let fleetNum = transformed.fleet_number || alert.fleet_number;
+    if (!fleetNum && transformed.vehicle_registration) {
+      const parts = transformed.vehicle_registration.split(' - ');
+      fleetNum = parts[0]?.trim();
+    }
     const alertTime = transformed.timestamp || alert.alarm_ts;
     if (fleetNum && alertTime) {
       try {
