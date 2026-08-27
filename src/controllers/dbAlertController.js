@@ -162,34 +162,45 @@ async function getAlertById(req, res) {
     const transformed = transformDbAlert(alert, severityMap);
     transformed.count = alert.count || 1;
 
-    // Fetch speed from telematics_events for any alert with a device_id
-    // Bridge: Mettax device_id -> vehiclesc (via camera_sim_id) -> fleet_number -> telematics_events
-    if (transformed.device_id) {
+    // Fetch speed from telematics_events using fleet_number and alert timestamp
+    // Look within 5 minute range of the video alert
+    const fleetNum = transformed.fleet_number || alert.fleet_number;
+    const alertTime = transformed.timestamp || alert.alarm_ts;
+    if (fleetNum && alertTime) {
       try {
-        // First try to find fleet_number from vehiclesc using camera_sim_id
-        const vehicleResult = await db.query(
-          `SELECT fleet_number FROM vehiclesc WHERE camera_sim_id = $1 OR camera_serial = $1 LIMIT 1`,
-          [transformed.device_id]
+        const speedResult = await db.query(
+          `SELECT speed, distance, duration_seconds FROM telematics_events
+           WHERE fleet_number = $1 AND speed IS NOT NULL 
+           AND event_time >= $2::timestamptz - INTERVAL '5 minutes'
+           AND event_time <= $2::timestamptz + INTERVAL '5 minutes'
+           ORDER BY ABS(EXTRACT(EPOCH FROM (event_time - $2::timestamptz))) ASC
+           LIMIT 1`,
+          [fleetNum, alertTime]
         );
-        
-        let speedResult;
-        if (vehicleResult.rows.length > 0 && vehicleResult.rows[0].fleet_number) {
-          // Use fleet_number to find speed
-          speedResult = await db.query(
-            `SELECT speed, distance, duration_seconds FROM telematics_events
-             WHERE fleet_number = $1 AND speed IS NOT NULL AND event_time IS NOT NULL
-             ORDER BY event_time DESC LIMIT 1`,
-            [vehicleResult.rows[0].fleet_number]
-          );
-        } else {
-          // Fallback: try device_id directly
-          speedResult = await db.query(
-            `SELECT speed, distance, duration_seconds FROM telematics_events
-             WHERE device_id = $1 AND speed IS NOT NULL AND event_time IS NOT NULL
-             ORDER BY event_time DESC LIMIT 1`,
-            [transformed.device_id]
-          );
+        if (speedResult.rows.length > 0) {
+          transformed.speed = speedResult.rows[0].speed;
+          transformed.distance = speedResult.rows[0].distance;
+          transformed.duration_seconds = speedResult.rows[0].duration_seconds;
+          transformed.metadata = { ...transformed.metadata, speed: speedResult.rows[0].speed };
         }
+      } catch (e) { /* non-critical */ }
+    } else if (fleetNum) {
+      // Fallback: get most recent speed for this fleet
+      try {
+        const speedResult = await db.query(
+          `SELECT speed, distance, duration_seconds FROM telematics_events
+           WHERE fleet_number = $1 AND speed IS NOT NULL
+           ORDER BY event_time DESC LIMIT 1`,
+          [fleetNum]
+        );
+        if (speedResult.rows.length > 0) {
+          transformed.speed = speedResult.rows[0].speed;
+          transformed.distance = speedResult.rows[0].distance;
+          transformed.duration_seconds = speedResult.rows[0].duration_seconds;
+          transformed.metadata = { ...transformed.metadata, speed: speedResult.rows[0].speed };
+        }
+      } catch (e) { /* non-critical */ }
+    }
 
         if (speedResult && speedResult.rows.length > 0) {
           transformed.speed = speedResult.rows[0].speed;
