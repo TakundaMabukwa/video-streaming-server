@@ -465,6 +465,10 @@ const MIGRATIONS_SQL = `
 
   -- Composite index for fast unresolved alert_groups lookup
   CREATE INDEX IF NOT EXISTS idx_alert_groups_resolved_ts ON alert_groups(resolved, last_alert_ts DESC) WHERE resolved = FALSE;
+
+  -- Index for vehicle-alerts query on unresolved alerts
+  CREATE INDEX IF NOT EXISTS idx_alerts_unresolved ON alerts(device_id, alarm_ts DESC) WHERE resolved = FALSE AND false_alert = FALSE;
+  CREATE INDEX IF NOT EXISTS idx_alerts_unresolved_name ON alerts(device_name, alarm_ts DESC) WHERE resolved = FALSE AND false_alert = FALSE;
 `;
 
 async function initializeDatabase() {
