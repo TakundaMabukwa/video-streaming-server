@@ -6,7 +6,7 @@ const pool = new Pool({
   max: 50,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000,
-  statement_timeout: 15000,
+  statement_timeout: 45000,
 });
 
 async function query(text, params) {
