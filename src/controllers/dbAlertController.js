@@ -615,18 +615,34 @@ async function resolveAlertsBulk(req, res) {
     const isFalse = closureType === 'false_alert';
     const now = new Date().toISOString();
 
-    // Batch update alerts table
     const placeholders = alertIds.map((_, i) => `$${i + 1}`).join(', ');
+
+    // 1. Resolve alert_groups by ID
     await db.query(
-      `UPDATE alerts SET resolved = TRUE, false_alert = $${alertIds.length + 1}, notes = COALESCE($${alertIds.length + 2}, notes), updated_at = $${alertIds.length + 3} WHERE id IN (${placeholders})`,
-      [...alertIds, isFalse, notes || null, now]
+      `UPDATE alert_groups SET resolved = TRUE, false_alert = $${alertIds.length + 1}, resolved_by = $${alertIds.length + 2}, resolved_at = $${alertIds.length + 3}, notes = COALESCE($${alertIds.length + 4}, notes)
+       WHERE id IN (${placeholders})`,
+      [...alertIds, isFalse, userId || null, now, notes || null]
     );
 
-    // Batch resolve matching alert_groups
+    // 2. Resolve alert_groups by last_alert_id
     await db.query(
       `UPDATE alert_groups SET resolved = TRUE, false_alert = $${alertIds.length + 1}, resolved_by = $${alertIds.length + 2}, resolved_at = $${alertIds.length + 3}, notes = COALESCE($${alertIds.length + 4}, notes)
        WHERE last_alert_id IN (${placeholders})`,
       [...alertIds, isFalse, userId || null, now, notes || null]
+    );
+
+    // 3. Resolve all child alerts in the same group (by device_id + alarm_type)
+    await db.query(
+      `UPDATE alerts SET resolved = TRUE, false_alert = $1, updated_at = $2
+       WHERE (device_id, alarm_type) IN (
+         SELECT device_id, alarm_type FROM alert_groups
+         WHERE group_key IN (
+           SELECT group_key FROM alert_groups WHERE id IN (${placeholders})
+           UNION
+           SELECT group_key FROM alert_groups WHERE last_alert_id IN (${placeholders})
+         )
+       ) AND resolved = FALSE`,
+      [isFalse, now, ...alertIds, ...alertIds]
     );
 
     res.json({ success: true, resolved: alertIds.length, total: alertIds.length, message: `${alertIds.length} alerts resolved` });
