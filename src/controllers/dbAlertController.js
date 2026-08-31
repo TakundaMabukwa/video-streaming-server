@@ -617,32 +617,32 @@ async function resolveAlertsBulk(req, res) {
 
     const placeholders = alertIds.map((_, i) => `$${i + 1}`).join(', ');
 
-    // 1. Resolve alert_groups by ID
-    await db.query(
-      `UPDATE alert_groups SET resolved = TRUE, false_alert = $${alertIds.length + 1}, resolved_by = $${alertIds.length + 2}, resolved_at = $${alertIds.length + 3}, notes = COALESCE($${alertIds.length + 4}, notes)
-       WHERE id IN (${placeholders})`,
-      [...alertIds, isFalse, userId || null, now, notes || null]
-    );
-
-    // 2. Resolve alert_groups by last_alert_id
+    // 1. Resolve alert_groups by last_alert_id (what frontend sends)
     await db.query(
       `UPDATE alert_groups SET resolved = TRUE, false_alert = $${alertIds.length + 1}, resolved_by = $${alertIds.length + 2}, resolved_at = $${alertIds.length + 3}, notes = COALESCE($${alertIds.length + 4}, notes)
        WHERE last_alert_id IN (${placeholders})`,
       [...alertIds, isFalse, userId || null, now, notes || null]
     );
 
-    // 3. Resolve all child alerts in the same group (by device_id + alarm_type)
+    // 2. Also resolve by integer id (in case some are group IDs)
+    const intIds = alertIds.filter(id => /^\d+$/.test(id) && Number(id) < 2147483647).map(Number);
+    if (intIds.length > 0) {
+      const intPlaceholders = intIds.map((_, i) => `$${i + 1}`).join(', ');
+      await db.query(
+        `UPDATE alert_groups SET resolved = TRUE, false_alert = $${intIds.length + 1}, resolved_by = $${intIds.length + 2}, resolved_at = $${intIds.length + 3}, notes = COALESCE($${intIds.length + 4}, notes)
+         WHERE id IN (${intPlaceholders})`,
+        [...intIds, isFalse, userId || null, now, notes || null]
+      );
+    }
+
+    // 3. Resolve all child alerts with same (device_id, alarm_type)
     await db.query(
       `UPDATE alerts SET resolved = TRUE, false_alert = $1, updated_at = $2
        WHERE (device_id, alarm_type) IN (
          SELECT device_id, alarm_type FROM alert_groups
-         WHERE group_key IN (
-           SELECT group_key FROM alert_groups WHERE id IN (${placeholders})
-           UNION
-           SELECT group_key FROM alert_groups WHERE last_alert_id IN (${placeholders})
-         )
+         WHERE last_alert_id IN (${placeholders})
        ) AND resolved = FALSE`,
-      [isFalse, now, ...alertIds, ...alertIds]
+      [isFalse, now, ...alertIds]
     );
 
     res.json({ success: true, resolved: alertIds.length, total: alertIds.length, message: `${alertIds.length} alerts resolved` });
