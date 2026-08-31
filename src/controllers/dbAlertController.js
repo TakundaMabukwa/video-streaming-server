@@ -111,39 +111,28 @@ async function getActiveAlerts(req, res) {
       return t;
     });
 
-    // Batch speed lookups: one query for all alerts instead of N queries
-    if (fleetLookups.length > 0) {
+    // Batch speed lookups: get unique fleet_numbers, single query, match in JS
+    const fleetSet = new Set<string>();
+    for (const l of fleetLookups) fleetSet.add(l.fleetNum);
+
+    if (fleetSet.size > 0) {
       try {
+        const fleetList = Array.from(fleetSet);
+        const speedResult = await db.query(
+          `SELECT DISTINCT ON (fleet_number)
+            fleet_number, speed, distance, duration_seconds, event_time
+           FROM telematics_events
+           WHERE fleet_number = ANY($1) AND speed IS NOT NULL
+           ORDER BY fleet_number, event_time DESC
+           LIMIT $2`,
+          [fleetList, fleetList.length]
+        );
+
         const speedMap = new Map<string, any>();
-
-        // Batch in groups of 50 to avoid too many params
-        for (let i = 0; i < fleetLookups.length; i += 50) {
-          const batch = fleetLookups.slice(i, i + 50);
-          const params: any[] = [];
-          const conditions: string[] = [];
-          batch.forEach((lookup, j) => {
-            const baseIdx = j * 3;
-            conditions.push(
-              `(fleet_number = $${baseIdx + 1} AND event_time >= $${baseIdx + 2}::timestamptz - INTERVAL '5 minutes' AND event_time <= $${baseIdx + 2}::timestamptz + INTERVAL '5 minutes')`
-            );
-            params.push(lookup.fleetNum, lookup.alertTime);
-          });
-
-          const speedResult = await db.query(
-            `SELECT DISTINCT ON (fleet_number)
-              fleet_number, speed, distance, duration_seconds
-             FROM telematics_events
-             WHERE speed IS NOT NULL AND (${conditions.join(' OR ')})
-             ORDER BY fleet_number, ABS(EXTRACT(EPOCH FROM (event_time::timestamptz))) ASC`,
-            params
-          );
-
-          for (const row of speedResult.rows) {
-            speedMap.set(row.fleet_number, row);
-          }
+        for (const row of speedResult.rows) {
+          speedMap.set(row.fleet_number, row);
         }
 
-        // Attach speed data to alerts
         for (const lookup of fleetLookups) {
           const speedData = speedMap.get(lookup.fleetNum);
           if (speedData) {
