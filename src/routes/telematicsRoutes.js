@@ -339,6 +339,7 @@ router.get('/vehicle-alerts/:deviceId', async (req, res) => {
 
     res.json({ success: true, alerts: result.rows, count: result.rows.length });
   } catch (error) {
+    console.error('[vehicle-alerts] Error:', error.message, error.stack);
     res.status(500).json({ success: false, message: error.message });
   }
 });
