@@ -646,9 +646,10 @@ async function resolveAlertsBulk(req, res) {
     }
 
     // 4. Also resolve any alerts whose IDs were directly passed
+    const directPlaceholders = uniqueIds.map((_, i) => `$${i + 3}`).join(', ');
     await db.query(
       `UPDATE alerts SET resolved = TRUE, false_alert = $1::boolean, updated_at = $2::timestamptz
-       WHERE id IN (${placeholders}) AND resolved = FALSE`,
+       WHERE id IN (${directPlaceholders}) AND resolved = FALSE`,
       [isFalse, now, ...uniqueIds]
     );
 
