@@ -664,12 +664,6 @@ async function resolveAlertsBulk(req, res) {
   }
 }
 
-    res.json({ success: true, resolved: alertIds.length, total: alertIds.length, message: `${alertIds.length} alerts resolved` });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-}
-
 module.exports = {
   getAlertsList,
   getAlertDetail,
