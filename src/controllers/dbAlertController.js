@@ -94,7 +94,7 @@ async function getActiveAlerts(req, res) {
     const groups = await db.getActiveAlertGroupsWithMedia({ limit });
 
     // Collect all fleet_numbers with their alert times for batch speed lookup
-    const fleetLookups: { fleetNum: string; alertTime: string; index: number }[] = [];
+    const fleetLookups = [];
     const transformedAlerts = groups.map((g, i) => {
       const t = transformDbAlert(g, severityMap);
       t.count = g.count || 1;
@@ -112,7 +112,7 @@ async function getActiveAlerts(req, res) {
     });
 
     // Batch speed lookups: get unique fleet_numbers, single query, match in JS
-    const fleetSet = new Set<string>();
+    const fleetSet = new Set();
     for (const l of fleetLookups) fleetSet.add(l.fleetNum);
 
     if (fleetSet.size > 0) {
@@ -128,7 +128,7 @@ async function getActiveAlerts(req, res) {
           [fleetList, fleetList.length]
         );
 
-        const speedMap = new Map<string, any>();
+        const speedMap = new Map();
         for (const row of speedResult.rows) {
           speedMap.set(row.fleet_number, row);
         }
