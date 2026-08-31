@@ -622,37 +622,21 @@ async function resolveAlertsBulk(req, res) {
     }
 
     const placeholders = uniqueIds.map((_, i) => `$${i + 1}`).join(', ');
-    const extraIdx = uniqueIds.length;
 
-    // 1. Resolve alert_groups by last_alert_id (text — what frontend sends)
+    // 1. Resolve alert_groups by last_alert_id
     await db.query(
-      `UPDATE alert_groups SET resolved = TRUE, false_alert = $${extraIdx + 1}, resolved_by = $${extraIdx + 2}, resolved_at = $${extraIdx + 3}, notes = COALESCE($${extraIdx + 4}, notes)
+      `UPDATE alert_groups SET resolved = TRUE, false_alert = $${uniqueIds.length + 1}, resolved_by = $${uniqueIds.length + 2}, resolved_at = $${uniqueIds.length + 3}, notes = COALESCE($${uniqueIds.length + 4}, notes)
        WHERE last_alert_id IN (${placeholders}) AND resolved = FALSE`,
       [...uniqueIds, isFalse, userId || null, now, notes || null]
     );
 
-    // 2. Also resolve by integer id (for small group IDs)
-    const intIds = uniqueIds
-      .filter(id => /^\d+$/.test(id) && BigInt(id) <= 2147483647n)
-      .map(Number);
-    if (intIds.length > 0) {
-      const ip = intIds.map((_, i) => `$${i + 1}`).join(', ');
-      await db.query(
-        `UPDATE alert_groups SET resolved = TRUE, false_alert = $${intIds.length + 1}, resolved_by = $${intIds.length + 2}, resolved_at = $${intIds.length + 3}, notes = COALESCE($${intIds.length + 4}, notes)
-         WHERE id IN (${ip}) AND resolved = FALSE`,
-        [...intIds, isFalse, userId || null, now, notes || null]
-      );
-    }
-
-    // 3. Find all affected groups (by group_key) from the resolved groups
+    // 2. Find all affected groups
     const groupResult = await db.query(
-      `SELECT DISTINCT group_key, device_id, alarm_type FROM alert_groups
-       WHERE last_alert_id IN (${placeholders})
-          OR id IN (${intIds.length > 0 ? intIds.map((_, i) => `$${uniqueIds.length + i + 1}`).join(',') : '0'})`,
-      [...uniqueIds, ...intIds]
+      `SELECT DISTINCT device_id, alarm_type FROM alert_groups WHERE last_alert_id IN (${placeholders})`,
+      uniqueIds
     );
 
-    // 4. Resolve all child alerts for each affected group
+    // 3. Resolve all child alerts for each affected group
     for (const g of groupResult.rows) {
       await db.query(
         `UPDATE alerts SET resolved = TRUE, false_alert = $1, updated_at = $2
@@ -661,7 +645,7 @@ async function resolveAlertsBulk(req, res) {
       );
     }
 
-    // 5. Also resolve any alerts whose IDs were directly passed
+    // 4. Also resolve any alerts whose IDs were directly passed
     await db.query(
       `UPDATE alerts SET resolved = TRUE, false_alert = $1, updated_at = $2
        WHERE id IN (${placeholders}) AND resolved = FALSE`,
