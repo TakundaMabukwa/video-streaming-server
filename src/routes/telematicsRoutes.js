@@ -302,38 +302,37 @@ router.get('/vehicle-alerts', async (req, res) => {
   }
 });
 
-// All unresolved alert groups for a specific device (used by resolve modal)
-// Also supports ?fleet=XX to match device_name containing that fleet number
+// All unresolved alerts for a specific device (used by resolve modal)
+// Queries alerts table directly — both video and telematics alerts live here
 router.get('/vehicle-alerts/:deviceId', async (req, res) => {
   try {
     const { deviceId } = req.params;
     const { fleet } = req.query;
 
-    let query = `SELECT ag.*, a.lat, a.lon, a.device_name
-       FROM alert_groups ag
-       LEFT JOIN alerts a ON a.id = ag.last_alert_id
-       WHERE ag.resolved = FALSE AND ag.false_alert = FALSE`;
+    let where = `WHERE resolved = FALSE AND false_alert = FALSE`;
     const params = [];
-    let paramIdx = 1;
+    let idx = 1;
 
-    // Match by device_id or fleet number in device_name
     if (deviceId && deviceId !== 'none') {
-      query += ` AND (ag.device_id = $${paramIdx} OR ag.device_name ILIKE $${paramIdx + 1})`;
+      where += ` AND (device_id = $${idx} OR device_name ILIKE $${idx + 1})`;
       params.push(deviceId, `%${deviceId}%`);
-      paramIdx += 2;
+      idx += 2;
     }
     if (fleet) {
-      query += ` AND ag.device_name ILIKE $${paramIdx}`;
+      where += ` AND device_name ILIKE $${idx}`;
       params.push(`%${fleet}%`);
-      paramIdx++;
+      idx++;
     }
 
     if (params.length === 0) {
       return res.json({ success: true, alerts: [], count: 0 });
     }
 
-    query += ` ORDER BY ag.last_alert_ts DESC`;
-    const result = await db.query(query, params);
+    const result = await db.query(
+      `SELECT * FROM alerts ${where} ORDER BY alarm_ts DESC`,
+      params
+    );
+
     res.json({ success: true, alerts: result.rows, count: result.rows.length });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });

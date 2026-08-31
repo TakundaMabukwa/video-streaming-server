@@ -106,9 +106,10 @@ router.get('/flv-proxy', async (req, res) => {
       if (!url) return sendError(res, 'url query parameter required', 400);
 
       const isSkycamx = url.includes('skycamx.co.za');
+      console.log(`[flv-proxy] Attempt ${attempt}: fetching ${url.slice(0, 100)}...`);
       const axiosOpts = {
         responseType: 'stream',
-        timeout: 25000,
+        timeout: isSkycamx ? 45000 : 25000,
         headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
       };
       if (isSkycamx) {
