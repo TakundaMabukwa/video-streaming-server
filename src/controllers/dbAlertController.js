@@ -625,7 +625,7 @@ async function resolveAlertsBulk(req, res) {
 
     // 1. Resolve alert_groups by last_alert_id
     await db.query(
-      `UPDATE alert_groups SET resolved = TRUE, false_alert = $${uniqueIds.length + 1}, resolved_by = $${uniqueIds.length + 2}, resolved_at = $${uniqueIds.length + 3}, notes = COALESCE($${uniqueIds.length + 4}, notes)
+      `UPDATE alert_groups SET resolved = TRUE, false_alert = $${uniqueIds.length + 1}::boolean, resolved_by = $${uniqueIds.length + 2}, resolved_at = $${uniqueIds.length + 3}::timestamptz, notes = COALESCE($${uniqueIds.length + 4}, notes)
        WHERE last_alert_id IN (${placeholders}) AND resolved = FALSE`,
       [...uniqueIds, isFalse, userId || null, now, notes || null]
     );
@@ -639,7 +639,7 @@ async function resolveAlertsBulk(req, res) {
     // 3. Resolve all child alerts for each affected group
     for (const g of groupResult.rows) {
       await db.query(
-        `UPDATE alerts SET resolved = TRUE, false_alert = $1, updated_at = $2
+        `UPDATE alerts SET resolved = TRUE, false_alert = $1::boolean, updated_at = $2::timestamptz
          WHERE device_id = $3 AND alarm_type = $4 AND resolved = FALSE`,
         [isFalse, now, g.device_id, g.alarm_type]
       );
@@ -647,7 +647,7 @@ async function resolveAlertsBulk(req, res) {
 
     // 4. Also resolve any alerts whose IDs were directly passed
     await db.query(
-      `UPDATE alerts SET resolved = TRUE, false_alert = $1, updated_at = $2
+      `UPDATE alerts SET resolved = TRUE, false_alert = $1::boolean, updated_at = $2::timestamptz
        WHERE id IN (${placeholders}) AND resolved = FALSE`,
       [isFalse, now, ...uniqueIds]
     );
