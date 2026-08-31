@@ -971,24 +971,18 @@ async function fetchAndStoreVehicleStatus() {
 
     const records = response.data.records;
 
-    const recentAlerts = await db.query(
-      `SELECT DISTINCT device_id FROM alerts WHERE alarm_ts > NOW() - INTERVAL '10 minutes'`
-    );
-    const onlineDevices = new Set(recentAlerts.rows.map(r => r.device_id));
-
     let updated = 0;
     for (const record of records) {
       try {
-        const isOnline = onlineDevices.has(record.id);
-
         const geotabDevice = await db.getGeotabDevice(record.id);
         const fleetNumber = geotabDevice?.fleet_number || null;
         const licensePlate = geotabDevice?.license_plate || null;
 
-        // Get previous engine state for transition detection
-        const prevResult = await db.query('SELECT engine_on FROM vehicle_status WHERE device_id = $1', [record.id]);
+        // Get current speed from vehicle_status (set by syncDeviceStatus from Geotab)
+        const prevResult = await db.query('SELECT engine_on, speed FROM vehicle_status WHERE device_id = $1', [record.id]);
         const wasEngineOn = prevResult.rows.length > 0 ? (prevResult.rows[0].engine_on || false) : false;
-        const isEngineOn = isOnline;
+        const currentSpeed = prevResult.rows.length > 0 ? (prevResult.rows[0].speed || 0) : 0;
+        const isEngineOn = currentSpeed >= 5;
 
         await db.query(
           `INSERT INTO vehicle_status (device_id, plate, license_plate, fleet_number, engine_on, ignition_on, last_update)
@@ -998,12 +992,11 @@ async function fetchAndStoreVehicleStatus() {
              license_plate = COALESCE(EXCLUDED.license_plate, vehicle_status.license_plate),
              fleet_number = COALESCE(EXCLUDED.fleet_number, vehicle_status.fleet_number),
              engine_on = $5, ignition_on = $6, last_update = NOW()`,
-          [record.id, record.deviceName || null, licensePlate, fleetNumber, isOnline, isOnline]
+          [record.id, record.deviceName || null, licensePlate, fleetNumber, isEngineOn, isEngineOn]
         );
 
         // RTMS: Log engine on/off transitions
         try {
-          const rtmsService = require('./rtmsService');
           if (isEngineOn && !wasEngineOn) {
             const { query: rtmsQuery } = require('../db');
             await rtmsQuery(
