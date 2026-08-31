@@ -607,7 +607,7 @@ async function clearFollowUp(req, res) {
 
 async function resolveAlertsBulk(req, res) {
   try {
-    const { alertIds, userId, notes, closureType = 'resolved', documents: docData } = req.body || {};
+    const { alertIds, userId, notes, closureType = 'resolved' } = req.body || {};
     if (!Array.isArray(alertIds) || alertIds.length === 0) {
       return res.status(400).json({ success: false, message: 'alertIds array is required' });
     }
@@ -615,35 +615,70 @@ async function resolveAlertsBulk(req, res) {
     const isFalse = closureType === 'false_alert';
     const now = new Date().toISOString();
 
-    const placeholders = alertIds.map((_, i) => `$${i + 1}`).join(', ');
+    // Deduplicate IDs
+    const uniqueIds = [...new Set(alertIds.map(String).filter(Boolean))];
+    if (uniqueIds.length === 0) {
+      return res.json({ success: true, resolved: 0, total: 0, message: 'No alerts to resolve' });
+    }
 
-    // 1. Resolve alert_groups by last_alert_id (what frontend sends)
+    const placeholders = uniqueIds.map((_, i) => `$${i + 1}`).join(', ');
+    const extraIdx = uniqueIds.length;
+
+    // 1. Resolve alert_groups by last_alert_id (text — what frontend sends)
     await db.query(
-      `UPDATE alert_groups SET resolved = TRUE, false_alert = $${alertIds.length + 1}, resolved_by = $${alertIds.length + 2}, resolved_at = $${alertIds.length + 3}, notes = COALESCE($${alertIds.length + 4}, notes)
-       WHERE last_alert_id IN (${placeholders})`,
-      [...alertIds, isFalse, userId || null, now, notes || null]
+      `UPDATE alert_groups SET resolved = TRUE, false_alert = $${extraIdx + 1}, resolved_by = $${extraIdx + 2}, resolved_at = $${extraIdx + 3}, notes = COALESCE($${extraIdx + 4}, notes)
+       WHERE last_alert_id IN (${placeholders}) AND resolved = FALSE`,
+      [...uniqueIds, isFalse, userId || null, now, notes || null]
     );
 
-    // 2. Also resolve by integer id (in case some are group IDs)
-    const intIds = alertIds.filter(id => /^\d+$/.test(id) && Number(id) < 2147483647).map(Number);
+    // 2. Also resolve by integer id (for small group IDs)
+    const intIds = uniqueIds
+      .filter(id => /^\d+$/.test(id) && BigInt(id) <= 2147483647n)
+      .map(Number);
     if (intIds.length > 0) {
-      const intPlaceholders = intIds.map((_, i) => `$${i + 1}`).join(', ');
+      const ip = intIds.map((_, i) => `$${i + 1}`).join(', ');
       await db.query(
         `UPDATE alert_groups SET resolved = TRUE, false_alert = $${intIds.length + 1}, resolved_by = $${intIds.length + 2}, resolved_at = $${intIds.length + 3}, notes = COALESCE($${intIds.length + 4}, notes)
-         WHERE id IN (${intPlaceholders})`,
+         WHERE id IN (${ip}) AND resolved = FALSE`,
         [...intIds, isFalse, userId || null, now, notes || null]
       );
     }
 
-    // 3. Resolve all child alerts with same (device_id, alarm_type)
+    // 3. Find all affected groups (by group_key) from the resolved groups
+    const groupResult = await db.query(
+      `SELECT DISTINCT group_key, device_id, alarm_type FROM alert_groups
+       WHERE last_alert_id IN (${placeholders})
+          OR id IN (${intIds.length > 0 ? intIds.map((_, i) => `$${uniqueIds.length + i + 1}`).join(',') : '0'})`,
+      [...uniqueIds, ...intIds]
+    );
+
+    // 4. Resolve all child alerts for each affected group
+    for (const g of groupResult.rows) {
+      await db.query(
+        `UPDATE alerts SET resolved = TRUE, false_alert = $1, updated_at = $2
+         WHERE device_id = $3 AND alarm_type = $4 AND resolved = FALSE`,
+        [isFalse, now, g.device_id, g.alarm_type]
+      );
+    }
+
+    // 5. Also resolve any alerts whose IDs were directly passed
     await db.query(
       `UPDATE alerts SET resolved = TRUE, false_alert = $1, updated_at = $2
-       WHERE (device_id, alarm_type) IN (
-         SELECT device_id, alarm_type FROM alert_groups
-         WHERE last_alert_id IN (${placeholders})
-       ) AND resolved = FALSE`,
-      [isFalse, now, ...alertIds]
+       WHERE id IN (${placeholders}) AND resolved = FALSE`,
+      [isFalse, now, ...uniqueIds]
     );
+
+    res.json({
+      success: true,
+      resolved: uniqueIds.length,
+      groups: groupResult.rows.length,
+      total: alertIds.length,
+      message: `${uniqueIds.length} groups resolved (${groupResult.rows.length} alert types)`,
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+}
 
     res.json({ success: true, resolved: alertIds.length, total: alertIds.length, message: `${alertIds.length} alerts resolved` });
   } catch (error) {
