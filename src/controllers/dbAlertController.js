@@ -93,41 +93,73 @@ async function getActiveAlerts(req, res) {
     // Read from alert_groups for grouped view
     const groups = await db.getActiveAlertGroupsWithMedia({ limit });
 
-    const alerts = [];
-    for (const g of groups) {
-      const transformed = transformDbAlert(g, severityMap);
-      
-      // Fetch speed from telematics_events using fleet_number
-      let fleetNum = transformed.fleet_number || g.fleet_number;
-      if (!fleetNum && transformed.vehicle_registration) {
-        const parts = transformed.vehicle_registration.split(' - ');
+    // Collect all fleet_numbers with their alert times for batch speed lookup
+    const fleetLookups: { fleetNum: string; alertTime: string; index: number }[] = [];
+    const transformedAlerts = groups.map((g, i) => {
+      const t = transformDbAlert(g, severityMap);
+      t.count = g.count || 1;
+
+      let fleetNum = t.fleet_number || g.fleet_number;
+      if (!fleetNum && t.vehicle_registration) {
+        const parts = t.vehicle_registration.split(' - ');
         fleetNum = parts[0]?.trim();
       }
-      const alertTime = transformed.timestamp || g.last_alert_ts || g.alarm_ts;
-      
+      const alertTime = t.timestamp || g.last_alert_ts || g.alarm_ts;
       if (fleetNum && alertTime) {
-        try {
-          const speedResult = await db.query(
-            `SELECT speed, distance, duration_seconds FROM telematics_events
-             WHERE fleet_number = $1 AND speed IS NOT NULL 
-             AND event_time >= $2::timestamptz - INTERVAL '5 minutes'
-             AND event_time <= $2::timestamptz + INTERVAL '5 minutes'
-             ORDER BY ABS(EXTRACT(EPOCH FROM (event_time - $2::timestamptz))) ASC
-             LIMIT 1`,
-            [fleetNum, alertTime]
-          );
-          if (speedResult.rows.length > 0) {
-            transformed.speed = speedResult.rows[0].speed;
-            transformed.distance = speedResult.rows[0].distance;
-            transformed.duration_seconds = speedResult.rows[0].duration_seconds;
-            transformed.metadata = { ...transformed.metadata, speed: speedResult.rows[0].speed };
-          }
-        } catch (e) { /* non-critical */ }
+        fleetLookups.push({ fleetNum, alertTime, index: i });
       }
-      
-      transformed.count = g.count || 1;
-      alerts.push(transformed);
+      return t;
+    });
+
+    // Batch speed lookups: one query for all alerts instead of N queries
+    if (fleetLookups.length > 0) {
+      try {
+        const speedMap = new Map<string, any>();
+
+        // Batch in groups of 50 to avoid too many params
+        for (let i = 0; i < fleetLookups.length; i += 50) {
+          const batch = fleetLookups.slice(i, i + 50);
+          const params: any[] = [];
+          const conditions: string[] = [];
+          batch.forEach((lookup, j) => {
+            const baseIdx = j * 3;
+            conditions.push(
+              `(fleet_number = $${baseIdx + 1} AND event_time >= $${baseIdx + 2}::timestamptz - INTERVAL '5 minutes' AND event_time <= $${baseIdx + 2}::timestamptz + INTERVAL '5 minutes')`
+            );
+            params.push(lookup.fleetNum, lookup.alertTime);
+          });
+
+          const speedResult = await db.query(
+            `SELECT DISTINCT ON (fleet_number)
+              fleet_number, speed, distance, duration_seconds
+             FROM telematics_events
+             WHERE speed IS NOT NULL AND (${conditions.join(' OR ')})
+             ORDER BY fleet_number, ABS(EXTRACT(EPOCH FROM (event_time::timestamptz))) ASC`,
+            params
+          );
+
+          for (const row of speedResult.rows) {
+            speedMap.set(row.fleet_number, row);
+          }
+        }
+
+        // Attach speed data to alerts
+        for (const lookup of fleetLookups) {
+          const speedData = speedMap.get(lookup.fleetNum);
+          if (speedData) {
+            transformedAlerts[lookup.index].speed = speedData.speed;
+            transformedAlerts[lookup.index].distance = speedData.distance;
+            transformedAlerts[lookup.index].duration_seconds = speedData.duration_seconds;
+            transformedAlerts[lookup.index].metadata = {
+              ...transformedAlerts[lookup.index].metadata,
+              speed: speedData.speed,
+            };
+          }
+        }
+      } catch (e) { /* non-critical */ }
     }
+
+    const alerts = transformedAlerts;
 
     res.json({ success: true, alerts, count: alerts.length, total: alerts.length, source: 'eps-db' });
   } catch (error) {
