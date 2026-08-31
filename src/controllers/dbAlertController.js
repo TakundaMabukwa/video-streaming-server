@@ -674,32 +674,24 @@ async function resolveAlertsBulk(req, res) {
       return res.status(400).json({ success: false, message: 'alertIds array is required' });
     }
 
-    const results = [];
-    for (const id of alertIds) {
-      try {
-        const updates = { resolved: true, false_alert: closureType === 'false_alert', resolved_at: new Date().toISOString() };
-        if (notes) updates.notes = notes;
-        const alert = await db.updateAlertStatus(id, updates);
-        if (!alert) { results.push({ id, success: false, message: 'Not found' }); continue; }
+    const isFalse = closureType === 'false_alert';
+    const now = new Date().toISOString();
 
-        const group = await db.getAlertGroupByAlertId(id);
-        if (group) {
-          await db.resolveAlertGroup(group.group_key, { resolved: true, false_alert: closureType === 'false_alert', resolved_by: userId || null, resolved_at: new Date().toISOString(), notes: notes || null });
-        }
+    // Batch update alerts table
+    const placeholders = alertIds.map((_, i) => `$${i + 1}`).join(', ');
+    await db.query(
+      `UPDATE alerts SET resolved = TRUE, false_alert = $${alertIds.length + 1}, notes = COALESCE($${alertIds.length + 2}, notes), updated_at = $${alertIds.length + 3} WHERE id IN (${placeholders})`,
+      [...alertIds, isFalse, notes || null, now]
+    );
 
-        if (docData && docData.length > 0) {
-          const docs = docData.map(d => ({ type: d.type, timestamp: d.timestamp || new Date().toISOString(), filled_by: d.filled_by || userId || 'unknown', link: d.link })).filter(d => d.type && d.link);
-          if (docs.length > 0) await db.addAlertDocument(id, docs);
-        }
+    // Batch resolve matching alert_groups
+    await db.query(
+      `UPDATE alert_groups SET resolved = TRUE, false_alert = $${alertIds.length + 1}, resolved_by = $${alertIds.length + 2}, resolved_at = $${alertIds.length + 3}, notes = COALESCE($${alertIds.length + 4}, notes)
+       WHERE last_alert_id IN (${placeholders})`,
+      [...alertIds, isFalse, userId || null, now, notes || null]
+    );
 
-        results.push({ id, success: true });
-      } catch (e) {
-        results.push({ id, success: false, message: e.message });
-      }
-    }
-
-    const resolved = results.filter(r => r.success).length;
-    res.json({ success: true, resolved, total: alertIds.length, results, message: `${resolved}/${alertIds.length} alerts resolved` });
+    res.json({ success: true, resolved: alertIds.length, total: alertIds.length, message: `${alertIds.length} alerts resolved` });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
