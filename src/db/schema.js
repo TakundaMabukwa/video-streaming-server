@@ -462,6 +462,9 @@ const MIGRATIONS_SQL = `
   );
 
   CREATE INDEX IF NOT EXISTS idx_vehicle_log_records_device_time ON vehicle_log_records(device_id, record_time);
+
+  -- Composite index for fast unresolved alert_groups lookup
+  CREATE INDEX IF NOT EXISTS idx_alert_groups_resolved_ts ON alert_groups(resolved, last_alert_ts DESC) WHERE resolved = FALSE;
 `;
 
 async function initializeDatabase() {
