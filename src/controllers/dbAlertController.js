@@ -4,7 +4,7 @@ const { sendSuccess, sendError } = require('../helpers/response');
 const { uploadDocument } = require('../helpers/storage');
 const { transformDbAlert } = require('../helpers/transform');
 const { getVideoSeverityMap } = require('../db/alert_definitions');
-const { findVehicleCostCenterId } = require('../services/costCenterLookup');
+const { findVehicleCostCenterId, resolveFleetNumber } = require('../services/costCenterLookup');
 const { applyNcrDeduction } = require('../services/driverScoringService');
 
 async function getAlertsList(req, res) {
@@ -541,7 +541,16 @@ async function resolveAlert(req, res) {
     let deduction = { deducted: false };
 
     if (isNcr) {
-      const fleetNumber = alert.device_id;
+      // Resolve the human fleet number (device ids are Geotab/Mettax codes,
+      // e.g. '221085903184' -> 'EX41'), preferring an explicit fleet from the form.
+      const fleetNumber = String(incidentData.fleet_number || incidentData.fleetNumber || '').trim()
+        || (await resolveFleetNumber({
+          deviceId: alert.device_id,
+          vehicleRegistration: alert.vehicle_registration || alert.vehicle_reg,
+          fleetNumber: alert.fleet_number,
+        }).catch(() => null))
+        || alert.device_id;
+
       const costCenterId = alert.cost_center_id
         || (await findVehicleCostCenterId(fleetNumber).catch(() => null));
 
@@ -550,13 +559,17 @@ async function resolveAlert(req, res) {
         alertGroupKey: resolvedGroupKey,
         alarmType: alert.alarm_type,
         sourceType: alert.source_type || 'telematics',
-        deviceId: fleetNumber,
+        deviceId: alert.device_id,
         fleetNumber,
         costCenterId,
         filledBy: userId || 'SYSTEM',
         status: isFalse ? 'FALSE_ALERT' : 'OPEN',
-        controller: reported_by || incidentData.controller || null,
-        driver_name: incidentData.driver_name || incidentData.driverName || null,
+        controller: reported_by || incidentData.controller || incidentData.reported_by || null,
+        driver_name:
+          incidentData.driver_name
+          || incidentData.driverName
+          || incidentData['name & surname']
+          || null,
         contact_number: incidentData.contact_number || incidentData.contactNumber || null,
         id_number: incidentData.id_number || null,
         division: incidentData.division || null,
@@ -650,21 +663,26 @@ async function markFalseAlert(req, res) {
 async function uploadDocumentToAlert(req, res) {
   try {
     const { id } = req.params;
-    const { type, filled_by } = req.body;
+    const { type, filled_by, link, url } = req.body || {};
 
     if (!type) {
       return res.status(400).json({ success: false, message: 'Document type is required' });
     }
 
-    if (!req.files || !req.files.file) {
-      return res.status(400).json({ success: false, message: 'File is required' });
+    // Accept either a multipart upload (file) or pre-uploaded metadata (link/url).
+    let publicUrl;
+    if (req.files && req.files.file) {
+      const file = req.files.file;
+      const safeName = `${id}_${type}_${Date.now()}_${file.name.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+      publicUrl = await uploadDocument(file.data, safeName, file.mimetype);
+    } else {
+      publicUrl = String(link || url || '').trim();
+      if (!publicUrl) {
+        return res.status(400).json({ success: false, message: 'Multipart file or a JSON body with "link" is required' });
+      }
     }
 
-    const file = req.files.file;
-    const timestamp = new Date().toISOString();
-    const safeName = `${id}_${type}_${Date.now()}_${file.name.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
-
-    const publicUrl = await uploadDocument(file.data, safeName, file.mimetype);
+    const timestamp = (req.body && req.body.timestamp) || new Date().toISOString();
 
     const document = {
       type,

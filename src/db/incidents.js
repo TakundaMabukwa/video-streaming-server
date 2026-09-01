@@ -1,5 +1,14 @@
 const { query } = require('./pool');
 
+// ISO-8601 week number (1-53), matching Excel WEEKNUM-style week the register uses.
+function isoWeek(date) {
+  const d = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+  const dayNum = d.getUTCDay() || 7;
+  d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+  return Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+}
+
 function incidentSelectColumns() {
   return `id, incident_no, alert_id, alert_group_key, alarm_type, source_type, device_id, fleet_number, cost_center_id,
     week, shift, incident_date, incident_time, controller, driver_name, contact_number, id_number, division,
@@ -21,6 +30,9 @@ async function upsertIncidentFromAlert({
   status = 'OPEN',
   ...form
 }) {
+  const saveTime = new Date();
+  const saveIso = saveTime.toISOString();
+
   const result = await query(
     `INSERT INTO incidents (
        incident_no, alert_id, alert_group_key, alarm_type, source_type, device_id, fleet_number, cost_center_id,
@@ -68,10 +80,10 @@ async function upsertIncidentFromAlert({
       deviceId,
       fleetNumber,
       costCenterId,
-      form.week || null,
+      form.week || isoWeek(saveTime),
       form.shift || null,
-      form.incident_date || null,
-      form.incident_time || null,
+      form.incident_date || saveIso.slice(0, 10),
+      form.incident_time || saveIso.slice(11, 16),
       form.controller || null,
       form.driver_name || null,
       form.contact_number || null,
