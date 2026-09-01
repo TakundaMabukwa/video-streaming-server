@@ -137,6 +137,18 @@ async function processAlertDeduction(fleet_number, alert_type) {
         ncrCreated = true;
         // Reset count after NCR
         alertEntry.count = 0;
+
+        // Capture incident register row for the auto-NCR
+        try {
+          await insertAutoIncident(client, {
+            alertId: ncrId,
+            fleetNumber: fleet_number,
+            alarmType: `NCR: ${alert_type}`,
+            costCenterId: vehicleCostCenterId,
+          });
+        } catch (incErr) {
+          console.error('[DriverScoring] Failed to capture auto-incident:', incErr.message);
+        }
       } catch (ncrErr) {
         console.error('[DriverScoring] Failed to create NCR alert:', ncrErr.message);
       }
@@ -163,6 +175,84 @@ async function processAlertDeduction(fleet_number, alert_type) {
   } catch (err) {
     await client.query('ROLLBACK');
     console.error('[DriverScoring] processAlertDeduction error:', err.message);
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// Insert an OPEN incident register row for an auto-generated NCR (uses caller's transaction client).
+async function insertAutoIncident(client, { alertId, fleetNumber, alarmType, costCenterId, sourceType = 'telematics' }) {
+  await client.query(
+    `INSERT INTO incidents (
+       incident_no, alert_id, alarm_type, source_type, device_id, fleet_number, cost_center_id,
+       week, shift, incident_date, incident_time, infringement, filled_by, status
+     ) VALUES (
+       DEFAULT, $1, $2, $3, $4, $5, $6,
+       EXTRACT(WEEK FROM NOW())::int, to_char(NOW(), 'HH24:MI'), CURRENT_DATE, NOW()::time, $2, 'SYSTEM', 'OPEN'
+     )
+     ON CONFLICT (alert_id) DO NOTHING`,
+    [alertId, alarmType, sourceType, fleetNumber, fleetNumber, costCenterId]
+  );
+}
+
+// Apply the one-time NCR deduction (deduction_with_ncr) for a closed NCR incident.
+// Gated by nrc_deduction on the CC-aware driver_config_criteria row.
+async function applyNcrDeduction(fleet_number, alertType) {
+  if (!fleet_number) return { deducted: false, reason: 'no_fleet' };
+
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+
+    const vehicleCostCenterId = await findVehicleCostCenterId(fleet_number);
+    const baseType = String(alertType || '').replace(/^NCR:\s*/i, '');
+
+    // Prefer a criterion matching the original alert type; fall back to any NCR-enabled criterion for the CC.
+    const criteriaResult = await client.query(
+      `SELECT id, name, deduction_with_ncr, nrc_deduction, cost_center_id
+       FROM driver_config_criteria
+       WHERE is_active = true
+       AND (cost_center_id = $2 OR (cost_center_id IS NULL))
+       AND (EXISTS (SELECT 1 FROM unnest(statuses) s WHERE LOWER(s) = LOWER($1))
+            OR nrc_deduction = true)
+       ORDER BY
+         (EXISTS (SELECT 1 FROM unnest(statuses) s WHERE LOWER(s) = LOWER($1))) DESC,
+         cost_center_id IS NOT NULL DESC
+       LIMIT 1`,
+      [baseType, vehicleCostCenterId == null ? 0 : vehicleCostCenterId]
+    );
+
+    const criteria = criteriaResult.rows[0];
+    if (!criteria || !criteria.nrc_deduction) {
+      await client.query('COMMIT');
+      return { deducted: false, reason: 'no_criteria_or_nrc_disabled' };
+    }
+
+    const weighting = parseFloat(criteria.deduction_with_ncr) || 0;
+    if (weighting <= 0) {
+      await client.query('COMMIT');
+      return { deducted: false, reason: 'zero_weighting', weighting };
+    }
+
+    const result = await client.query(
+      `UPDATE driver_scoring
+       SET score = GREATEST(score - $1, 0), updated_at = NOW()
+       WHERE fleet_number = $2
+       RETURNING id, score`,
+      [weighting, fleet_number]
+    );
+
+    await client.query('COMMIT');
+
+    if (result.rows.length === 0) {
+      return { deducted: false, reason: 'no_scoring_record', weighting };
+    }
+
+    return { deducted: true, new_score: result.rows[0].score, weighting };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('[DriverScoring] applyNcrDeduction error:', err.message);
     throw err;
   } finally {
     client.release();
@@ -282,5 +372,7 @@ module.exports = {
   syncNewVehicles,
   startMidnightCron,
   stopMidnightCron,
-  processAlertDeduction
+  processAlertDeduction,
+  applyNcrDeduction,
+  insertAutoIncident,
 };

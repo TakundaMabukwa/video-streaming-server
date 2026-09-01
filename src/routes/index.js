@@ -11,6 +11,7 @@ const driverScoringRoutes = require('./driverScoringRoutes');
 const rtmsRoutes = require('./rtmsRoutes');
 const telematicsRoutes = require('./telematicsRoutes');
 const policeRoutes = require('./policeRoutes');
+const incidentsRoutes = require('./incidentsRoutes');
 
 const router = express.Router();
 
@@ -26,5 +27,6 @@ router.use('/driver-scoring', driverScoringRoutes);
 router.use('/rtms', rtmsRoutes);
 router.use('/telematics', telematicsRoutes);
 router.use('/police', policeRoutes);
+router.use('/incidents', incidentsRoutes);
 
 module.exports = router;

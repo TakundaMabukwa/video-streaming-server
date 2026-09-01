@@ -567,62 +567,16 @@ async function syncGeotabEvents() {
         }
 
         // Also store as alert in alerts + alert_groups tables (telematics source)
-        try {
-          const { findVehicleCostCenterId } = require('./costCenterLookup');
-          const eventCC = await findVehicleCostCenterId(fleetNumber || geotabDeviceId);
-          const telematicsSeverityMap = await getTelematicsSeverityMap(eventCC ? [eventCC] : []);
-          const eventLower = (eventName || '').toLowerCase();
-          // Map event name to a signal_code for alert_definitions lookup
-          let signalCode = 'exceptionEvent';
-          if (eventLower.includes('speed')) signalCode = 'speeding';
-          else if (eventLower.includes('braking') || eventLower.includes('harsh')) signalCode = 'harshBraking';
-          else if (eventLower.includes('cornering')) signalCode = 'harshCornering';
-          else if (eventLower.includes('acceleration') || eventLower.includes('rapid')) signalCode = 'rapidAcceleration';
-          else if (eventLower.includes('no go') || eventLower.includes('nogo')) signalCode = 'noGoZoneEntry';
-          else if (eventLower.includes('high risk') || eventLower.includes('highrisk')) signalCode = 'highRiskZoneEntry';
-          else if (eventLower.includes('zone') || eventLower.includes('fence')) signalCode = 'zoneBreach';
-          else if (eventLower.includes('idle')) signalCode = 'idling';
-          else if (eventLower.includes('tow')) signalCode = 'tow';
-          else if (eventLower.includes('battery')) signalCode = 'batteryLow';
-          else if (eventLower.includes('remov') || eventLower.includes('tamper')) signalCode = 'deviceRemoved';
-          else if (eventLower.includes('seatbelt')) signalCode = 'seatBelt';
+        // Resolve the telematics signal_code + severity map from alert_definitions (CC-aware)
+        const { findVehicleCostCenterId } = require('./costCenterLookup');
+        const eventCC = await findVehicleCostCenterId(fleetNumber || geotabDeviceId).catch(() => null);
+        const telematicsSeverityMap = await getTelematicsSeverityMap(eventCC ? [eventCC] : []).catch(() => ({}));
+        const telematicsSignalCode = mapEventToSignalCode(eventName || '');
 
-          const alertSeverity = (telematicsSeverityMap[signalCode] || severity || 'MEDIUM').toLowerCase();
-          const alertId = `tel-${geotabDeviceId}-${Date.now()}-${inserted}`;
-          const deviceName = fleetNumber ? `${fleetNumber}${licensePlate ? ' - ' + licensePlate : ''}` : geotabDeviceId;
-
-          // Insert into alerts table
-          await db.upsertAlert({
-            id: alertId,
-            deviceId: geotabDeviceId,
-            deviceName,
-            alarmType: signalCode,
-            alarmTs: eventTime,
-            lat: evtLat,
-            lon: evtLon,
-            alarmText: `${eventName}${zoneNameFromEvent ? ' in zone ' + zoneNameFromEvent : ''}`,
-            sourceType: 'telematics',
-          });
-
-          // Upsert into alert_groups
-          await db.upsertAlertGroup({
-            deviceId: geotabDeviceId,
-            deviceName,
-            alarmType: signalCode,
-            alarmText: `${eventName}${zoneNameFromEvent ? ' in zone ' + zoneNameFromEvent : ''}`,
-            alertId,
-            alarmTs: eventTime,
-            lat: evtLat,
-            lon: evtLon,
-            sourceType: 'telematics',
-          });
-          console.log(`[GEOTAB] Telematics alert created: ${alertId} (${signalCode}) for device ${geotabDeviceId}`);
-        } catch (alertErr) {
-          console.error('[GEOTAB] Failed to create telematics alert:', alertErr.message, alertErr.stack);
-        }
-
-        // Broadcast real-time event to connected frontends
-        if (wsBroadcast && insertResult.rows.length > 0) {
+        // Gate the real-time broadcast: only push telematics events whose signal_code is
+        // defined in alert_definitions for the vehicle's cost center (e.g. no-go/high-risk
+        // are seeded; everything else is suppressed unless explicitly defined).
+        if (wsBroadcast && insertResult.rows.length > 0 && telematicsSeverityMap[telematicsSignalCode]) {
           const row = insertResult.rows[0];
           wsBroadcast('new_event', {
             id: row.id,
@@ -642,6 +596,40 @@ async function syncGeotabEvents() {
             zoneName: zoneNameFromEvent,
             eventTime: new Date(eventTime).toISOString(),
           });
+        }
+
+        try {
+          const alertId = `tel-${geotabDeviceId}-${Date.now()}-${inserted}`;
+          const deviceName = fleetNumber ? `${fleetNumber}${licensePlate ? ' - ' + licensePlate : ''}` : geotabDeviceId;
+
+          // Insert into alerts table
+          await db.upsertAlert({
+            id: alertId,
+            deviceId: geotabDeviceId,
+            deviceName,
+            alarmType: telematicsSignalCode,
+            alarmTs: eventTime,
+            lat: evtLat,
+            lon: evtLon,
+            alarmText: `${eventName}${zoneNameFromEvent ? ' in zone ' + zoneNameFromEvent : ''}`,
+            sourceType: 'telematics',
+          });
+
+          // Upsert into alert_groups
+          await db.upsertAlertGroup({
+            deviceId: geotabDeviceId,
+            deviceName,
+            alarmType: telematicsSignalCode,
+            alarmText: `${eventName}${zoneNameFromEvent ? ' in zone ' + zoneNameFromEvent : ''}`,
+            alertId,
+            alarmTs: eventTime,
+            lat: evtLat,
+            lon: evtLon,
+            sourceType: 'telematics',
+          });
+          console.log(`[GEOTAB] Telematics alert created: ${alertId} (${telematicsSignalCode}) for device ${geotabDeviceId}`);
+        } catch (alertErr) {
+          console.error('[GEOTAB] Failed to create telematics alert:', alertErr.message, alertErr.stack);
         }
       } catch (err) {
         // skip individual event errors
@@ -663,6 +651,24 @@ const apiClient = require('../helpers/apiClient');
 // ── WebSocket broadcast hook (set by websocket.js) ──
 let wsBroadcast = null;
 function setWsBroadcast(fn) { wsBroadcast = fn; }
+
+// Map a raw Geotab exception event name to a telematics alert_definitions signal_code
+function mapEventToSignalCode(eventName) {
+  const eventLower = (eventName || '').toLowerCase();
+  if (eventLower.includes('speed')) return 'speeding';
+  if (eventLower.includes('braking') || eventLower.includes('harsh')) return 'harshBraking';
+  if (eventLower.includes('cornering')) return 'harshCornering';
+  if (eventLower.includes('acceleration') || eventLower.includes('rapid')) return 'rapidAcceleration';
+  if (eventLower.includes('no go') || eventLower.includes('nogo')) return 'noGoZoneEntry';
+  if (eventLower.includes('high risk') || eventLower.includes('highrisk')) return 'highRiskZoneEntry';
+  if (eventLower.includes('zone') || eventLower.includes('fence')) return 'zoneBreach';
+  if (eventLower.includes('idle')) return 'idling';
+  if (eventLower.includes('tow')) return 'tow';
+  if (eventLower.includes('battery')) return 'batteryLow';
+  if (eventLower.includes('remov') || eventLower.includes('tamper')) return 'deviceRemoved';
+  if (eventLower.includes('seatbelt')) return 'seatBelt';
+  return 'exceptionEvent';
+}
 
 // ── Point-in-polygon test (ray casting) ──
 function isPointInPolygon(lat, lon, points) {

@@ -5,6 +5,7 @@ const media = require('./media');
 const documents = require('./documents');
 const alertGroups = require('./alert_groups');
 const geotab = require('./geotab');
+const incidents = require('./incidents');
 
 module.exports = {
   query,
@@ -16,4 +17,5 @@ module.exports = {
   ...documents,
   ...alertGroups,
   ...geotab,
+  ...incidents,
 };

@@ -209,6 +209,19 @@ router.post('/increment', async (req, res) => {
           ncrCreated = true;
           // Reset count after NCR
           alertEntry.count = 0;
+
+          // Capture incident register row for the auto-NCR
+          try {
+            const { insertAutoIncident } = require('../services/driverScoringService');
+            await insertAutoIncident(client, {
+              alertId: ncrId,
+              fleetNumber: fleet_number,
+              alarmType: `NCR: ${alert_type}`,
+              costCenterId: vehicleCostCenterId,
+            });
+          } catch (incErr) {
+            console.error('[DriverScoring] Failed to capture auto-incident:', incErr.message);
+          }
         } catch (ncrErr) {
           console.error('[DriverScoring] Failed to create NCR alert:', ncrErr.message);
         }

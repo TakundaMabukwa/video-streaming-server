@@ -1,0 +1,186 @@
+const { query } = require('./pool');
+
+function incidentSelectColumns() {
+  return `id, incident_no, alert_id, alert_group_key, alarm_type, source_type, device_id, fleet_number, cost_center_id,
+    week, shift, incident_date, incident_time, controller, driver_name, contact_number, id_number, division,
+    infringement, infringement_detail, action_taken, outcome, notes, document_link, document_type, status,
+    filled_by, filled_at, resolved_by, resolved_at, closure_type, deduction_applied, created_at, updated_at`;
+}
+
+// Insert an incident captured from an alert (auto-NCR or manual close).
+// Only the resolution + form fields are updated on conflict; the incident is always attached to one alert.
+async function upsertIncidentFromAlert({
+  alertId,
+  alertGroupKey = null,
+  alarmType = null,
+  sourceType = 'telematics',
+  deviceId = null,
+  fleetNumber = null,
+  costCenterId = null,
+  filledBy = 'SYSTEM',
+  status = 'OPEN',
+  ...form
+}) {
+  const result = await query(
+    `INSERT INTO incidents (
+       incident_no, alert_id, alert_group_key, alarm_type, source_type, device_id, fleet_number, cost_center_id,
+       week, shift, incident_date, incident_time, controller, driver_name, contact_number, id_number, division,
+       infringement, infringement_detail, action_taken, outcome, notes, document_link, document_type,
+       status, filled_by
+     ) VALUES (
+       DEFAULT, $1, $2, $3, $4, $5, $6, $7,
+       $8, $9, $10, $11, $12, $13, $14, $15, $16,
+       $17, $18, $19, $20, $21, $22, $23,
+       $24, $25
+     )
+     ON CONFLICT (alert_id) DO UPDATE SET
+       alert_group_key = COALESCE(EXCLUDED.alert_group_key, incidents.alert_group_key),
+       alarm_type = COALESCE(EXCLUDED.alarm_type, incidents.alarm_type),
+       source_type = COALESCE(EXCLUDED.source_type, incidents.source_type),
+       device_id = COALESCE(EXCLUDED.device_id, incidents.device_id),
+       fleet_number = COALESCE(EXCLUDED.fleet_number, incidents.fleet_number),
+       cost_center_id = COALESCE(EXCLUDED.cost_center_id, incidents.cost_center_id),
+       week = COALESCE(EXCLUDED.week, incidents.week),
+       shift = COALESCE(EXCLUDED.shift, incidents.shift),
+       incident_date = COALESCE(EXCLUDED.incident_date, incidents.incident_date),
+       incident_time = COALESCE(EXCLUDED.incident_time, incidents.incident_time),
+       controller = COALESCE(EXCLUDED.controller, incidents.controller),
+       driver_name = COALESCE(EXCLUDED.driver_name, incidents.driver_name),
+       contact_number = COALESCE(EXCLUDED.contact_number, incidents.contact_number),
+       id_number = COALESCE(EXCLUDED.id_number, incidents.id_number),
+       division = COALESCE(EXCLUDED.division, incidents.division),
+       infringement = COALESCE(EXCLUDED.infringement, incidents.infringement),
+       infringement_detail = COALESCE(EXCLUDED.infringement_detail, incidents.infringement_detail),
+       action_taken = COALESCE(EXCLUDED.action_taken, incidents.action_taken),
+       outcome = COALESCE(EXCLUDED.outcome, incidents.outcome),
+       notes = COALESCE(EXCLUDED.notes, incidents.notes),
+       document_link = COALESCE(EXCLUDED.document_link, incidents.document_link),
+       document_type = COALESCE(EXCLUDED.document_type, incidents.document_type),
+       status = COALESCE(EXCLUDED.status, incidents.status),
+       filled_by = COALESCE(EXCLUDED.filled_by, incidents.filled_by),
+       updated_at = NOW()
+     RETURNING ${incidentSelectColumns()}`,
+    [
+      alertId,
+      alertGroupKey,
+      alarmType,
+      sourceType,
+      deviceId,
+      fleetNumber,
+      costCenterId,
+      form.week || null,
+      form.shift || null,
+      form.incident_date || null,
+      form.incident_time || null,
+      form.controller || null,
+      form.driver_name || null,
+      form.contact_number || null,
+      form.id_number || null,
+      form.division || null,
+      form.infringement || null,
+      form.infringement_detail || null,
+      form.action_taken || null,
+      form.outcome || null,
+      form.notes || null,
+      form.document_link || null,
+      form.document_type || null,
+      status,
+      filledBy,
+    ]
+  );
+  return result.rows[0] || null;
+}
+
+async function getIncidentByAlertId(alertId) {
+  const result = await query(
+    `SELECT ${incidentSelectColumns()} FROM incidents WHERE alert_id = $1`,
+    [alertId]
+  );
+  return result.rows[0] || null;
+}
+
+async function getIncident(id) {
+  const result = await query(
+    `SELECT ${incidentSelectColumns()} FROM incidents WHERE id = $1`,
+    [id]
+  );
+  return result.rows[0] || null;
+}
+
+async function getIncidents({ cost_center_id, cost_center_ids, fleet_number, status, from, to, pageSize = 50, pageIndex = 1 } = {}) {
+  const conditions = [];
+  const params = [];
+  const limit = Math.min(Math.max(parseInt(pageSize) || 50, 1), 500);
+  const offset = (Math.max(parseInt(pageIndex) || 1, 1) - 1) * limit;
+
+  const ccList = String(cost_center_ids || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (String(cost_center_id || '').trim()) ccList.push(String(cost_center_id).trim());
+  if (ccList.length > 0) {
+    const ccNums = [...new Set(ccList.map(Number).filter(n => Number.isFinite(n) && n > 0))];
+    if (ccNums.length > 0) {
+      params.push(ccNums);
+      conditions.push(`cost_center_id = ANY($${params.length}::int[])`);
+    }
+  }
+  if (fleet_number) {
+    params.push(String(fleet_number));
+    conditions.push(`fleet_number = $${params.length}`);
+  }
+  if (status) {
+    params.push(String(status).toUpperCase());
+    conditions.push(`status = $${params.length}`);
+  }
+  if (from && to) {
+    params.push(from, to);
+    conditions.push(`incident_date BETWEEN $${params.length - 1} AND $${params.length}`);
+  } else if (from) {
+    params.push(from);
+    conditions.push(`incident_date >= $${params.length}`);
+  } else if (to) {
+    params.push(to);
+    conditions.push(`incident_date <= $${params.length}`);
+  }
+
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const countResult = await query(`SELECT COUNT(*)::int AS total FROM incidents ${where}`, params);
+  const result = await query(
+    `SELECT ${incidentSelectColumns()} FROM incidents ${where}
+     ORDER BY incident_date DESC NULLS LAST, created_at DESC
+     LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+    [...params, limit, offset]
+  );
+
+  return { incidents: result.rows, total: countResult.rows[0].total, page: parseInt(pageIndex) || 1, pageSize: limit };
+}
+
+async function updateIncidentFields(id, fields) {
+  const allowed = [
+    'week', 'shift', 'incident_date', 'incident_time', 'controller', 'driver_name', 'contact_number',
+    'id_number', 'division', 'infringement', 'infringement_detail', 'action_taken', 'outcome', 'notes',
+    'document_link', 'document_type', 'status', 'resolved_by', 'resolved_at', 'closure_type', 'deduction_applied'
+  ];
+  const sets = [];
+  const params = [];
+  for (const key of Object.keys(fields)) {
+    if (!allowed.includes(key)) continue;
+    params.push(fields[key]);
+    sets.push(`${key} = $${params.length}`);
+  }
+  if (sets.length === 0) return null;
+  params.push(id);
+  sets.push('updated_at = NOW()');
+  const result = await query(
+    `UPDATE incidents SET ${sets.join(', ')} WHERE id = $${params.length} RETURNING ${incidentSelectColumns()}`,
+    params
+  );
+  return result.rows[0] || null;
+}
+
+module.exports = {
+  upsertIncidentFromAlert,
+  getIncidentByAlertId,
+  getIncident,
+  getIncidents,
+  updateIncidentFields,
+  incidentSelectColumns,
+};

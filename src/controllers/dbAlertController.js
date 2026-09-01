@@ -4,6 +4,8 @@ const { sendSuccess, sendError } = require('../helpers/response');
 const { uploadDocument } = require('../helpers/storage');
 const { transformDbAlert } = require('../helpers/transform');
 const { getVideoSeverityMap } = require('../db/alert_definitions');
+const { findVehicleCostCenterId } = require('../services/costCenterLookup');
+const { applyNcrDeduction } = require('../services/driverScoringService');
 
 async function getAlertsList(req, res) {
   try {
@@ -410,22 +412,69 @@ async function acknowledgeAlert(req, res) {
 async function resolveAlert(req, res) {
   try {
     const { id } = req.params;
-    const { userId, notes, closureType = 'resolved', documents: docData } = req.body || {};
+    const {
+      userId,
+      notes,
+      closureType = 'resolved',
+      documents: docData,
+      action_taken,
+      ncr_classification,
+      close_reason,
+      reported_by,
+      resolveScope = 'this_alert',
+      incident: incidentData = {},
+    } = req.body || {};
 
-    const updates = { resolved: true, false_alert: closureType === 'false_alert' };
-    if (notes) updates.notes = notes;
-    const alert = await db.updateAlertStatus(id, updates);
+    const isFalse = closureType === 'false_alert';
+    const now = new Date().toISOString();
 
-    if (!alert) {
+    // Load the alert (needed for incident capture / deduction)
+    const alertResult = await db.query('SELECT * FROM alerts WHERE id = $1', [id]);
+    if (alertResult.rows.length === 0) {
       return res.status(404).json({ success: false, message: `Alert ${id} not found` });
     }
+    const alert = alertResult.rows[0];
 
-    // Also resolve the alert group if it exists
-    const group = await db.getAlertGroupByAlertId(id);
-    if (group) {
-      await db.resolveAlertGroup(group.group_key, { resolved: true, false_alert: closureType === 'false_alert', resolved_by: userId || null, resolved_at: new Date().toISOString(), notes: notes || null });
+    // Resolve the alert group if it exists (telematics alerts may not match last_alert_id)
+    const group = await db.getAlertGroupByAlertId(id)
+      || await db.getAlertGroupByKey(`${alert.device_id}:${alert.alarm_type}`.toLowerCase());
+    const resolvedGroupKey = group ? group.group_key : null;
+
+    let count = 1;
+    if (resolveScope === 'all_group' && group) {
+      // Set-based resolve of the whole group + all its child alerts (fast, one shot)
+      await db.query(
+        `UPDATE alert_groups SET resolved = TRUE, false_alert = $1::boolean, resolved_by = $2, resolved_at = $3::timestamptz, notes = COALESCE($4, notes), updated_at = NOW()
+         WHERE group_key = $5 AND resolved = FALSE`,
+        [isFalse, userId || null, now, notes || null, group.group_key]
+      );
+      await db.query(
+        `UPDATE alerts SET resolved = TRUE, false_alert = $1::boolean, updated_at = $2::timestamptz
+         WHERE device_id = $3 AND alarm_type = $4 AND resolved = FALSE`,
+        [isFalse, now, group.device_id, group.alarm_type]
+      );
+      await db.query(
+        `UPDATE alerts SET resolved = TRUE, false_alert = $1::boolean, updated_at = $2::timestamptz
+         WHERE id = $3 AND resolved = FALSE`,
+        [isFalse, now, id]
+      );
+      count = group.count || 1;
+    } else {
+      const updates = { resolved: true, false_alert: isFalse };
+      if (notes) updates.notes = notes;
+      await db.updateAlertStatus(id, updates);
+      if (group) {
+        await db.resolveAlertGroup(group.group_key, {
+          resolved: true,
+          false_alert: isFalse,
+          resolved_by: userId || null,
+          resolved_at: now,
+          notes: notes || null,
+        });
+      }
     }
 
+    // Documents: store on Supabase, keep the link for the incident register
     const docs = [];
     if (docData) {
       const docEntries = Array.isArray(docData) ? docData : [docData];
@@ -433,7 +482,7 @@ async function resolveAlert(req, res) {
         if (doc.type && doc.link) {
           docs.push({
             type: doc.type,
-            timestamp: doc.timestamp || new Date().toISOString(),
+            timestamp: doc.timestamp || now,
             filled_by: doc.filled_by || userId || 'unknown',
             link: doc.link,
           });
@@ -444,16 +493,79 @@ async function resolveAlert(req, res) {
       }
     }
 
+    // Capture / update the incident register row for NCR closures
+    const isNcr = String(alert.alarm_type || '').startsWith('NCR:')
+      || !!(incidentData.infringement || ncr_classification || close_reason || action_taken);
+
+    let incident = null;
+    let deduction = { deducted: false };
+
+    if (isNcr) {
+      const fleetNumber = alert.device_id;
+      const costCenterId = alert.cost_center_id
+        || (await findVehicleCostCenterId(fleetNumber).catch(() => null));
+
+      incident = await db.upsertIncidentFromAlert({
+        alertId: id,
+        alertGroupKey: resolvedGroupKey,
+        alarmType: alert.alarm_type,
+        sourceType: alert.source_type || 'telematics',
+        deviceId: fleetNumber,
+        fleetNumber,
+        costCenterId,
+        filledBy: userId || 'SYSTEM',
+        status: isFalse ? 'FALSE_ALERT' : 'OPEN',
+        controller: reported_by || incidentData.controller || null,
+        driver_name: incidentData.driver_name || incidentData.driverName || null,
+        contact_number: incidentData.contact_number || incidentData.contactNumber || null,
+        id_number: incidentData.id_number || null,
+        division: incidentData.division || null,
+        infringement: ncr_classification || incidentData.infringement || alert.alarm_type,
+        infringement_detail: close_reason || incidentData.infringement_detail || notes || null,
+        action_taken: action_taken || incidentData.action_taken || null,
+        outcome: incidentData.outcome || null,
+        notes: notes || null,
+        document_link: docs.length > 0 ? docs[0].link : null,
+        document_type: docs.length > 0 ? docs[0].type : null,
+      });
+
+      if (incident) {
+        if (isFalse) {
+          await db.updateIncidentFields(incident.id, { status: 'FALSE_ALERT', closure_type: closureType });
+        } else {
+          // Deduct once per closed NCR (never for false alerts)
+          try {
+            deduction = await applyNcrDeduction(fleetNumber, alert.alarm_type);
+          } catch (deductErr) {
+            console.error('[ResolveAlert] NCR deduction error:', deductErr.message);
+          }
+          const resFields = {
+            status: 'RESOLVED',
+            resolved_by: userId || null,
+            resolved_at: now,
+            closure_type: closureType,
+          };
+          if (deduction.deducted) resFields.deduction_applied = deduction.weighting;
+          await db.updateIncidentFields(incident.id, resFields);
+        }
+      }
+    }
+
     res.json({
       success: true,
       alertId: id,
       action: 'close',
       closureType,
+      resolveScope,
       resolved: true,
-      false_alert: closureType === 'false_alert',
+      false_alert: isFalse,
       documents: docs,
-      count: group ? group.count : 1,
-      message: group ? `Alert group ${group.group_key} resolved (${group.count} alerts)` : `Alert ${id} resolved successfully`,
+      incident: incident || null,
+      deduction,
+      count,
+      message: group
+        ? `Alert group ${group.group_key} resolved (${count} alerts)${resolveScope === 'all_group' ? ' + all children' : ''}`
+        : `Alert ${id} resolved successfully`,
     });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
