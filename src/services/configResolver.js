@@ -7,8 +7,8 @@ const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const configCache = new Map();
 const CONFIG_CACHE_TTL = 5 * 60 * 1000;
 
-function cacheKey(table, costCenterId) {
-  return `${table}:${costCenterId == null ? 'global' : costCenterId}`;
+function cacheKey(table, costCenterId, matchBy = {}) {
+  return `${table}:${costCenterId == null ? 'global' : costCenterId}:${JSON.stringify(matchBy)}`;
 }
 
 /*
@@ -19,7 +19,7 @@ function cacheKey(table, costCenterId) {
  * `matchBy` (e.g. { name: 'X' } or { signal_code: 'Y' }).
  */
 async function resolveConfig(table, costCenterId, matchBy = {}) {
-  const key = cacheKey(table, costCenterId);
+  const key = cacheKey(table, costCenterId, matchBy);
   const cached = configCache.get(key);
   if (cached && Date.now() - cached.ts < CONFIG_CACHE_TTL) {
     return matchFor(cached.data, matchBy);
@@ -37,9 +37,7 @@ async function resolveConfig(table, costCenterId, matchBy = {}) {
 
   let rows = [];
   try {
-    const queryText = !params.length
-      ? `SELECT * FROM ${table} WHERE is_active = true ORDER BY cost_center_id IS NOT NULL`
-      : `SELECT * FROM ${table} WHERE is_active = true AND cost_center_id IS NOT NULL ${whereClause}`;
+    const queryText = `SELECT * FROM ${table} WHERE is_active = true ${whereClause}`;
     const result = await query(queryText, params);
     rows = result.rows;
   } catch (err) {
@@ -47,30 +45,27 @@ async function resolveConfig(table, costCenterId, matchBy = {}) {
     return null;
   }
 
-  const costCenterKey = cacheKey(table, costCenterId);
+  const costCenterKey = cacheKey(table, costCenterId, matchBy);
 
-  // Build cache map for this key
-  const cacheData = [];
-  let resolvedRow = null;
+  // Rows ordered CC-specific first, then global, so cached/find precedence is correct
+  const cacheData = [...rows].sort(
+    (a, b) => (a.cost_center_id === null ? 1 : 0) - (b.cost_center_id === null ? 1 : 0)
+  );
 
   if (costCenterId != null) {
-    // Try CC-specific first
-    resolvedRow = rows.find(r => r.cost_center_id === costCenterId && matches(r, matchBy));
-    if (!resolvedRow) {
-      const globalRow = await query(
-        `SELECT * FROM ${table} WHERE is_active = true AND cost_center_id IS NULL ${whereClause}`,
-        params
-      );
-      resolvedRow = globalRow.rows[0] || null;
-    }
-    cacheData.push(...rows);
+    // Try CC-specific first, fall back to the global row
+    const resolvedRow =
+      rows.find((r) => r.cost_center_id === costCenterId && matches(r, matchBy)) ||
+      rows.find((r) => r.cost_center_id === null && matches(r, matchBy)) ||
+      null;
     configCache.set(costCenterKey, { data: cacheData, ts: Date.now() });
     return resolvedRow;
   }
 
-  // Global context: no cost_center_id provided, just return global row
-  resolvedRow = rows.find(r => r.cost_center_id === null && matches(r, matchBy));
-  configCache.set(costCenterKey, { data: rows, ts: Date.now() });
+  // Global context: no cost_center_id provided, only global rows apply
+  const resolvedRow =
+    rows.find((r) => r.cost_center_id === null && matches(r, matchBy)) || null;
+  configCache.set(costCenterKey, { data: cacheData.filter((r) => r.cost_center_id === null), ts: Date.now() });
   return resolvedRow;
 }
 
