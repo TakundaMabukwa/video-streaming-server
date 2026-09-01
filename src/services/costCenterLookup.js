@@ -91,9 +91,11 @@ async function resolveFleetNumber({ deviceId, vehicleRegistration, fleetNumber }
       [dev]
     );
     if (g.rows.length > 0) {
-      value = g.rows[0].fleet_number
-        || fleetFromRegistration(g.rows[0].license_plate)
-        || fleetFromRegistration(g.rows[0].name);
+      // geotab_devices.fleet_number sometimes holds the device serial rather than a
+      // fleet code - only accept values that actually look like a fleet number.
+      value = g.rows[0].fleet_number && looksLikeFleetCode(g.rows[0].fleet_number)
+        ? g.rows[0].fleet_number
+        : (fleetFromRegistration(g.rows[0].license_plate) || fleetFromRegistration(g.rows[0].name));
     }
 
     if (!value) {
