@@ -235,6 +235,18 @@ async function getDiagnostic(id) {
 async function upsertFleetVehicles(vehicles) {
   if (!vehicles || vehicles.length === 0) return;
 
+  // Resolve cost center names/codes to ids
+  let ccMap = new Map();
+  try {
+    const ccResult = await query('SELECT id, name, code FROM cost_centers');
+    for (const cc of ccResult.rows) {
+      if (cc.name) ccMap.set(String(cc.name).toLowerCase(), cc.id);
+      if (cc.code) ccMap.set(String(cc.code).toLowerCase(), cc.id);
+    }
+  } catch (err) {
+    console.error('[GEOTAB] Failed to resolve cost centers:', err.message);
+  }
+
   // Deduplicate by fleet_number + registration_number (keep last occurrence)
   const uniqueMap = new Map();
   for (const v of vehicles) {
@@ -247,8 +259,8 @@ async function upsertFleetVehicles(vehicles) {
   for (let i = 0; i < uniqueVehicles.length; i += batchSize) {
     const batch = uniqueVehicles.slice(i, i + batchSize);
     const values = batch.map((_, idx) => {
-      const base = idx * 6;
-      return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6})`;
+      const base = idx * 7;
+      return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7})`;
     }).join(', ');
 
     const params = batch.flatMap(v => [
@@ -257,16 +269,18 @@ async function upsertFleetVehicles(vehicles) {
       v.make || null,
       v.model || null,
       v.cost_center || null,
+      (v.cost_center && ccMap.get(String(v.cost_center).toLowerCase())) || v.cost_center_id || null,
       new Date(),
     ]);
 
     await query(
-      `INSERT INTO fleet_vehicles (fleet_number, registration_number, make, model, cost_center, last_synced)
+      `INSERT INTO fleet_vehicles (fleet_number, registration_number, make, model, cost_center, cost_center_id, last_synced)
        VALUES ${values}
        ON CONFLICT (fleet_number, registration_number) DO UPDATE SET
          make = EXCLUDED.make,
          model = EXCLUDED.model,
          cost_center = EXCLUDED.cost_center,
+         cost_center_id = EXCLUDED.cost_center_id,
          last_synced = EXCLUDED.last_synced,
          updated_at = NOW()`,
       params

@@ -6,7 +6,21 @@ const router = express.Router();
 // GET /api/rtms/rules - Get all RTMS rules
 router.get('/rules', async (req, res) => {
   try {
-    const result = await query('SELECT * FROM rtms_rules ORDER BY module, rule_name');
+    const { cost_center_id } = req.query;
+    let result;
+    if (cost_center_id) {
+      const ccId = Number(cost_center_id);
+      result = await query(
+        `SELECT * FROM rtms_rules
+         WHERE cost_center_id IS NULL OR cost_center_id = $1
+         ORDER BY cost_center_id IS NOT NULL, module, rule_name`,
+        [ccId]
+      );
+    } else {
+      result = await query(
+        'SELECT * FROM rtms_rules WHERE cost_center_id IS NULL ORDER BY module, rule_name'
+      );
+    }
     res.json({ success: true, rules: result.rows });
   } catch (err) {
     console.error('[RTMS] Get rules error:', err.message);
@@ -17,19 +31,23 @@ router.get('/rules', async (req, res) => {
 // POST /api/rtms/rules - Create or bulk upsert rules
 router.post('/rules', async (req, res) => {
   try {
-    const { rules } = req.body;
+    const { rules, cost_center_id } = req.body;
 
     // Single rule creation with duplicate check
     if (!Array.isArray(rules) && req.body.rule_name) {
       const { module, rule_name, system_constraint, audit_focus, max_value, min_value, unit, enabled } = req.body;
-      const existing = await query('SELECT id FROM rtms_rules WHERE rule_name = $1', [rule_name]);
+      const ccId = cost_center_id || null;
+      const existing = await query(
+        'SELECT id FROM rtms_rules WHERE rule_name = $1 AND cost_center_id IS NOT DISTINCT FROM $2',
+        [rule_name, ccId]
+      );
       if (existing.rows.length > 0) {
-        return res.status(409).json({ success: false, message: `Rule "${rule_name}" already exists` });
+        return res.status(409).json({ success: false, message: `Rule "${rule_name}" already exists for this cost center` });
       }
       const result = await query(`
-        INSERT INTO rtms_rules (module, rule_name, system_constraint, audit_focus, max_value, min_value, unit, enabled)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *
-      `, [module, rule_name, system_constraint || '', audit_focus || '', max_value || 0, min_value || 0, unit || '', enabled !== false]);
+        INSERT INTO rtms_rules (module, rule_name, system_constraint, audit_focus, max_value, min_value, unit, enabled, cost_center_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *
+      `, [module, rule_name, system_constraint || '', audit_focus || '', max_value || 0, min_value || 0, unit || '', enabled !== false, ccId]);
       return res.json({ success: true, rule: result.rows[0] });
     }
 
@@ -43,10 +61,11 @@ router.post('/rules', async (req, res) => {
       await client.query('BEGIN');
 
       for (const rule of rules) {
+        const ccId = rule.cost_center_id || cost_center_id || null;
         await client.query(`
-          INSERT INTO rtms_rules (module, rule_name, system_constraint, audit_focus, max_value, min_value, unit, enabled)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-          ON CONFLICT (rule_name) DO UPDATE SET
+          INSERT INTO rtms_rules (module, rule_name, system_constraint, audit_focus, max_value, min_value, unit, enabled, cost_center_id)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+          ON CONFLICT (rule_name, cost_center_id) DO UPDATE SET
             module = EXCLUDED.module,
             system_constraint = EXCLUDED.system_constraint,
             audit_focus = EXCLUDED.audit_focus,
@@ -55,7 +74,7 @@ router.post('/rules', async (req, res) => {
             unit = EXCLUDED.unit,
             enabled = EXCLUDED.enabled,
             updated_at = NOW()
-        `, [rule.module, rule.rule_name, rule.system_constraint || '', rule.audit_focus || '', rule.max_value || 0, rule.min_value || 0, rule.unit || '', rule.enabled !== false]);
+        `, [rule.module, rule.rule_name, rule.system_constraint || '', rule.audit_focus || '', rule.max_value || 0, rule.min_value || 0, rule.unit || '', rule.enabled !== false, ccId]);
       }
 
       await client.query('COMMIT');
@@ -76,7 +95,7 @@ router.post('/rules', async (req, res) => {
 router.put('/rules/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { module, rule_name, system_constraint, audit_focus, max_value, min_value, unit, enabled } = req.body;
+    const { module, rule_name, system_constraint, audit_focus, max_value, min_value, unit, enabled, cost_center_id } = req.body;
 
     const result = await query(`
       UPDATE rtms_rules SET
@@ -88,9 +107,10 @@ router.put('/rules/:id', async (req, res) => {
         min_value = COALESCE($6, min_value),
         unit = COALESCE($7, unit),
         enabled = COALESCE($8, enabled),
+        cost_center_id = COALESCE($9, cost_center_id),
         updated_at = NOW()
-      WHERE id = $9 RETURNING *
-    `, [module, rule_name, system_constraint, audit_focus, max_value, min_value, unit, enabled, id]);
+      WHERE id = $10 RETURNING *
+    `, [module, rule_name, system_constraint, audit_focus, max_value, min_value, unit, enabled, cost_center_id, id]);
 
     if (result.rows.length === 0) {
       return res.status(404).json({ success: false, message: 'Rule not found' });
@@ -133,10 +153,13 @@ router.post('/engine-on', async (req, res) => {
       return res.json({ success: true, session_id: existing.rows[0].id, message: 'Session already active' });
     }
 
+    const { findVehicleCostCenterId } = require('../services/costCenterLookup');
+    const ccId = await findVehicleCostCenterId(fleet_number || device_id);
+
     const result = await query(`
-      INSERT INTO rtms_driving_sessions (device_id, fleet_number, registration_number, engine_on_at)
-      VALUES ($1, $2, $3, NOW()) RETURNING id
-    `, [device_id, fleet_number || null, registration_number || null]);
+      INSERT INTO rtms_driving_sessions (device_id, fleet_number, registration_number, engine_on_at, cost_center_id)
+      VALUES ($1, $2, $3, NOW(), $4) RETURNING id
+    `, [device_id, fleet_number || null, registration_number || null, ccId]);
 
     res.json({ success: true, session_id: result.rows[0].id });
   } catch (err) {
@@ -175,7 +198,12 @@ router.get('/sessions/active', async (req, res) => {
     const result = await query(`
       SELECT s.*, r.max_value as max_minutes
       FROM rtms_driving_sessions s
-      LEFT JOIN rtms_rules r ON r.rule_name = 'Driver Hours' AND r.enabled = true
+      LEFT JOIN rtms_rules r
+        ON r.rule_name = 'Driver Hours' AND r.enabled = true
+        AND (r.cost_center_id = s.cost_center_id OR (r.cost_center_id IS NULL AND s.cost_center_id IS NULL) OR (s.cost_center_id IS NOT NULL AND r.cost_center_id IS NULL AND NOT EXISTS (
+          SELECT 1 FROM rtms_rules r2
+          WHERE r2.rule_name = r.rule_name AND r2.enabled = true AND r2.cost_center_id = s.cost_center_id
+        )))
       WHERE s.engine_off_at IS NULL
       ORDER BY s.engine_on_at ASC
     `);

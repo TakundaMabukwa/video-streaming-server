@@ -214,6 +214,87 @@ const MIGRATIONS_SQL = `
   ALTER TABLE driver_config_criteria ADD COLUMN IF NOT EXISTS incidents_threshold INTEGER DEFAULT 1;
   CREATE INDEX IF NOT EXISTS idx_driver_config_criteria_nrc ON driver_config_criteria(nrc_deduction);
 
+  -- Phase 1: New deduction model columns
+  ALTER TABLE driver_config_criteria ADD COLUMN IF NOT EXISTS deduction_per_alert NUMERIC DEFAULT 10;
+  ALTER TABLE driver_config_criteria ADD COLUMN IF NOT EXISTS deduction_with_ncr NUMERIC DEFAULT 0;
+  ALTER TABLE driver_config_criteria ADD COLUMN IF NOT EXISTS ncr_threshold INTEGER DEFAULT 3;
+
+  -- Phase 3: Cost center config system
+  -- Local mirror of Supabase cost_centers table, synced at midnight
+  CREATE TABLE IF NOT EXISTS cost_centers (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    code TEXT DEFAULT '',
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  );
+  CREATE INDEX IF NOT EXISTS idx_cost_centers_name ON cost_centers(name);
+  CREATE INDEX IF NOT EXISTS idx_cost_centers_code ON cost_centers(code);
+
+  -- cost_center_id columns on config tables (NULL = global/default config)
+  ALTER TABLE alert_definitions ADD COLUMN IF NOT EXISTS cost_center_id INTEGER;
+  ALTER TABLE alert_group_configs ADD COLUMN IF NOT EXISTS cost_center_id INTEGER;
+  ALTER TABLE driver_config_criteria ADD COLUMN IF NOT EXISTS cost_center_id INTEGER;
+  ALTER TABLE rtms_rules ADD COLUMN IF NOT EXISTS cost_center_id INTEGER;
+  ALTER TABLE fleet_vehicles ADD COLUMN IF NOT EXISTS cost_center_id INTEGER;
+
+  CREATE INDEX IF NOT EXISTS idx_alert_definitions_cc ON alert_definitions(cost_center_id);
+  CREATE INDEX IF NOT EXISTS idx_alert_group_configs_cc ON alert_group_configs(cost_center_id);
+  CREATE INDEX IF NOT EXISTS idx_driver_config_criteria_cc ON driver_config_criteria(cost_center_id);
+  CREATE INDEX IF NOT EXISTS idx_rtms_rules_cc ON rtms_rules(cost_center_id);
+  CREATE INDEX IF NOT EXISTS idx_fleet_vehicles_cc ON fleet_vehicles(cost_center_id);
+
+  -- Track cost center per driver scoring / fleet vehicle
+  ALTER TABLE driver_scoring ADD COLUMN IF NOT EXISTS cost_center_id INTEGER;
+  CREATE INDEX IF NOT EXISTS idx_driver_scoring_cc ON driver_scoring(cost_center_id);
+
+  -- Replace rtms_rules single-column UNIQUE on rule_name with composite (rule_name, cost_center_id)
+  DO $$
+  BEGIN
+    IF EXISTS (
+      SELECT 1 FROM pg_constraint
+      WHERE conname = 'rtms_rules_rule_name_key'
+      AND conrelid = 'rtms_rules'::regclass
+    ) THEN
+      ALTER TABLE rtms_rules DROP CONSTRAINT rtms_rules_rule_name_key;
+    END IF;
+  END $$;
+  DO $$
+  BEGIN
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_constraint
+      WHERE conname = 'rtms_rules_cc_unique'
+      AND conrelid = 'rtms_rules'::regclass
+    ) THEN
+      ALTER TABLE rtms_rules ADD CONSTRAINT rtms_rules_cc_unique UNIQUE (rule_name, cost_center_id);
+    END IF;
+  END $$;
+
+  -- Replace the single-column UNIQUE on driver_config_criteria.name with a composite
+  -- (name, cost_center_id) so per-cost-center overrides are allowed.
+  DO $$
+  BEGIN
+    IF EXISTS (
+      SELECT 1 FROM pg_constraint
+      WHERE conname = 'driver_config_criteria_name_key'
+      AND conrelid = 'driver_config_criteria'::regclass
+    ) THEN
+      ALTER TABLE driver_config_criteria DROP CONSTRAINT driver_config_criteria_name_key;
+    END IF;
+  END $$;
+  DO $$
+  BEGIN
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_constraint
+      WHERE conname = 'driver_config_criteria_cc_unique'
+      AND conrelid = 'driver_config_criteria'::regclass
+    ) THEN
+      ALTER TABLE driver_config_criteria
+        ADD CONSTRAINT driver_config_criteria_cc_unique UNIQUE (name, cost_center_id);
+    END IF;
+  END $$;
+
   -- Driver scoring: per-vehicle/driver score tracking
   CREATE TABLE IF NOT EXISTS driver_scoring (
     id SERIAL PRIMARY KEY,
@@ -266,6 +347,8 @@ const MIGRATIONS_SQL = `
 
   CREATE INDEX IF NOT EXISTS idx_rtms_sessions_device ON rtms_driving_sessions(device_id);
   CREATE INDEX IF NOT EXISTS idx_rtms_sessions_active ON rtms_driving_sessions(engine_off_at) WHERE engine_off_at IS NULL;
+  ALTER TABLE rtms_driving_sessions ADD COLUMN IF NOT EXISTS cost_center_id INTEGER;
+  CREATE INDEX IF NOT EXISTS idx_rtms_sessions_cc ON rtms_driving_sessions(cost_center_id);
 
   -- Geotab devices
   CREATE TABLE IF NOT EXISTS geotab_devices (

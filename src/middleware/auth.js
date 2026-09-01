@@ -13,12 +13,35 @@ function getSupabaseAdmin() {
   return supabaseAdmin;
 }
 
+// Cache for user cost center IDs (per user, 5-min TTL)
+const userCostCenterCache = new Map();
+const CC_CACHE_TTL = 5 * 60 * 1000;
+
+async function getUserCostCenterIds(userId, supabase) {
+  const cached = userCostCenterCache.get(userId);
+  if (cached && Date.now() - cached.ts < CC_CACHE_TTL) return cached.ids;
+
+  try {
+    const { data } = await supabase
+      .from('user_cost_centers')
+      .select('cost_center_id')
+      .eq('user_id', userId);
+    const ids = (data || []).map(uc => uc.cost_center_id).filter(Boolean);
+    userCostCenterCache.set(userId, { ids, ts: Date.now() });
+    return ids;
+  } catch (err) {
+    console.error('[AUTH] Failed to fetch user cost centers:', err.message);
+    return cached ? cached.ids : [];
+  }
+}
+
 async function requireAuth(req, res, next) {
   // Allow internal API key from SRS server-to-server calls
   const internalKey = req.headers['x-internal-key'];
   if (internalKey && internalKey === SRS_INTERNAL_KEY) {
     req.user = { id: 'srs-internal', email: 'internal@srs.local' };
     req.userRole = 'admin';
+    req.userCostCenterIds = [];
     return next();
   }
 
@@ -60,6 +83,7 @@ async function requireAuth(req, res, next) {
 
     req.user = user;
     req.userRole = userRecord.role;
+    req.userCostCenterIds = await getUserCostCenterIds(user.id, supabase);
     next();
   } catch (err) {
     console.error('[AUTH] Error:', err.message);

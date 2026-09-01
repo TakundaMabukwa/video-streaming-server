@@ -7,17 +7,28 @@ function setBroadcast(fn) {
   broadcastFn = fn;
 }
 
+async function getDriverHoursMaxMinutes(costCenterId) {
+  const result = await query(
+    `SELECT max_value FROM rtms_rules
+     WHERE rule_name = 'Driver Hours' AND enabled = true
+     AND (cost_center_id = $1 OR cost_center_id IS NULL)
+     ORDER BY cost_center_id IS NOT NULL DESC
+     LIMIT 1`,
+    [costCenterId == null ? 0 : costCenterId]
+  );
+  if (result.rows.length === 0) return null;
+  return parseFloat(result.rows[0].max_value) || 240;
+}
+
 async function checkDrivingTimeViolations() {
   try {
-    // Get the Driver Hours rule
-    const ruleResult = await query(
-      "SELECT max_value FROM rtms_rules WHERE rule_name = 'Driver Hours' AND enabled = true LIMIT 1"
-    );
+    // Get the global default Driver Hours rule (fallback)
+    const defaultMax = await getDriverHoursMaxMinutes(null);
+    if (defaultMax == null) {
+      return; // no rule configured at all
+    }
 
-    if (ruleResult.rows.length === 0) return;
-    const maxMinutes = parseFloat(ruleResult.rows[0].max_value) || 240; // default 4 hours
-
-    // Find active sessions exceeding max time
+    // Find active sessions that are eligible (no alert sent yet)
     const sessions = await query(`
       SELECT s.*, 
         EXTRACT(EPOCH FROM (NOW() - s.engine_on_at)) / 60 as elapsed_minutes
@@ -26,9 +37,14 @@ async function checkDrivingTimeViolations() {
         AND s.alert_sent = false
         AND EXTRACT(EPOCH FROM (NOW() - s.engine_on_at)) / 60 >= $1
       ORDER BY s.engine_on_at ASC
-    `, [maxMinutes]);
+    `, [0]);
 
     for (const session of sessions.rows) {
+      // Resolve the max minutes for this session's cost center
+      const maxMinutes = await getDriverHoursMaxMinutes(session.cost_center_id) || defaultMax;
+      const elapsed = parseFloat(session.elapsed_minutes);
+      if (elapsed < maxMinutes) continue;
+
       // Mark alert as sent
       await query(
         'UPDATE rtms_driving_sessions SET alert_sent = true WHERE id = $1',
@@ -37,19 +53,19 @@ async function checkDrivingTimeViolations() {
 
       // Send websocket alert
       if (broadcastFn) {
-        const elapsed = Math.round(parseFloat(session.elapsed_minutes));
+        const elapsedRounded = Math.round(elapsed);
         broadcastFn({
           type: 'rtms_driving_time_alert',
           device_id: session.device_id,
           fleet_number: session.fleet_number,
           registration_number: session.registration_number,
-          message: `Driving time exceeded: ${elapsed} minutes (max: ${maxMinutes} min)`,
-          elapsed_minutes: elapsed,
+          message: `Driving time exceeded: ${elapsedRounded} minutes (max: ${maxMinutes} min)`,
+          elapsed_minutes: elapsedRounded,
           max_minutes: maxMinutes,
           engine_on_at: session.engine_on_at,
           timestamp: new Date().toISOString(),
         });
-        console.log(`[RTMS] Driving time alert sent for ${session.fleet_number || session.device_id}: ${elapsed}min`);
+        console.log(`[RTMS] Driving time alert sent for ${session.fleet_number || session.device_id}: ${elapsedRounded}min`);
       }
     }
   } catch (err) {

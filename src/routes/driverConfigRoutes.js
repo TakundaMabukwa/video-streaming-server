@@ -6,9 +6,22 @@ const router = express.Router();
 // Get all driver config criteria
 router.get('/criteria', async (req, res) => {
   try {
-    const result = await db.query(
-      'SELECT * FROM driver_config_criteria ORDER BY name ASC'
-    );
+    const { cost_center_id } = req.query;
+    let result;
+    if (cost_center_id) {
+      // Return both global defaults and cost-center-specific configs for this CC
+      const ccId = Number(cost_center_id);
+      result = await db.query(
+        `SELECT * FROM driver_config_criteria
+         WHERE cost_center_id IS NULL OR cost_center_id = $1
+         ORDER BY cost_center_id IS NOT NULL, name ASC`,
+        [ccId]
+      );
+    } else {
+      result = await db.query(
+        'SELECT * FROM driver_config_criteria WHERE cost_center_id IS NULL ORDER BY name ASC'
+      );
+    }
     res.json({ success: true, data: result.rows });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
@@ -35,21 +48,25 @@ router.get('/criteria/:id', async (req, res) => {
 // Create criterion
 router.post('/criteria', async (req, res) => {
   try {
-    const { name, selected_weighting, actual_weighting, risk_tiers, no_incidents, statuses, nrc_deduction, incidents_threshold } = req.body;
+    const { name, selected_weighting, actual_weighting, risk_tiers, no_incidents, statuses, nrc_deduction, incidents_threshold, deduction_per_alert, deduction_with_ncr, ncr_threshold, cost_center_id } = req.body;
     if (!name) return res.status(400).json({ success: false, message: 'Name is required' });
 
     const result = await db.query(
-      `INSERT INTO driver_config_criteria (name, selected_weighting, actual_weighting, risk_tiers, no_incidents, statuses, nrc_deduction, incidents_threshold)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+      `INSERT INTO driver_config_criteria (name, selected_weighting, actual_weighting, risk_tiers, no_incidents, statuses, nrc_deduction, incidents_threshold, deduction_per_alert, deduction_with_ncr, ncr_threshold, cost_center_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
       [
         name,
-        selected_weighting || 10,
-        actual_weighting || selected_weighting || 10,
+        selected_weighting || deduction_per_alert || 10,
+        actual_weighting || selected_weighting || deduction_per_alert || 10,
         risk_tiers || 4,
         no_incidents || 0,
         statuses || [],
         nrc_deduction || false,
         incidents_threshold || 1,
+        deduction_per_alert || selected_weighting || 10,
+        deduction_with_ncr || 0,
+        ncr_threshold || 3,
+        cost_center_id || null,
       ]
     );
     res.json({ success: true, data: result.rows[0] });
@@ -65,7 +82,7 @@ router.post('/criteria', async (req, res) => {
 router.put('/criteria/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, selected_weighting, actual_weighting, risk_tiers, no_incidents, statuses, is_active, nrc_deduction, incidents_threshold } = req.body;
+    const { name, selected_weighting, actual_weighting, risk_tiers, no_incidents, statuses, is_active, nrc_deduction, incidents_threshold, deduction_per_alert, deduction_with_ncr, ncr_threshold, cost_center_id } = req.body;
 
     const result = await db.query(
       `UPDATE driver_config_criteria
@@ -78,9 +95,13 @@ router.put('/criteria/:id', async (req, res) => {
            is_active = COALESCE($7, is_active),
            nrc_deduction = COALESCE($8, nrc_deduction),
            incidents_threshold = COALESCE($9, incidents_threshold),
+           deduction_per_alert = COALESCE($10, deduction_per_alert),
+           deduction_with_ncr = COALESCE($11, deduction_with_ncr),
+           ncr_threshold = COALESCE($12, ncr_threshold),
+           cost_center_id = $13,
            updated_at = NOW()
-       WHERE id = $10 RETURNING *`,
-      [name, selected_weighting, actual_weighting, risk_tiers, no_incidents, statuses, is_active, nrc_deduction, incidents_threshold, id]
+       WHERE id = $14 RETURNING *`,
+      [name, selected_weighting, actual_weighting, risk_tiers, no_incidents, statuses, is_active, nrc_deduction, incidents_threshold, deduction_per_alert, deduction_with_ncr, ncr_threshold, cost_center_id || null, id]
     );
 
     if (result.rows.length === 0) {

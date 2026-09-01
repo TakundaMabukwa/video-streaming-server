@@ -88,7 +88,7 @@ async function getAlertTypes(req, res) {
 async function getActiveAlerts(req, res) {
   try {
     const limit = parseInt(req.query.limit) || 2000;
-    const severityMap = await getVideoSeverityMap();
+    const severityMap = await getVideoSeverityMap(req.userCostCenterIds);
 
     // Read from alert_groups for grouped view
     const groups = await db.getActiveAlertGroupsWithMedia({ limit });
@@ -108,7 +108,7 @@ async function getActiveAlerts(req, res) {
 async function getResolvedAlerts(req, res) {
   try {
     const limit = parseInt(req.query.limit) || 2000;
-    const severityMap = await getVideoSeverityMap();
+    const severityMap = await getVideoSeverityMap(req.userCostCenterIds);
 
     const groups = await db.getResolvedAlertGroupsWithMedia({ limit });
 
@@ -123,7 +123,7 @@ async function getResolvedAlerts(req, res) {
 async function getActiveAlertsAll(req, res) {
   try {
     const limit = parseInt(req.query.limit) || 2000;
-    const severityMap = await getVideoSeverityMap();
+    const severityMap = await getVideoSeverityMap(req.userCostCenterIds);
 
     const groups = await db.getActiveAlertGroupsAll({ limit });
 
@@ -139,7 +139,7 @@ async function getAlertById(req, res) {
   try {
     const { id } = req.params;
     if (!id) return sendError(res, 'Alert ID required', 400);
-    const severityMap = await getVideoSeverityMap();
+    const severityMap = await getVideoSeverityMap(req.userCostCenterIds);
 
     // Try group lookup first, fall back to individual alert
     let alert = await db.getAlertGroupByAlertId(id);
@@ -276,7 +276,7 @@ async function getAlertMedia(req, res) {
     const { id } = req.params;
     const ensureMedia = req.query.ensureMedia === 'true';
     if (!id) return sendError(res, 'Alert ID required', 400);
-    const severityMap = await getVideoSeverityMap();
+    const severityMap = await getVideoSeverityMap(req.userCostCenterIds);
 
     // Try group lookup, fall back to individual alert
     let group = await db.getAlertGroupByAlertId(id);

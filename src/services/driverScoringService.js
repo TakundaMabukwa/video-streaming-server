@@ -1,5 +1,7 @@
 const { query, getClient } = require('../db');
 const { fetchVehiclesFromSupabase } = require('../helpers/supabaseClient');
+const { findVehicleCostCenterId } = require('./costCenterLookup');
+const { syncCostCenters } = require('./configResolver');
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -25,6 +27,14 @@ async function fetchVehiclesWithDrivers() {
     fetchDriversFromSupabase()
   ]);
 
+  // Resolve cost center names/codes to local cost_center ids
+  const ccResult = await query('SELECT id, name, code FROM cost_centers');
+  const ccMap = new Map();
+  for (const cc of ccResult.rows) {
+    if (cc.name) ccMap.set(String(cc.name).toLowerCase(), cc.id);
+    if (cc.code) ccMap.set(String(cc.code).toLowerCase(), cc.id);
+  }
+
   const driverMap = new Map();
   for (const d of drivers) {
     if (d.fleet_number) driverMap.set(d.fleet_number.toUpperCase(), `${d.first_name || ''} ${d.surname || ''}`.trim());
@@ -35,7 +45,8 @@ async function fetchVehiclesWithDrivers() {
     .map(v => ({
       fleet_number: v.fleet_number,
       registration_number: v.registration_number || '',
-      driver_name: driverMap.get(v.fleet_number.toUpperCase()) || null
+      driver_name: driverMap.get(v.fleet_number.toUpperCase()) || null,
+      cost_center_id: (v.cost_center && ccMap.get(String(v.cost_center).toLowerCase())) || null
     }));
 }
 
@@ -46,13 +57,19 @@ async function processAlertDeduction(fleet_number, alert_type) {
   try {
     await client.query('BEGIN');
 
-    // Find matching criteria where alert_type is in statuses (case-insensitive) and nrc_deduction = false
+    // Determine the vehicle's cost center (NULL = use global config)
+    const vehicleCostCenterId = await findVehicleCostCenterId(fleet_number);
+
+    // Find matching criteria — resolve CC-specific first, fall back to global
     const criteriaResult = await client.query(
-      `SELECT id, name, selected_weighting, incidents_threshold 
-       FROM driver_config_criteria 
-       WHERE is_active = true AND nrc_deduction = false 
-       AND EXISTS (SELECT 1 FROM unnest(statuses) s WHERE LOWER(s) = LOWER($1))`,
-      [alert_type]
+      `SELECT id, name, deduction_per_alert, deduction_with_ncr, ncr_threshold, cost_center_id
+       FROM driver_config_criteria
+       WHERE is_active = true
+       AND (cost_center_id = $2 OR (cost_center_id IS NULL))
+       AND EXISTS (SELECT 1 FROM unnest(statuses) s WHERE LOWER(s) = LOWER($1))
+       ORDER BY cost_center_id IS NOT NULL DESC
+       LIMIT 1`,
+      [alert_type, vehicleCostCenterId == null ? 0 : vehicleCostCenterId]
     );
 
     if (criteriaResult.rows.length === 0) {
@@ -62,7 +79,7 @@ async function processAlertDeduction(fleet_number, alert_type) {
 
     const criteria = criteriaResult.rows[0];
 
-    // Lock the row for update
+    // Lock the scoring row for update
     const scoringResult = await client.query(
       'SELECT id, score, alert_types FROM driver_scoring WHERE fleet_number = $1 FOR UPDATE',
       [fleet_number]
@@ -82,21 +99,53 @@ async function processAlertDeduction(fleet_number, alert_type) {
       alertTypes.push(alertEntry);
     }
 
+    // Increment count
     alertEntry.count += 1;
-    let deducted = false;
-    let newScore = scoring.score;
 
-    if (alertEntry.count >= criteria.incidents_threshold) {
-      const weighting = parseFloat(criteria.selected_weighting) || 0;
-      newScore = Math.max(newScore - weighting, 0);
-      alertEntry.count = 0;
-      deducted = true;
+    // Always deduct per-alert points
+    const perAlertDeduction = parseFloat(criteria.deduction_per_alert) || 0;
+    let newScore = Math.max(scoring.score - perAlertDeduction, 0);
+    let ncrCreated = false;
+
+    // Check if NCR threshold reached
+    const ncrThreshold = criteria.ncr_threshold || 3;
+    if (alertEntry.count >= ncrThreshold) {
+      // Create NCR alert in alerts table
+      try {
+        const ncrId = `ncr-${fleet_number}-${alert_type}-${Date.now()}`;
+        const now = new Date().toISOString();
+        await client.query(
+          `INSERT INTO alerts (id, device_id, alarm_type, alarm_ts, source_type, status, resolved, false_alert, notes, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, 'telematics', 'new', false, false, $5, $4, $4)
+           ON CONFLICT (id) DO NOTHING`,
+          [ncrId, fleet_number, `NCR: ${alert_type}`, now, `Auto-generated NCR after ${alertEntry.count} ${alert_type} alerts`]
+        );
+
+        // Create alert_group for the NCR
+        const groupKey = `${fleet_number}:NCR: ${alert_type}`;
+        await client.query(
+          `INSERT INTO alert_groups (group_key, device_id, alarm_type, count, last_alert_id, last_alert_ts, source_type, status, resolved, false_alert, created_at, updated_at)
+           VALUES ($1, $2, $3, 1, $4, $4, 'telematics', 'new', false, false, $4, $4)
+           ON CONFLICT (group_key) DO UPDATE SET
+             count = alert_groups.count + 1,
+             last_alert_id = EXCLUDED.last_alert_id,
+             last_alert_ts = EXCLUDED.last_alert_ts,
+             updated_at = NOW()`,
+          [groupKey, fleet_number, `NCR: ${alert_type}`, ncrId]
+        );
+
+        ncrCreated = true;
+        // Reset count after NCR
+        alertEntry.count = 0;
+      } catch (ncrErr) {
+        console.error('[DriverScoring] Failed to create NCR alert:', ncrErr.message);
+      }
     }
 
     // Update driver_scoring
     await client.query(
-      `UPDATE driver_scoring 
-       SET score = $1, alert_types = $2, updated_at = NOW() 
+      `UPDATE driver_scoring
+       SET score = $1, alert_types = $2, updated_at = NOW()
        WHERE fleet_number = $3`,
       [newScore, JSON.stringify(alertTypes), fleet_number]
     );
@@ -104,10 +153,12 @@ async function processAlertDeduction(fleet_number, alert_type) {
     await client.query('COMMIT');
 
     return {
-      deducted,
+      deducted: true,
       new_score: newScore,
       current_count: alertEntry.count,
-      weighting: deducted ? criteria.selected_weighting : 0
+      weighting: perAlertDeduction,
+      ncr_created: ncrCreated,
+      ncr_threshold: ncrThreshold,
     };
   } catch (err) {
     await client.query('ROLLBACK');
@@ -134,14 +185,15 @@ async function initializeDriverScoring() {
     let synced = 0;
     for (const v of vehicles) {
       const result = await client.query(`
-        INSERT INTO driver_scoring (fleet_number, registration_number, driver, score, alert_types)
-        VALUES ($1, $2, $3, 100, '[]'::jsonb)
+        INSERT INTO driver_scoring (fleet_number, registration_number, driver, score, alert_types, cost_center_id)
+        VALUES ($1, $2, $3, 100, '[]'::jsonb, $4)
         ON CONFLICT (fleet_number) DO UPDATE 
         SET registration_number = EXCLUDED.registration_number,
             driver = COALESCE(EXCLUDED.driver, driver_scoring.driver),
+            cost_center_id = COALESCE(EXCLUDED.cost_center_id, driver_scoring.cost_center_id),
             updated_at = NOW()
         RETURNING id
-      `, [v.fleet_number, v.registration_number, v.driver_name]);
+      `, [v.fleet_number, v.registration_number, v.driver_name, v.cost_center_id]);
 
       if (result.rows.length > 0) synced++;
     }
@@ -175,9 +227,9 @@ async function syncNewVehicles() {
     for (const v of vehicles) {
       if (existingSet.has(v.fleet_number)) continue;
       await client.query(`
-        INSERT INTO driver_scoring (fleet_number, registration_number, driver, score, alert_types)
-        VALUES ($1, $2, $3, 100, '[]'::jsonb)
-      `, [v.fleet_number, v.registration_number, v.driver_name]);
+        INSERT INTO driver_scoring (fleet_number, registration_number, driver, score, alert_types, cost_center_id)
+        VALUES ($1, $2, $3, 100, '[]'::jsonb, $4)
+      `, [v.fleet_number, v.registration_number, v.driver_name, v.cost_center_id]);
       synced++;
     }
 
@@ -204,10 +256,12 @@ function startMidnightCron() {
 
   // Set initial timeout
   setTimeout(() => {
+    syncCostCenters().catch(console.error);
     syncNewVehicles().catch(console.error);
     
     // Then run every 24 hours
     midnightInterval = setInterval(() => {
+      syncCostCenters().catch(console.error);
       syncNewVehicles().catch(console.error);
     }, 24 * 60 * 60 * 1000);
   }, msUntilMidnight);

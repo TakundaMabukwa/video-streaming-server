@@ -568,7 +568,9 @@ async function syncGeotabEvents() {
 
         // Also store as alert in alerts + alert_groups tables (telematics source)
         try {
-          const telematicsSeverityMap = await getTelematicsSeverityMap();
+          const { findVehicleCostCenterId } = require('./costCenterLookup');
+          const eventCC = await findVehicleCostCenterId(fleetNumber || geotabDeviceId);
+          const telematicsSeverityMap = await getTelematicsSeverityMap(eventCC ? [eventCC] : []);
           const eventLower = (eventName || '').toLowerCase();
           // Map event name to a signal_code for alert_definitions lookup
           let signalCode = 'exceptionEvent';
@@ -999,9 +1001,11 @@ async function fetchAndStoreVehicleStatus() {
         try {
           if (isEngineOn && !wasEngineOn) {
             const { query: rtmsQuery } = require('../db');
+            const { findVehicleCostCenterId } = require('./costCenterLookup');
+            const sessionCC = await findVehicleCostCenterId(fleetNumber || record.id);
             await rtmsQuery(
-              'INSERT INTO rtms_driving_sessions (device_id, fleet_number, registration_number, engine_on_at) VALUES ($1, $2, $3, NOW())',
-              [record.id, fleetNumber, licensePlate]
+              'INSERT INTO rtms_driving_sessions (device_id, fleet_number, registration_number, engine_on_at, cost_center_id) VALUES ($1, $2, $3, NOW(), $4)',
+              [record.id, fleetNumber, licensePlate, sessionCC]
             );
           } else if (!isEngineOn && wasEngineOn) {
             const { query: rtmsQuery } = require('../db');

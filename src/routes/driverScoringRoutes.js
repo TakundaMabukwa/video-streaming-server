@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { query, getClient } = require('../db');
+const { findVehicleCostCenterId } = require('../services/costCenterLookup');
 
 // GET /api/driver-scoring - Get all driver scores
 router.get('/', async (req, res) => {
@@ -24,13 +25,20 @@ router.get('/lookup', async (req, res) => {
       return res.status(400).json({ success: false, message: 'fleet_number and alert_type required' });
     }
 
-    // Find criteria where alert_type is in statuses (case-insensitive) and nrc_deduction = false
+    // Determine the vehicle's cost center (NULL = use global config)
+    const vehicleCostCenterId = await findVehicleCostCenterId(fleet_number);
+
+    // Find criteria where alert_type is in statuses (case-insensitive),
+    // preferring cost-center-specific over global
     const criteriaResult = await query(
-      `SELECT id, name, selected_weighting, incidents_threshold, nrc_deduction 
-       FROM driver_config_criteria 
-       WHERE is_active = true AND nrc_deduction = false 
-       AND EXISTS (SELECT 1 FROM unnest(statuses) s WHERE LOWER(s) = LOWER($1))`,
-      [alert_type]
+      `SELECT id, name, deduction_per_alert, deduction_with_ncr, ncr_threshold, incidents_threshold, cost_center_id
+       FROM driver_config_criteria
+       WHERE is_active = true
+       AND (cost_center_id = $2 OR (cost_center_id IS NULL))
+       AND EXISTS (SELECT 1 FROM unnest(statuses) s WHERE LOWER(s) = LOWER($1))
+       ORDER BY cost_center_id IS NOT NULL DESC
+       LIMIT 1`,
+      [alert_type, vehicleCostCenterId == null ? 0 : vehicleCostCenterId]
     );
 
     if (criteriaResult.rows.length === 0) {
@@ -58,8 +66,10 @@ router.get('/lookup', async (req, res) => {
       success: true,
       eligible: true,
       criteria_id: criteria.id,
-      weighting: criteria.selected_weighting,
-      incidents_threshold: criteria.incidents_threshold,
+      deduction_per_alert: parseFloat(criteria.deduction_per_alert) || 0,
+      deduction_with_ncr: parseFloat(criteria.deduction_with_ncr) || 0,
+      ncr_threshold: criteria.ncr_threshold || 3,
+      incidents_threshold: criteria.incidents_threshold || 1,
       current_count: currentCount,
       score: scoring.score
     });
@@ -77,9 +87,9 @@ router.post('/deduct', async (req, res) => {
       return res.status(400).json({ success: false, message: 'fleet_number and criteria_id required' });
     }
 
-    // Get criteria weighting
+    // Get criteria NCR deduction amount
     const criteriaResult = await query(
-      'SELECT selected_weighting FROM driver_config_criteria WHERE id = $1',
+      'SELECT deduction_with_ncr FROM driver_config_criteria WHERE id = $1',
       [criteria_id]
     );
 
@@ -87,13 +97,13 @@ router.post('/deduct', async (req, res) => {
       return res.status(404).json({ success: false, message: 'Criteria not found' });
     }
 
-    const weighting = parseFloat(criteriaResult.rows[0].selected_weighting) || 0;
+    const weighting = parseFloat(criteriaResult.rows[0].deduction_with_ncr) || 0;
 
     // Deduct from score
     const result = await query(
-      `UPDATE driver_scoring 
-       SET score = GREATEST(score - $1, 0), updated_at = NOW() 
-       WHERE fleet_number = $2 
+      `UPDATE driver_scoring
+       SET score = GREATEST(score - $1, 0), updated_at = NOW()
+       WHERE fleet_number = $2
        RETURNING score`,
       [weighting, fleet_number]
     );
@@ -109,7 +119,7 @@ router.post('/deduct', async (req, res) => {
   }
 });
 
-// POST /api/driver-scoring/increment - Increment alert count and deduct if threshold reached
+// POST /api/driver-scoring/increment - Increment alert count and deduct per-alert points
 router.post('/increment', async (req, res) => {
   try {
     const { fleet_number, alert_type } = req.body;
@@ -121,13 +131,17 @@ router.post('/increment', async (req, res) => {
     try {
       await client.query('BEGIN');
 
-      // Find matching criteria
+      // Find matching criteria (cost-center-aware)
+      const vehicleCostCenterId = await findVehicleCostCenterId(fleet_number);
       const criteriaResult = await client.query(
-        `SELECT id, name, selected_weighting, incidents_threshold 
-         FROM driver_config_criteria 
-         WHERE is_active = true AND nrc_deduction = false 
-         AND $1 = ANY(statuses)`,
-        [alert_type]
+        `SELECT id, name, deduction_per_alert, deduction_with_ncr, ncr_threshold, cost_center_id
+         FROM driver_config_criteria
+         WHERE is_active = true
+         AND (cost_center_id = $2 OR (cost_center_id IS NULL))
+         AND EXISTS (SELECT 1 FROM unnest(statuses) s WHERE LOWER(s) = LOWER($1))
+         ORDER BY cost_center_id IS NOT NULL DESC
+         LIMIT 1`,
+        [alert_type, vehicleCostCenterId == null ? 0 : vehicleCostCenterId]
       );
 
       if (criteriaResult.rows.length === 0) {
@@ -157,21 +171,53 @@ router.post('/increment', async (req, res) => {
         alertTypes.push(alertEntry);
       }
 
+      // Increment count
       alertEntry.count += 1;
-      let deducted = false;
-      let newScore = scoring.score;
 
-      if (alertEntry.count >= criteria.incidents_threshold) {
-        const weighting = parseFloat(criteria.selected_weighting) || 0;
-        newScore = Math.max(newScore - weighting, 0);
-        alertEntry.count = 0;
-        deducted = true;
+      // Always deduct per-alert points
+      const perAlertDeduction = parseFloat(criteria.deduction_per_alert) || 0;
+      let newScore = Math.max(scoring.score - perAlertDeduction, 0);
+      let ncrCreated = false;
+
+      // Check if NCR threshold reached
+      const ncrThreshold = criteria.ncr_threshold || 3;
+      if (alertEntry.count >= ncrThreshold) {
+        // Create NCR alert in alerts table
+        try {
+          const ncrId = `ncr-${fleet_number}-${alert_type}-${Date.now()}`;
+          const now = new Date().toISOString();
+          await client.query(
+            `INSERT INTO alerts (id, device_id, alarm_type, alarm_ts, source_type, status, resolved, false_alert, notes, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, 'telematics', 'new', false, false, $5, $4, $4)
+             ON CONFLICT (id) DO NOTHING`,
+            [ncrId, fleet_number, `NCR: ${alert_type}`, now, `Auto-generated NCR after ${alertEntry.count} ${alert_type} alerts`]
+          );
+
+          // Create alert_group for the NCR
+          const groupKey = `${fleet_number}:NCR: ${alert_type}`;
+          await client.query(
+            `INSERT INTO alert_groups (group_key, device_id, alarm_type, count, last_alert_id, last_alert_ts, source_type, status, resolved, false_alert, created_at, updated_at)
+             VALUES ($1, $2, $3, 1, $4, $4, 'telematics', 'new', false, false, $4, $4)
+             ON CONFLICT (group_key) DO UPDATE SET
+               count = alert_groups.count + 1,
+               last_alert_id = EXCLUDED.last_alert_id,
+               last_alert_ts = EXCLUDED.last_alert_ts,
+               updated_at = NOW()`,
+            [groupKey, fleet_number, `NCR: ${alert_type}`, ncrId]
+          );
+
+          ncrCreated = true;
+          // Reset count after NCR
+          alertEntry.count = 0;
+        } catch (ncrErr) {
+          console.error('[DriverScoring] Failed to create NCR alert:', ncrErr.message);
+        }
       }
 
       // Update driver_scoring
       await client.query(
-        `UPDATE driver_scoring 
-         SET score = $1, alert_types = $2, updated_at = NOW() 
+        `UPDATE driver_scoring
+         SET score = $1, alert_types = $2, updated_at = NOW()
          WHERE fleet_number = $3`,
         [newScore, JSON.stringify(alertTypes), fleet_number]
       );
@@ -180,10 +226,12 @@ router.post('/increment', async (req, res) => {
 
       res.json({
         success: true,
-        deducted,
+        deducted: true,
         new_score: newScore,
         current_count: alertEntry.count,
-        weighting: deducted ? criteria.selected_weighting : 0
+        weighting: perAlertDeduction,
+        ncr_created: ncrCreated,
+        ncr_threshold: ncrThreshold,
       });
     } catch (err) {
       await client.query('ROLLBACK');

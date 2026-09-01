@@ -6,14 +6,24 @@ const { invalidateCache } = require('../db/alert_definitions');
 
 async function listAlertDefinitions(req, res) {
   try {
-    const { category } = req.query;
-    let sql = 'SELECT * FROM alert_definitions';
-    const params = [];
+    const { category, cost_center_id } = req.query;
+    let params = [];
+    const conds = [];
+
     if (category) {
-      sql += ' WHERE category = $1';
+      conds.push(`category = $${params.length + 1}`);
       params.push(category);
     }
+    if (cost_center_id) {
+      const ccId = Number(cost_center_id);
+      conds.push(`(cost_center_id IS NULL OR cost_center_id = $${params.length + 1})`);
+      params.push(ccId);
+    }
+
+    let sql = 'SELECT * FROM alert_definitions';
+    if (conds.length) sql += ' WHERE ' + conds.join(' AND ');
     sql += ' ORDER BY category, name';
+
     const result = await db.query(sql, params);
     sendSuccess(res, result.rows, 'Alert definitions retrieved');
   } catch (error) {
@@ -23,14 +33,14 @@ async function listAlertDefinitions(req, res) {
 
 async function createAlertDefinition(req, res) {
   try {
-    const { name, category, description = '', signal_code = '' } = req.body;
+    const { name, category, description = '', signal_code = '', cost_center_id = null, severity = 'MEDIUM' } = req.body;
     if (!name || !category) return sendError(res, 'name and category required', 400);
     if (!['telematics', 'video'].includes(category)) return sendError(res, 'category must be telematics or video', 400);
 
     const result = await db.query(
-      `INSERT INTO alert_definitions (name, category, description, signal_code)
-       VALUES ($1, $2, $3, $4) RETURNING *`,
-      [name.trim(), category, description, signal_code]
+      `INSERT INTO alert_definitions (name, category, description, signal_code, cost_center_id, severity)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [name.trim(), category, description, signal_code, cost_center_id, String(severity).toUpperCase()]
     );
     sendSuccess(res, result.rows[0], 'Alert definition created');
     if (category === 'video') invalidateCache();
@@ -42,7 +52,7 @@ async function createAlertDefinition(req, res) {
 async function updateAlertDefinition(req, res) {
   try {
     const { id } = req.params;
-    const { name, category, description, signal_code, is_active, severity } = req.body;
+    const { name, category, description, signal_code, is_active, severity, cost_center_id } = req.body;
     const fields = [];
     const values = [];
     let idx = 1;
@@ -56,6 +66,7 @@ async function updateAlertDefinition(req, res) {
     if (signal_code !== undefined) { fields.push(`signal_code = $${idx++}`); values.push(signal_code); }
     if (severity !== undefined) { fields.push(`severity = $${idx++}`); values.push(String(severity).toUpperCase()); }
     if (is_active !== undefined) { fields.push(`is_active = $${idx++}`); values.push(is_active); }
+    if (cost_center_id !== undefined) { fields.push(`cost_center_id = $${idx++}`); values.push(cost_center_id); }
     fields.push(`updated_at = NOW()`);
 
     if (fields.length === 1) return sendError(res, 'No fields to update', 400);
@@ -87,7 +98,21 @@ async function deleteAlertDefinition(req, res) {
 
 async function listAlertGroupConfigs(req, res) {
   try {
-    const groups = await db.query('SELECT * FROM alert_group_configs ORDER BY severity, name');
+    const { cost_center_id } = req.query;
+    let groups;
+    if (cost_center_id) {
+      const ccId = Number(cost_center_id);
+      groups = await db.query(
+        `SELECT * FROM alert_group_configs
+         WHERE cost_center_id IS NULL OR cost_center_id = $1
+         ORDER BY cost_center_id IS NOT NULL, severity, name`,
+        [ccId]
+      );
+    } else {
+      groups = await db.query(
+        'SELECT * FROM alert_group_configs WHERE cost_center_id IS NULL ORDER BY severity, name'
+      );
+    }
 
     // Fetch members for each group
     const members = await db.query(`
@@ -118,15 +143,15 @@ const VALID_SEVERITY = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'];
 
 async function createAlertGroupConfig(req, res) {
   try {
-    const { name, severity, description = '', member_ids = [] } = req.body;
+    const { name, severity, description = '', member_ids = [], cost_center_id = null } = req.body;
     if (!name) return sendError(res, 'name required', 400);
     const sev = (severity || 'MEDIUM').toUpperCase();
     if (!VALID_SEVERITY.includes(sev)) return sendError(res, 'severity must be CRITICAL, HIGH, MEDIUM, or LOW', 400);
 
     const groupResult = await db.query(
-      `INSERT INTO alert_group_configs (name, severity, description)
-       VALUES ($1, $2, $3) RETURNING *`,
-      [name.trim(), sev, description]
+      `INSERT INTO alert_group_configs (name, severity, description, cost_center_id)
+       VALUES ($1, $2, $3, $4) RETURNING *`,
+      [name.trim(), sev, description, cost_center_id]
     );
     const group = groupResult.rows[0];
 
@@ -154,7 +179,7 @@ async function createAlertGroupConfig(req, res) {
 async function updateAlertGroupConfig(req, res) {
   try {
     const { id } = req.params;
-    const { name, severity, description, is_active, member_ids } = req.body;
+    const { name, severity, description, is_active, member_ids, cost_center_id } = req.body;
     const fields = [];
     const values = [];
     let idx = 1;
@@ -167,6 +192,7 @@ async function updateAlertGroupConfig(req, res) {
     }
     if (description !== undefined) { fields.push(`description = $${idx++}`); values.push(description); }
     if (is_active !== undefined) { fields.push(`is_active = $${idx++}`); values.push(is_active); }
+    if (cost_center_id !== undefined) { fields.push(`cost_center_id = $${idx++}`); values.push(cost_center_id); }
     fields.push(`updated_at = NOW()`);
 
     if (fields.length > 1) {
