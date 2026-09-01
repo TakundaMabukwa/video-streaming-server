@@ -100,26 +100,24 @@ async function resolveFleetNumber({ deviceId, vehicleRegistration, fleetNumber }
 
     if (!value) {
       const vs = await query(
-        `SELECT fleet_number, plate, registration_number FROM vehicle_status WHERE device_id = $1 LIMIT 1`,
+        `SELECT fleet_number, plate FROM vehicle_status WHERE device_id = $1 LIMIT 1`,
         [dev]
       );
       if (vs.rows.length > 0) {
         value = vs.rows[0].fleet_number
-          || fleetFromRegistration(vs.rows[0].plate)
-          || fleetFromRegistration(vs.rows[0].registration_number);
+          || fleetFromRegistration(vs.rows[0].plate);
       }
     }
 
     if (!value) {
       const te = await query(
-        `SELECT fleet_number, plate, registration_number, license_plate FROM telematics_events
+        `SELECT fleet_number, plate, license_plate FROM telematics_events
          WHERE device_id = $1 ORDER BY event_time DESC NULLS LAST LIMIT 1`,
         [dev]
       );
       if (te.rows.length > 0) {
         value = te.rows[0].fleet_number
           || fleetFromRegistration(te.rows[0].plate)
-          || fleetFromRegistration(te.rows[0].registration_number)
           || fleetFromRegistration(te.rows[0].license_plate);
       }
     }
