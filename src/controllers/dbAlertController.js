@@ -405,6 +405,45 @@ async function getAlertMedia(req, res) {
 
 // transformDbAlert and getAlertCoordinates moved to helpers/transform.js
 
+async function getAlertHistory(req, res) {
+  try {
+    const days = Math.min(Math.max(parseInt(req.query.days) || 30, 1), 365);
+    const limit = Math.min(Math.max(parseInt(req.query.limit) || 200, 1), 2000);
+    const deviceId = String(req.query.device_id || req.query.vehicleId || '').trim();
+
+    const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+    const params = [cutoff];
+    let where = 'alarm_ts >= $1';
+    if (deviceId) {
+      params.push(deviceId);
+      where += ` AND device_id = $${params.length}`;
+    }
+    params.push(limit);
+
+    const result = await db.query(
+      `SELECT id, device_id, alarm_type, alarm_ts, source_type, status, resolved, false_alert, notes, created_at, updated_at
+       FROM alerts
+       WHERE ${where}
+       ORDER BY alarm_ts DESC
+       LIMIT $${params.length}`,
+      params
+    );
+
+    res.json({
+      success: true,
+      alerts: result.rows,
+      history: result.rows,
+      data: result.rows,
+      count: result.rows.length,
+      days,
+      device_id: deviceId || null,
+    });
+  } catch (error) {
+    console.error('[Alerts] History error:', error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+}
+
 async function acknowledgeAlert(req, res) {
   res.json({ success: true, alertId: req.params.id, action: 'acknowledge', message: 'EPS read-only: acknowledged locally' });
 }
@@ -791,6 +830,7 @@ module.exports = {
   getAlertById,
   getAlertScreenshots,
   getAlertMedia,
+  getAlertHistory,
   acknowledgeAlert,
   resolveAlert,
   resolveAlertsBulk,
