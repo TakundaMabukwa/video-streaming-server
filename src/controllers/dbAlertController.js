@@ -495,6 +495,7 @@ async function resolveAlert(req, res) {
 
     // Capture / update the incident register row for NCR closures
     const isNcr = String(alert.alarm_type || '').startsWith('NCR:')
+      || closureType === 'ncr'
       || !!(incidentData.infringement || ncr_classification || close_reason || action_taken);
 
     let incident = null;
