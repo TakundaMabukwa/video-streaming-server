@@ -56,16 +56,25 @@ function looksLikeFleetCode(value) {
   return false;
 }
 
+// Extract the fleet prefix from registration/plate strings like "PB29 - JHD716FS".
+function fleetFromRegistration(value) {
+  const s = String(value || '').trim();
+  if (!s) return null;
+  const parts = s.split(' - ').map((p) => p.trim()).filter(Boolean);
+  const first = parts[0];
+  if (first && looksLikeFleetCode(first.split(/\s+/)[0])) return first.split(/\s+/)[0];
+  if (looksLikeFleetCode(first)) return first;
+  return null;
+}
+
 // Build the human vehicle fleet number for an alert. EPS/Geotab alerts carry raw
 // device codes (e.g. '221085903184'); map them to the fleet number we display
 // (e.g. 'EX41') using the local Geotab/telematics indexes.
 async function resolveFleetNumber({ deviceId, vehicleRegistration, fleetNumber } = {}) {
   if (fleetNumber && looksLikeFleetCode(fleetNumber)) return String(fleetNumber).trim();
 
-  const reg = String(vehicleRegistration || '').trim();
-  const regParts = reg.split(' - ').map((p) => p.trim()).filter(Boolean);
-  const regFirst = regParts[0];
-  if (regFirst && looksLikeFleetCode(regFirst)) return regFirst;
+  const regFleet = fleetFromRegistration(vehicleRegistration);
+  if (regFleet) return regFleet;
 
   const dev = String(deviceId || '').trim();
   if (!dev) return null;
@@ -77,25 +86,43 @@ async function resolveFleetNumber({ deviceId, vehicleRegistration, fleetNumber }
   let value = null;
   try {
     const g = await query(
-      'SELECT fleet_number FROM geotab_devices WHERE id = $1 OR serial_number = $1 LIMIT 1',
+      `SELECT fleet_number, license_plate, name FROM geotab_devices
+       WHERE id = $1 OR serial_number = $1 OR fleet_number = $1 LIMIT 1`,
       [dev]
     );
-    if (g.rows.length > 0 && g.rows[0].fleet_number) value = g.rows[0].fleet_number;
+    if (g.rows.length > 0) {
+      value = g.rows[0].fleet_number
+        || fleetFromRegistration(g.rows[0].license_plate)
+        || fleetFromRegistration(g.rows[0].name);
+    }
 
     if (!value) {
-      const vs = await query('SELECT fleet_number FROM vehicle_status WHERE device_id = $1 LIMIT 1', [dev]);
-      if (vs.rows.length > 0 && vs.rows[0].fleet_number) value = vs.rows[0].fleet_number;
+      const vs = await query(
+        `SELECT fleet_number, plate, registration_number FROM vehicle_status WHERE device_id = $1 LIMIT 1`,
+        [dev]
+      );
+      if (vs.rows.length > 0) {
+        value = vs.rows[0].fleet_number
+          || fleetFromRegistration(vs.rows[0].plate)
+          || fleetFromRegistration(vs.rows[0].registration_number);
+      }
     }
 
     if (!value) {
       const te = await query(
-        `SELECT fleet_number FROM telematics_events
-         WHERE device_id = $1 AND fleet_number IS NOT NULL
-         ORDER BY event_time DESC NULLS LAST LIMIT 1`,
+        `SELECT fleet_number, plate, registration_number, license_plate FROM telematics_events
+         WHERE device_id = $1 ORDER BY event_time DESC NULLS LAST LIMIT 1`,
         [dev]
       );
-      if (te.rows.length > 0) value = te.rows[0].fleet_number;
+      if (te.rows.length > 0) {
+        value = te.rows[0].fleet_number
+          || fleetFromRegistration(te.rows[0].plate)
+          || fleetFromRegistration(te.rows[0].registration_number)
+          || fleetFromRegistration(te.rows[0].license_plate);
+      }
     }
+
+    if (!value && looksLikeFleetCode(dev)) value = dev;
   } catch (err) {
     console.error('[costCenterLookup] resolveFleetNumber error:', err.message);
     value = null;
