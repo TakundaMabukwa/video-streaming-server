@@ -3,6 +3,32 @@ const db = require('../db');
 
 const router = express.Router();
 
+// Get global-only criteria (cost_center_id IS NULL)
+router.get('/criteria/global', async (req, res) => {
+  try {
+    const result = await db.query(
+      'SELECT * FROM driver_config_criteria WHERE cost_center_id IS NULL ORDER BY name ASC'
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// Get criteria for a specific cost center (CC-specific only, no globals)
+router.get('/criteria/for-cc/:costCenterId', async (req, res) => {
+  try {
+    const { costCenterId } = req.params;
+    const result = await db.query(
+      'SELECT * FROM driver_config_criteria WHERE cost_center_id = $1 ORDER BY name ASC',
+      [Number(costCenterId)]
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // Get all driver config criteria
 router.get('/criteria', async (req, res) => {
   try {
