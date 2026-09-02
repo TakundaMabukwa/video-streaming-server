@@ -41,6 +41,15 @@ async function batchResolveDeviceCC(alertGroups) {
     }
   }
 
+  const resolved = [...deviceCC.values()].filter(Boolean).length;
+  if (resolved > 0) {
+    console.log(`[batchResolve] ${resolved}/${deviceIds.length} devices resolved to CCs`);
+  } else if (deviceIds.length > 0) {
+    console.log(`[batchResolve] WARNING: 0/${deviceIds.length} devices resolved to CCs`);
+    const sample = results.slice(0, 3).map(r => r.status === 'fulfilled' ? r.value : r.reason?.message);
+    console.log(`[batchResolve] Sample:`, JSON.stringify(sample));
+  }
+
   return { fleetMap, deviceCC };
 }
 
@@ -131,7 +140,7 @@ async function getActiveAlerts(req, res) {
 
     const { deviceCC } = await batchResolveDeviceCC(groups);
     const ccIds = [...new Set([...deviceCC.values()])];
-    const perCCMaps = await getPerCCSeverityMaps(ccIds, 'video');
+    const perCCMaps = await getPerCCSeverityMaps(ccIds);
 
     const alerts = groups.map((g) => {
       const ccId = deviceCC.get(g.device_id);
@@ -154,7 +163,7 @@ async function getResolvedAlerts(req, res) {
 
     const { deviceCC } = await batchResolveDeviceCC(groups);
     const ccIds = [...new Set([...deviceCC.values()])];
-    const perCCMaps = await getPerCCSeverityMaps(ccIds, 'video');
+    const perCCMaps = await getPerCCSeverityMaps(ccIds);
 
     const alerts = groups.map((g) => {
       const ccId = deviceCC.get(g.device_id);
@@ -175,7 +184,7 @@ async function getActiveAlertsAll(req, res) {
 
     const { deviceCC } = await batchResolveDeviceCC(groups);
     const ccIds = [...new Set([...deviceCC.values()])];
-    const perCCMaps = await getPerCCSeverityMaps(ccIds, 'video');
+    const perCCMaps = await getPerCCSeverityMaps(ccIds);
 
     const alerts = groups.map((g) => {
       const ccId = deviceCC.get(g.device_id);
@@ -219,7 +228,7 @@ async function getAlertById(req, res) {
     const { deviceCC } = await batchResolveDeviceCC([alert]);
     const ccId = deviceCC.get(alert.device_id);
     const ccIds = ccId ? [ccId] : [];
-    const perCCMaps = await getPerCCSeverityMaps(ccIds, 'video');
+    const perCCMaps = await getPerCCSeverityMaps(ccIds);
     const severityMap = (ccId && perCCMaps[ccId]) || perCCMaps[0] || {};
 
     const transformed = transformDbAlert(alert, severityMap);
