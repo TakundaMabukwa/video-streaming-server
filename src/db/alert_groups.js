@@ -199,7 +199,6 @@ module.exports = {
   getAlertGroupById,
   getAlertGroupByKey,
   getAlertGroupByAlertId,
-  getAlertGroupByGroupKey,
   getActiveAlertGroupsAll,
   getActiveAlertGroupsWithMedia,
   getResolvedAlertGroupsWithMedia,
