@@ -123,16 +123,19 @@ async function getTelematicsSeverityMap(costCenterIds) {
  * Build per-CC severity maps: { [ccId]: { [signal_code]: severity } }.
  * Each cost center gets its own override-aware map.
  * Falls back to global (base) severity when no override exists.
+ * @param {number[]} ccIds - cost center IDs
+ * @param {string|string[]} categories - 'video', 'telematics', or array of both
  */
-async function getPerCCSeverityMaps(ccIds, category = 'video') {
+async function getPerCCSeverityMaps(ccIds, categories = ['video', 'telematics']) {
+  const cats = Array.isArray(categories) ? categories : [categories];
+
   if (!ccIds || ccIds.length === 0) {
-    const map = category === 'video'
-      ? await getVideoSeverityMap([])
-      : await getTelematicsSeverityMap([]);
-    return { 0: map };
+    const videoMap = await getVideoSeverityMap([]);
+    const telematicsMap = await getTelematicsSeverityMap([]);
+    const merged = { ...telematicsMap, ...videoMap };
+    return { 0: merged };
   }
 
-  const now = Date.now();
   const perCC = {};
 
   try {
@@ -141,8 +144,8 @@ async function getPerCCSeverityMaps(ccIds, category = 'video') {
        FROM alert_definitions d
        LEFT JOIN alert_definition_overrides o
          ON o.alert_definition_id = d.id AND o.cost_center_id = ANY($1::int[])
-       WHERE d.category = $2 AND d.is_active = true`,
-      [ccIds, category]
+       WHERE d.category = ANY($2::text[]) AND d.is_active = true`,
+      [ccIds, cats]
     );
 
     for (const row of result.rows) {
@@ -152,9 +155,9 @@ async function getPerCCSeverityMaps(ccIds, category = 'video') {
       perCC[ccKey][row.signal_code] = (row.override_severity || row.severity || 'MEDIUM').toLowerCase();
     }
 
-    const globalMap = category === 'video'
-      ? await getVideoSeverityMap([])
-      : await getTelematicsSeverityMap([]);
+    const videoMap = await getVideoSeverityMap([]);
+    const telematicsMap = await getTelematicsSeverityMap([]);
+    const globalMap = { ...telematicsMap, ...videoMap };
 
     for (const ccId of ccIds) {
       if (!perCC[ccId]) perCC[ccId] = { ...globalMap };
@@ -163,10 +166,9 @@ async function getPerCCSeverityMaps(ccIds, category = 'video') {
     return perCC;
   } catch (error) {
     console.error('[alert_definitions] Failed to build per-CC severity maps:', error.message);
-    const fallback = category === 'video'
-      ? await getVideoSeverityMap([])
-      : await getTelematicsSeverityMap([]);
-    return { 0: fallback };
+    const videoMap = await getVideoSeverityMap([]);
+    const telematicsMap = await getTelematicsSeverityMap([]);
+    return { 0: { ...telematicsMap, ...videoMap } };
   }
 }
 
