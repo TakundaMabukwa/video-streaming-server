@@ -60,14 +60,21 @@ async function processAlertDeduction(fleet_number, alert_type) {
     // Determine the vehicle's cost center (NULL = use global config)
     const vehicleCostCenterId = await findVehicleCostCenterId(fleet_number);
 
-    // Find matching criteria — resolve CC-specific first, fall back to global
+    // Find matching criteria — resolve group first, then CC-specific, then global
     const criteriaResult = await client.query(
-      `SELECT id, name, deduction_per_alert, deduction_with_ncr, ncr_threshold, cost_center_id
+      `SELECT id, name, deduction_per_alert, deduction_with_ncr, ncr_threshold, cost_center_id, config_group_id
        FROM driver_config_criteria
        WHERE is_active = true
-       AND (cost_center_id = $2 OR (cost_center_id IS NULL))
+       AND (
+         config_group_id IN (SELECT group_id FROM config_group_members WHERE cost_center_id = $2)
+         OR cost_center_id = $2
+         OR (config_group_id IS NULL AND cost_center_id IS NULL)
+       )
        AND EXISTS (SELECT 1 FROM unnest(statuses) s WHERE LOWER(s) = LOWER($1))
-       ORDER BY cost_center_id IS NOT NULL DESC
+       ORDER BY
+         CASE WHEN config_group_id IS NOT NULL THEN 1
+              WHEN cost_center_id IS NOT NULL THEN 2
+              ELSE 3 END
        LIMIT 1`,
       [alert_type, vehicleCostCenterId == null ? 0 : vehicleCostCenterId]
     );
@@ -210,15 +217,21 @@ async function applyNcrDeduction(fleet_number, alertType) {
 
     // Prefer a criterion matching the original alert type; fall back to any NCR-enabled criterion for the CC.
     const criteriaResult = await client.query(
-      `SELECT id, name, deduction_with_ncr, nrc_deduction, cost_center_id
+      `SELECT id, name, deduction_with_ncr, nrc_deduction, cost_center_id, config_group_id
        FROM driver_config_criteria
        WHERE is_active = true
-       AND (cost_center_id = $2 OR (cost_center_id IS NULL))
+       AND (
+         config_group_id IN (SELECT group_id FROM config_group_members WHERE cost_center_id = $2)
+         OR cost_center_id = $2
+         OR (config_group_id IS NULL AND cost_center_id IS NULL)
+       )
        AND (EXISTS (SELECT 1 FROM unnest(statuses) s WHERE LOWER(s) = LOWER($1))
             OR nrc_deduction = true)
        ORDER BY
          (EXISTS (SELECT 1 FROM unnest(statuses) s WHERE LOWER(s) = LOWER($1))) DESC,
-         cost_center_id IS NOT NULL DESC
+         CASE WHEN config_group_id IS NOT NULL THEN 1
+              WHEN cost_center_id IS NOT NULL THEN 2
+              ELSE 3 END
        LIMIT 1`,
       [baseType, vehicleCostCenterId == null ? 0 : vehicleCostCenterId]
     );

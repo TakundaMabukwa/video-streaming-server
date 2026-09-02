@@ -596,6 +596,24 @@ const MIGRATIONS_SQL = `
   CREATE INDEX IF NOT EXISTS idx_incidents_status_date ON incidents(status, incident_date DESC);
   CREATE INDEX IF NOT EXISTS idx_incidents_cc_date ON incidents(cost_center_id, incident_date DESC);
   CREATE INDEX IF NOT EXISTS idx_incidents_fleet ON incidents(fleet_number);
+
+  -- Config Groups: allow multiple cost centers to share the same driver config criteria
+  CREATE TABLE IF NOT EXISTS config_groups (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  );
+
+  CREATE TABLE IF NOT EXISTS config_group_members (
+    group_id INTEGER NOT NULL REFERENCES config_groups(id) ON DELETE CASCADE,
+    cost_center_id INTEGER NOT NULL,
+    PRIMARY KEY (group_id, cost_center_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_config_group_members_cc ON config_group_members(cost_center_id);
+
+  ALTER TABLE driver_config_criteria ADD COLUMN IF NOT EXISTS config_group_id INTEGER;
+  CREATE INDEX IF NOT EXISTS idx_driver_config_criteria_group ON driver_config_criteria(config_group_id);
 `;
 
 async function initializeDatabase() {

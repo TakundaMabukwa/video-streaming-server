@@ -269,7 +269,7 @@ async function upsertFleetVehicles(vehicles) {
       v.make || null,
       v.model || null,
       v.cost_center || null,
-      (v.cost_center && ccMap.get(String(v.cost_center).toLowerCase())) || v.cost_center_id || null,
+      v.cost_center_id || (v.cost_center && ccMap.get(String(v.cost_center).toLowerCase())) || null,
       new Date(),
     ]);
 

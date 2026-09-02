@@ -7,7 +7,7 @@ async function fetchVehiclesFromSupabase() {
     return [];
   }
 
-  const url = `${SUPABASE_URL}/rest/v1/vehiclesc?select=fleet_number,registration_number,make,model,cost_center`;
+  const url = `${SUPABASE_URL}/rest/v1/vehiclesc?select=fleet_number,registration_number,make,model,cost_center,cost_center_id`;
 
   try {
     const response = await fetch(url, {
