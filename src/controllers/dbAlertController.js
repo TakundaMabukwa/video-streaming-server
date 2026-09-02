@@ -835,6 +835,15 @@ async function resolveAlertsBulk(req, res) {
   }
 }
 
+async function getResolvedAlertCount(req, res) {
+  try {
+    const count = await db.getResolvedAlertGroupCount();
+    res.json({ success: true, count });
+  } catch (error) {
+    res.status(500).json({ success: false, count: 0, message: error.message });
+  }
+}
+
 module.exports = {
   getAlertsList,
   getAlertDetail,
@@ -845,6 +854,7 @@ module.exports = {
   getActiveAlerts,
   getActiveAlertsAll,
   getResolvedAlerts,
+  getResolvedAlertCount,
   getAlertById,
   getAlertScreenshots,
   getAlertMedia,

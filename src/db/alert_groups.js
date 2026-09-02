@@ -178,6 +178,11 @@ async function resolveAlertGroup(groupKey, updates) {
   return result.rows[0] || null;
 }
 
+async function getResolvedAlertGroupCount() {
+  const result = await query('SELECT COUNT(*) FROM alert_groups WHERE resolved = TRUE');
+  return parseInt(result.rows[0].count);
+}
+
 async function getAlertGroupStats() {
   const groupCount = await query('SELECT COUNT(*) FROM alert_groups');
   const activeCount = await query('SELECT COUNT(*) FROM alert_groups WHERE resolved = FALSE');
@@ -194,9 +199,11 @@ module.exports = {
   getAlertGroupById,
   getAlertGroupByKey,
   getAlertGroupByAlertId,
-  getActiveAlertGroupsWithMedia,
+  getAlertGroupByGroupKey,
   getActiveAlertGroupsAll,
+  getActiveAlertGroupsWithMedia,
   getResolvedAlertGroupsWithMedia,
+  getResolvedAlertGroupCount,
   resolveAlertGroup,
   getAlertGroupStats,
 };
