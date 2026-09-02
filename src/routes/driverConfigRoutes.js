@@ -15,24 +15,24 @@ router.get('/criteria/global', async (req, res) => {
   }
 });
 
-// Get criteria for a specific cost center (group + CC-specific + global)
+// Get criteria for a specific cost center (group + CC-specific + global, deduplicated by name)
 router.get('/criteria/for-cc/:costCenterId', async (req, res) => {
   try {
     const { costCenterId } = req.params;
     const ccId = Number(costCenterId);
     const result = await db.query(
-      `SELECT * FROM driver_config_criteria
+      `SELECT DISTINCT ON (name) *
+       FROM driver_config_criteria
        WHERE is_active = true
        AND (
          config_group_id IN (SELECT group_id FROM config_group_members WHERE cost_center_id = $1)
          OR cost_center_id = $1
          OR (config_group_id IS NULL AND cost_center_id IS NULL)
        )
-       ORDER BY
+       ORDER BY name,
          CASE WHEN config_group_id IS NOT NULL THEN 1
               WHEN cost_center_id IS NOT NULL THEN 2
-              ELSE 3 END,
-         name ASC`,
+              ELSE 3 END ASC`,
       [ccId]
     );
     res.json({ success: true, data: result.rows });
