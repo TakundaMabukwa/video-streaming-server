@@ -708,6 +708,40 @@ const MIGRATIONS_SQL = `
       DROP INDEX IF EXISTS idx_alert_group_configs_cc;
     END IF;
   END $$;
+
+  -- ============================================================
+  -- Escalation Groups: contact people per cost center and alert.
+  -- Escalation group = a named set of contacts (emails) attached to
+  -- one cost center, triggered for whichever alert groups are linked.
+  -- ============================================================
+  CREATE TABLE IF NOT EXISTS escalation_groups (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    cost_center_id INTEGER,
+    description TEXT DEFAULT '',
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(name, cost_center_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_escalation_groups_cc ON escalation_groups(cost_center_id);
+
+  CREATE TABLE IF NOT EXISTS escalation_group_members (
+    id SERIAL PRIMARY KEY,
+    escalation_group_id INTEGER NOT NULL REFERENCES escalation_groups(id) ON DELETE CASCADE,
+    email TEXT NOT NULL,
+    name TEXT DEFAULT '',
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  );
+  CREATE INDEX IF NOT EXISTS idx_escalation_members_group ON escalation_group_members(escalation_group_id);
+
+  CREATE TABLE IF NOT EXISTS escalation_group_alert_groups (
+    escalation_group_id INTEGER NOT NULL REFERENCES escalation_groups(id) ON DELETE CASCADE,
+    alert_group_config_id INTEGER NOT NULL REFERENCES alert_group_configs(id) ON DELETE CASCADE,
+    PRIMARY KEY (escalation_group_id, alert_group_config_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_escalation_alertgroups_grp ON escalation_group_alert_groups(escalation_group_id);
 `;
 
 async function initializeDatabase() {
