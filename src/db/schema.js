@@ -638,6 +638,76 @@ const MIGRATIONS_SQL = `
         ADD CONSTRAINT driver_config_criteria_scope_unique UNIQUE (name, config_group_id, cost_center_id);
     END IF;
   END $$;
+
+  -- ============================================================
+  -- Alert Definition Overrides: separate table for CC-specific config
+  -- ============================================================
+  CREATE TABLE IF NOT EXISTS alert_definition_overrides (
+    id SERIAL PRIMARY KEY,
+    alert_definition_id INTEGER NOT NULL REFERENCES alert_definitions(id) ON DELETE CASCADE,
+    cost_center_id INTEGER NOT NULL,
+    severity TEXT,
+    description TEXT,
+    is_active BOOLEAN,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(alert_definition_id, cost_center_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_alert_def_overrides_cc ON alert_definition_overrides(cost_center_id);
+  CREATE INDEX IF NOT EXISTS idx_alert_def_overrides_def ON alert_definition_overrides(alert_definition_id);
+
+  -- Migrate existing CC-specific rows from alert_definitions into overrides
+  DO $$
+  BEGIN
+    IF EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_name = 'alert_definitions' AND column_name = 'cost_center_id'
+    ) THEN
+      -- Insert CC-specific data into overrides table
+      INSERT INTO alert_definition_overrides (alert_definition_id, cost_center_id, severity, description, is_active)
+      SELECT id, cost_center_id, severity, description, is_active
+      FROM alert_definitions
+      WHERE cost_center_id IS NOT NULL
+      ON CONFLICT (alert_definition_id, cost_center_id) DO NOTHING;
+
+      -- Drop cost_center_id from alert_definitions (no longer needed)
+      ALTER TABLE alert_definitions DROP COLUMN IF EXISTS cost_center_id;
+      DROP INDEX IF EXISTS idx_alert_definitions_cc;
+    END IF;
+  END $$;
+
+  -- Same pattern for alert_group_configs
+  CREATE TABLE IF NOT EXISTS alert_group_config_overrides (
+    id SERIAL PRIMARY KEY,
+    group_config_id INTEGER NOT NULL REFERENCES alert_group_configs(id) ON DELETE CASCADE,
+    cost_center_id INTEGER NOT NULL,
+    severity TEXT,
+    description TEXT,
+    is_active BOOLEAN,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(group_config_id, cost_center_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_alert_grp_overrides_cc ON alert_group_config_overrides(cost_center_id);
+  CREATE INDEX IF NOT EXISTS idx_alert_grp_overrides_grp ON alert_group_config_overrides(group_config_id);
+
+  -- Migrate existing CC-specific rows from alert_group_configs into overrides
+  DO $$
+  BEGIN
+    IF EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_name = 'alert_group_configs' AND column_name = 'cost_center_id'
+    ) THEN
+      INSERT INTO alert_group_config_overrides (group_config_id, cost_center_id, severity, description, is_active)
+      SELECT id, cost_center_id, severity, description, is_active
+      FROM alert_group_configs
+      WHERE cost_center_id IS NOT NULL
+      ON CONFLICT (group_config_id, cost_center_id) DO NOTHING;
+
+      ALTER TABLE alert_group_configs DROP COLUMN IF EXISTS cost_center_id;
+      DROP INDEX IF EXISTS idx_alert_group_configs_cc;
+    END IF;
+  END $$;
 `;
 
 async function initializeDatabase() {
