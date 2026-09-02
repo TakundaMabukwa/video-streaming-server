@@ -618,6 +618,7 @@ const MIGRATIONS_SQL = `
   -- Update unique constraint to include config_group_id
   DO $$
   BEGIN
+    -- Drop old constraint if it still exists
     IF EXISTS (
       SELECT 1 FROM pg_constraint
       WHERE conname = 'driver_config_criteria_cc_unique'
@@ -626,10 +627,17 @@ const MIGRATIONS_SQL = `
       ALTER TABLE driver_config_criteria
         DROP CONSTRAINT driver_config_criteria_cc_unique;
     END IF;
-  END $$;
 
-  ALTER TABLE driver_config_criteria
-    ADD CONSTRAINT driver_config_criteria_scope_unique UNIQUE (name, config_group_id, cost_center_id);
+    -- Add new constraint only if it doesn't exist
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_constraint
+      WHERE conname = 'driver_config_criteria_scope_unique'
+      AND conrelid = 'driver_config_criteria'::regclass
+    ) THEN
+      ALTER TABLE driver_config_criteria
+        ADD CONSTRAINT driver_config_criteria_scope_unique UNIQUE (name, config_group_id, cost_center_id);
+    END IF;
+  END $$;
 `;
 
 async function initializeDatabase() {
