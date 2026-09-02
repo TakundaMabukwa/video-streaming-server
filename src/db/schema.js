@@ -614,6 +614,22 @@ const MIGRATIONS_SQL = `
 
   ALTER TABLE driver_config_criteria ADD COLUMN IF NOT EXISTS config_group_id INTEGER;
   CREATE INDEX IF NOT EXISTS idx_driver_config_criteria_group ON driver_config_criteria(config_group_id);
+
+  -- Update unique constraint to include config_group_id
+  DO $$
+  BEGIN
+    IF EXISTS (
+      SELECT 1 FROM pg_constraint
+      WHERE conname = 'driver_config_criteria_cc_unique'
+      AND conrelid = 'driver_config_criteria'::regclass
+    ) THEN
+      ALTER TABLE driver_config_criteria
+        DROP CONSTRAINT driver_config_criteria_cc_unique;
+    END IF;
+  END $$;
+
+  ALTER TABLE driver_config_criteria
+    ADD CONSTRAINT driver_config_criteria_scope_unique UNIQUE (name, config_group_id, cost_center_id);
 `;
 
 async function initializeDatabase() {

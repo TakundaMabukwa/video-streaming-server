@@ -208,7 +208,7 @@ router.get('/config-groups', async (req, res) => {
   }
 });
 
-// Create config group with members
+// Create config group with members, auto-populate with global defaults
 router.post('/config-groups', async (req, res) => {
   const client = await db.getClient();
   try {
@@ -231,8 +231,27 @@ router.post('/config-groups', async (req, res) => {
       );
     }
 
+    // Auto-populate with global default criteria
+    const globalCriteria = await client.query(
+      `SELECT name, selected_weighting, actual_weighting, risk_tiers, no_incidents, statuses,
+              nrc_deduction, incidents_threshold, deduction_per_alert, deduction_with_ncr, ncr_threshold
+       FROM driver_config_criteria
+       WHERE config_group_id IS NULL AND cost_center_id IS NULL AND is_active = true`
+    );
+
+    if (globalCriteria.rows.length > 0) {
+      for (const row of globalCriteria.rows) {
+        await client.query(
+          `INSERT INTO driver_config_criteria (name, selected_weighting, actual_weighting, risk_tiers, no_incidents, statuses, nrc_deduction, incidents_threshold, deduction_per_alert, deduction_with_ncr, ncr_threshold, config_group_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+           ON CONFLICT (name, config_group_id, cost_center_id) DO NOTHING`,
+          [row.name, row.selected_weighting, row.actual_weighting, row.risk_tiers, row.no_incidents, row.statuses, row.nrc_deduction, row.incidents_threshold, row.deduction_per_alert, row.deduction_with_ncr, row.ncr_threshold, group.id]
+        );
+      }
+    }
+
     await client.query('COMMIT');
-    res.json({ success: true, data: { ...group, members: cost_center_ids } });
+    res.json({ success: true, data: { ...group, members: cost_center_ids, criteria_count: globalCriteria.rows.length } });
   } catch (error) {
     await client.query('ROLLBACK');
     if (error.code === '23505') {
