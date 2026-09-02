@@ -4,8 +4,19 @@ const { query } = require('./pool');
 
 function extractFleetNumber(name) {
   const cleaned = (name || '').trim();
-  const match = cleaned.match(/^([A-Za-z0-9]+)\s*[-–]/);
-  return match ? match[1] : (cleaned || null);
+  if (!cleaned) return null;
+
+  // Split on ' - ' or ' – ' (Geotab device names use this format)
+  const parts = cleaned.split(/\s*[-–]\s*/).filter(Boolean);
+  if (parts.length < 2) {
+    // No delimiter — return as-is (might be a raw fleet code or device ID)
+    return cleaned;
+  }
+
+  // For "32 - EX55 - LCL660MP", find the segment that looks like a fleet code.
+  // Fleet codes start with 2+ letters (EX55, PB29, AM03) possibly followed by digits.
+  const fleetCode = parts.find(p => /^[A-Za-z]{2,}\d*$/.test(p));
+  return fleetCode || parts[0];
 }
 
 function parseDuration(durationStr) {

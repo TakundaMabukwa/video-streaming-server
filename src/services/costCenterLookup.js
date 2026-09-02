@@ -56,11 +56,20 @@ function looksLikeFleetCode(value) {
   return false;
 }
 
-// Extract the fleet prefix from registration/plate strings like "PB29 - JHD716FS".
+// Extract the fleet prefix from registration/plate strings like "PB29 - JHD716FS"
+// or "32 - EX55 - LCL660MP" (numeric prefix + fleet code + plate).
 function fleetFromRegistration(value) {
   const s = String(value || '').trim();
   if (!s) return null;
   const parts = s.split(' - ').map((p) => p.trim()).filter(Boolean);
+  if (parts.length === 0) return null;
+
+  // First, try to find a segment that looks like a fleet code (starts with 2+ letters).
+  // For "32 - EX55 - LCL660MP", this finds "EX55".
+  const fleetCode = parts.find(p => /^[A-Za-z]{2,}\d*$/.test(p));
+  if (fleetCode && looksLikeFleetCode(fleetCode)) return fleetCode;
+
+  // Fallback: check the first segment
   const first = parts[0];
   if (first && looksLikeFleetCode(first.split(/\s+/)[0])) return first.split(/\s+/)[0];
   if (looksLikeFleetCode(first)) return first;
