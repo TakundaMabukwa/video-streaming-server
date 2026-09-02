@@ -339,4 +339,62 @@ router.get('/config-groups/:id/criteria', async (req, res) => {
   }
 });
 
+// Reset a cost center's config to match global defaults (delete all CC-specific, copy globals)
+router.post('/criteria/reset-to-global/:costCenterId', async (req, res) => {
+  const client = await db.getClient();
+  try {
+    const { costCenterId } = req.params;
+    const ccId = Number(costCenterId);
+    if (!ccId) return res.status(400).json({ success: false, message: 'Invalid cost center ID' });
+
+    await client.query('BEGIN');
+
+    // Delete all existing CC-specific criteria (not group-based)
+    const deleteResult = await client.query(
+      'DELETE FROM driver_config_criteria WHERE cost_center_id = $1 AND config_group_id IS NULL',
+      [ccId]
+    );
+
+    // Copy all global criteria as CC-specific overrides
+    const globalCriteria = await client.query(
+      `SELECT name, selected_weighting, actual_weighting, risk_tiers, no_incidents, statuses,
+              nrc_deduction, incidents_threshold, deduction_per_alert, deduction_with_ncr, ncr_threshold
+       FROM driver_config_criteria
+       WHERE config_group_id IS NULL AND cost_center_id IS NULL AND is_active = true`
+    );
+
+    let created = 0;
+    for (const row of globalCriteria.rows) {
+      await client.query(
+        `INSERT INTO driver_config_criteria (name, selected_weighting, actual_weighting, risk_tiers, no_incidents, statuses, nrc_deduction, incidents_threshold, deduction_per_alert, deduction_with_ncr, ncr_threshold, cost_center_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+         ON CONFLICT (name, config_group_id, cost_center_id) DO UPDATE SET
+           selected_weighting = EXCLUDED.selected_weighting,
+           deduction_per_alert = EXCLUDED.deduction_per_alert,
+           deduction_with_ncr = EXCLUDED.deduction_with_ncr,
+           ncr_threshold = EXCLUDED.ncr_threshold,
+           statuses = EXCLUDED.statuses,
+           updated_at = NOW()`,
+        [row.name, row.selected_weighting, row.actual_weighting, row.risk_tiers, row.no_incidents, row.statuses, row.nrc_deduction, row.incidents_threshold, row.deduction_per_alert, row.deduction_with_ncr, row.ncr_threshold, ccId]
+      );
+      created++;
+    }
+
+    await client.query('COMMIT');
+    res.json({
+      success: true,
+      data: {
+        deleted: deleteResult.rowCount,
+        created,
+        message: `Reset cost center ${ccId}: deleted ${deleteResult.rowCount} overrides, created ${created} from global defaults`
+      }
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ success: false, message: error.message });
+  } finally {
+    client.release();
+  }
+});
+
 module.exports = router;
