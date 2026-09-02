@@ -410,10 +410,14 @@ async function getAlertHistory(req, res) {
     const days = Math.min(Math.max(parseInt(req.query.days) || 30, 1), 365);
     const limit = Math.min(Math.max(parseInt(req.query.limit) || 200, 1), 2000);
     const deviceId = String(req.query.device_id || req.query.vehicleId || '').trim();
+    const includeResolved = req.query.include_resolved === 'true';
 
     const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
     const params = [cutoff];
     let where = 'alarm_ts >= $1';
+    if (!includeResolved) {
+      where += ' AND (resolved IS NOT TRUE) AND (false_alert IS NOT TRUE)';
+    }
     if (deviceId) {
       params.push(deviceId);
       where += ` AND device_id = $${params.length}`;
