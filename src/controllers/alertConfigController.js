@@ -20,9 +20,16 @@ async function listAlertDefinitions(req, res) {
       params.push(ccId);
     }
 
-    let sql = 'SELECT * FROM alert_definitions';
-    if (conds.length) sql += ' WHERE ' + conds.join(' AND ');
-    sql += ' ORDER BY category, name';
+    let sql;
+    if (cost_center_id) {
+      sql = `SELECT DISTINCT ON (name) * FROM alert_definitions`;
+      if (conds.length) sql += ' WHERE ' + conds.join(' AND ');
+      sql += ` ORDER BY name, cost_center_id IS NOT NULL DESC`;
+    } else {
+      sql = 'SELECT * FROM alert_definitions';
+      if (conds.length) sql += ' WHERE ' + conds.join(' AND ');
+      sql += ' ORDER BY category, name';
+    }
 
     const result = await db.query(sql, params);
     sendSuccess(res, result.rows, 'Alert definitions retrieved');
@@ -103,9 +110,9 @@ async function listAlertGroupConfigs(req, res) {
     if (cost_center_id) {
       const ccId = Number(cost_center_id);
       groups = await db.query(
-        `SELECT * FROM alert_group_configs
+        `SELECT DISTINCT ON (name) * FROM alert_group_configs
          WHERE cost_center_id IS NULL OR cost_center_id = $1
-         ORDER BY cost_center_id IS NOT NULL, severity, name`,
+         ORDER BY name, cost_center_id IS NOT NULL DESC`,
         [ccId]
       );
     } else {
