@@ -44,10 +44,13 @@ async function createAlertDefinition(req, res) {
     if (!name || !category) return sendError(res, 'name and category required', 400);
     if (!['telematics', 'video'].includes(category)) return sendError(res, 'category must be telematics or video', 400);
 
+    // Use NULL for empty signal_code (NULLs are unique in Postgres, empty strings are not)
+    const sigCode = signal_code && signal_code.trim() ? signal_code.trim() : null;
+
     const result = await db.query(
       `INSERT INTO alert_definitions (name, category, description, signal_code, cost_center_id, severity)
        VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-      [name.trim(), category, description, signal_code, cost_center_id, String(severity).toUpperCase()]
+      [name.trim(), category, description, sigCode, cost_center_id, String(severity).toUpperCase()]
     );
     sendSuccess(res, result.rows[0], 'Alert definition created');
     if (category === 'video') invalidateCache();
