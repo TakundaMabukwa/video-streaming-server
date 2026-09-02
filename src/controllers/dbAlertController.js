@@ -3,9 +3,46 @@ const syncService = require('../services/syncService');
 const { sendSuccess, sendError } = require('../helpers/response');
 const { uploadDocument } = require('../helpers/storage');
 const { transformDbAlert } = require('../helpers/transform');
-const { getVideoSeverityMap } = require('../db/alert_definitions');
+const { getVideoSeverityMap, getPerCCSeverityMaps } = require('../db/alert_definitions');
 const { findVehicleCostCenterId, resolveFleetNumber } = require('../services/costCenterLookup');
 const { applyNcrDeduction } = require('../services/driverScoringService');
+
+async function batchResolveDeviceCC(alertGroups) {
+  const deviceIds = [...new Set(alertGroups.map(g => g.device_id).filter(Boolean))];
+  if (deviceIds.length === 0) return { fleetMap: new Map(), deviceCC: new Map() };
+
+  const fleetMap = new Map();
+  const results = await Promise.allSettled(
+    deviceIds.map(async (did) => {
+      const fleet = await resolveFleetNumber({
+        deviceId: did,
+        vehicleRegistration: alertGroups.find(g => g.device_id === did)?.device_name,
+      }).catch(() => null);
+      if (fleet) fleetMap.set(did, fleet);
+      return { deviceId: did, fleet };
+    })
+  );
+
+  const uniqueFleets = [...new Set([...fleetMap.values()])];
+  const deviceCC = new Map();
+
+  const ccResults = await Promise.allSettled(
+    uniqueFleets.map(async (fn) => {
+      const ccId = await findVehicleCostCenterId(fn).catch(() => null);
+      return { fleet: fn, ccId };
+    })
+  );
+
+  for (const r of ccResults) {
+    if (r.status === 'fulfilled' && r.value.ccId) {
+      for (const [did, fleet] of fleetMap) {
+        if (fleet === r.value.fleet) deviceCC.set(did, r.value.ccId);
+      }
+    }
+  }
+
+  return { fleetMap, deviceCC };
+}
 
 async function getAlertsList(req, res) {
   try {
@@ -90,12 +127,15 @@ async function getAlertTypes(req, res) {
 async function getActiveAlerts(req, res) {
   try {
     const limit = parseInt(req.query.limit) || 2000;
-    const severityMap = await getVideoSeverityMap(req.userCostCenterIds);
-
-    // Read from alert_groups for grouped view
     const groups = await db.getActiveAlertGroupsWithMedia({ limit });
 
+    const { deviceCC } = await batchResolveDeviceCC(groups);
+    const ccIds = [...new Set([...deviceCC.values()])];
+    const perCCMaps = await getPerCCSeverityMaps(ccIds, 'video');
+
     const alerts = groups.map((g) => {
+      const ccId = deviceCC.get(g.device_id);
+      const severityMap = (ccId && perCCMaps[ccId]) || perCCMaps[0] || {};
       const t = transformDbAlert(g, severityMap);
       t.count = g.count || 1;
       return t;
@@ -110,11 +150,17 @@ async function getActiveAlerts(req, res) {
 async function getResolvedAlerts(req, res) {
   try {
     const limit = parseInt(req.query.limit) || 2000;
-    const severityMap = await getVideoSeverityMap(req.userCostCenterIds);
-
     const groups = await db.getResolvedAlertGroupsWithMedia({ limit });
 
-    const alerts = groups.map((g) => transformDbAlert(g, severityMap));
+    const { deviceCC } = await batchResolveDeviceCC(groups);
+    const ccIds = [...new Set([...deviceCC.values()])];
+    const perCCMaps = await getPerCCSeverityMaps(ccIds, 'video');
+
+    const alerts = groups.map((g) => {
+      const ccId = deviceCC.get(g.device_id);
+      const severityMap = (ccId && perCCMaps[ccId]) || perCCMaps[0] || {};
+      return transformDbAlert(g, severityMap);
+    });
 
     res.json({ success: true, alerts, count: alerts.length, total: alerts.length, source: 'eps-db' });
   } catch (error) {
@@ -125,11 +171,17 @@ async function getResolvedAlerts(req, res) {
 async function getActiveAlertsAll(req, res) {
   try {
     const limit = parseInt(req.query.limit) || 2000;
-    const severityMap = await getVideoSeverityMap(req.userCostCenterIds);
-
     const groups = await db.getActiveAlertGroupsAll({ limit });
 
-    const alerts = groups.map((g) => transformDbAlert(g, severityMap));
+    const { deviceCC } = await batchResolveDeviceCC(groups);
+    const ccIds = [...new Set([...deviceCC.values()])];
+    const perCCMaps = await getPerCCSeverityMaps(ccIds, 'video');
+
+    const alerts = groups.map((g) => {
+      const ccId = deviceCC.get(g.device_id);
+      const severityMap = (ccId && perCCMaps[ccId]) || perCCMaps[0] || {};
+      return transformDbAlert(g, severityMap);
+    });
 
     res.json({ success: true, alerts, count: alerts.length, total: alerts.length, source: 'eps-db' });
   } catch (error) {
@@ -141,7 +193,6 @@ async function getAlertById(req, res) {
   try {
     const { id } = req.params;
     if (!id) return sendError(res, 'Alert ID required', 400);
-    const severityMap = await getVideoSeverityMap(req.userCostCenterIds);
 
     // Try group lookup first, fall back to individual alert
     let alert = await db.getAlertGroupByAlertId(id);
@@ -164,6 +215,12 @@ async function getAlertById(req, res) {
       const media = await db.getMediaForAlert(alert.last_alert_id);
       alert.media = media || [];
     }
+
+    const { deviceCC } = await batchResolveDeviceCC([alert]);
+    const ccId = deviceCC.get(alert.device_id);
+    const ccIds = ccId ? [ccId] : [];
+    const perCCMaps = await getPerCCSeverityMaps(ccIds, 'video');
+    const severityMap = (ccId && perCCMaps[ccId]) || perCCMaps[0] || {};
 
     const transformed = transformDbAlert(alert, severityMap);
     transformed.count = alert.count || 1;
@@ -278,7 +335,6 @@ async function getAlertMedia(req, res) {
     const { id } = req.params;
     const ensureMedia = req.query.ensureMedia === 'true';
     if (!id) return sendError(res, 'Alert ID required', 400);
-    const severityMap = await getVideoSeverityMap(req.userCostCenterIds);
 
     // Try group lookup, fall back to individual alert
     let group = await db.getAlertGroupByAlertId(id);

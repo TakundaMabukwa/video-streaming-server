@@ -119,6 +119,57 @@ async function getTelematicsSeverityMap(costCenterIds) {
   }
 }
 
+/**
+ * Build per-CC severity maps: { [ccId]: { [signal_code]: severity } }.
+ * Each cost center gets its own override-aware map.
+ * Falls back to global (base) severity when no override exists.
+ */
+async function getPerCCSeverityMaps(ccIds, category = 'video') {
+  if (!ccIds || ccIds.length === 0) {
+    const map = category === 'video'
+      ? await getVideoSeverityMap([])
+      : await getTelematicsSeverityMap([]);
+    return { 0: map };
+  }
+
+  const now = Date.now();
+  const perCC = {};
+
+  try {
+    const result = await db.query(
+      `SELECT d.signal_code, d.severity, o.severity AS override_severity, o.cost_center_id
+       FROM alert_definitions d
+       LEFT JOIN alert_definition_overrides o
+         ON o.alert_definition_id = d.id AND o.cost_center_id = ANY($1::int[])
+       WHERE d.category = $2 AND d.is_active = true`,
+      [ccIds, category]
+    );
+
+    for (const row of result.rows) {
+      if (!row.signal_code) continue;
+      const ccKey = row.cost_center_id || 0;
+      if (!perCC[ccKey]) perCC[ccKey] = {};
+      perCC[ccKey][row.signal_code] = (row.override_severity || row.severity || 'MEDIUM').toLowerCase();
+    }
+
+    const globalMap = category === 'video'
+      ? await getVideoSeverityMap([])
+      : await getTelematicsSeverityMap([]);
+
+    for (const ccId of ccIds) {
+      if (!perCC[ccId]) perCC[ccId] = { ...globalMap };
+    }
+
+    return perCC;
+  } catch (error) {
+    console.error('[alert_definitions] Failed to build per-CC severity maps:', error.message);
+    const fallback = category === 'video'
+      ? await getVideoSeverityMap([])
+      : await getTelematicsSeverityMap([]);
+    return { 0: fallback };
+  }
+}
+
 function invalidateCache() {
   cachedMap = null;
   cacheTime = 0;
@@ -128,4 +179,4 @@ function invalidateCache() {
   ccTelematicsCache.clear();
 }
 
-module.exports = { getVideoSeverityMap, getTelematicsSeverityMap, invalidateCache };
+module.exports = { getVideoSeverityMap, getTelematicsSeverityMap, getPerCCSeverityMaps, invalidateCache };
