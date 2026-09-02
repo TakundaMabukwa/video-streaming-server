@@ -4,7 +4,7 @@ const {
   createEscalationGroup,
   updateEscalationGroup,
   deleteEscalationGroup,
-  listAlertGroupsForSelection,
+  searchAlertDefinitions,
 } = require('../controllers/escalationController');
 
 const router = express.Router();
@@ -14,6 +14,6 @@ router.post('/groups', createEscalationGroup);
 router.put('/groups/:id', updateEscalationGroup);
 router.delete('/groups/:id', deleteEscalationGroup);
 
-router.get('/alert-groups', listAlertGroupsForSelection);
+router.get('/alerts', searchAlertDefinitions);
 
 module.exports = router;

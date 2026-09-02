@@ -17,10 +17,10 @@ async function listEscalationGroups(req, res) {
       groups = await db.query('SELECT * FROM escalation_groups ORDER BY name');
     }
 
-    // Fetch members + linked alert groups in two bulk queries
+    // Fetch members + linked alerts in two bulk queries
     const groupIds = groups.rows.map((g) => g.id);
     let membersByGroup = {};
-    let alertGroupsByGroup = {};
+    let alertsByGroup = {};
     if (groupIds.length > 0) {
       const members = await db.query(
         `SELECT em.escalation_group_id, em.id, em.email, em.name AS member_name, em.is_active
@@ -34,24 +34,29 @@ async function listEscalationGroups(req, res) {
         membersByGroup[m.escalation_group_id].push(m);
       }
 
-      const alertGroups = await db.query(
-        `SELECT ega.escalation_group_id, agc.id, agc.name
+      const alerts = await db.query(
+        `SELECT ega.escalation_group_id, ad.id, ad.name, ad.category, ad.signal_code
          FROM escalation_group_alert_groups ega
-         JOIN alert_group_configs agc ON agc.id = ega.alert_group_config_id
+         JOIN alert_definitions ad ON ad.id = ega.alert_definition_id
          WHERE ega.escalation_group_id = ANY($1)
-         ORDER BY agc.name`,
+         ORDER BY ad.name`,
         [groupIds]
       );
-      for (const a of alertGroups.rows) {
-        if (!alertGroupsByGroup[a.escalation_group_id]) alertGroupsByGroup[a.escalation_group_id] = [];
-        alertGroupsByGroup[a.escalation_group_id].push({ id: a.id, name: a.name });
+      for (const a of alerts.rows) {
+        if (!alertsByGroup[a.escalation_group_id]) alertsByGroup[a.escalation_group_id] = [];
+        alertsByGroup[a.escalation_group_id].push({
+          id: a.id,
+          name: a.name,
+          category: a.category,
+          signal_code: a.signal_code,
+        });
       }
     }
 
     const result = groups.rows.map((g) => ({
       ...g,
       members: membersByGroup[g.id] || [],
-      alert_groups: alertGroupsByGroup[g.id] || [],
+      alerts: alertsByGroup[g.id] || [],
     }));
 
     sendSuccess(res, result, 'Escalation groups retrieved');
@@ -62,7 +67,7 @@ async function listEscalationGroups(req, res) {
 
 async function createEscalationGroup(req, res) {
   try {
-    const { name, cost_center_id, description = '', emails = [], alert_group_ids = [] } = req.body;
+    const { name, cost_center_id, description = '', emails = [], alert_definition_ids = [] } = req.body;
     if (!name) return sendError(res, 'name required', 400);
 
     const groupResult = await db.query(
@@ -73,7 +78,7 @@ async function createEscalationGroup(req, res) {
     const group = groupResult.rows[0];
 
     await insertMembers(group.id, emails);
-    await insertAlertGroups(group.id, alert_group_ids);
+    await insertAlertDefinitions(group.id, alert_definition_ids);
 
     const result = await fetchGroupWithRelations(group.id);
     sendSuccess(res, result, 'Escalation group created');
@@ -86,7 +91,7 @@ async function createEscalationGroup(req, res) {
 async function updateEscalationGroup(req, res) {
   try {
     const { id } = req.params;
-    const { name, cost_center_id, description, is_active, emails, alert_group_ids } = req.body;
+    const { name, cost_center_id, description, is_active, emails, alert_definition_ids } = req.body;
 
     const fields = [];
     const values = [];
@@ -103,14 +108,14 @@ async function updateEscalationGroup(req, res) {
       await db.query(`UPDATE escalation_groups SET ${fields.join(', ')} WHERE id = $${idx}`, values);
     }
 
-    // Replace members and linked alert groups if provided
+    // Replace members and linked alerts if provided
     if (Array.isArray(emails)) {
       await db.query('DELETE FROM escalation_group_members WHERE escalation_group_id = $1', [id]);
       await insertMembers(id, emails);
     }
-    if (Array.isArray(alert_group_ids)) {
+    if (Array.isArray(alert_definition_ids)) {
       await db.query('DELETE FROM escalation_group_alert_groups WHERE escalation_group_id = $1', [id]);
-      await insertAlertGroups(id, alert_group_ids);
+      await insertAlertDefinitions(id, alert_definition_ids);
     }
 
     const result = await fetchGroupWithRelations(id);
@@ -145,12 +150,12 @@ async function insertMembers(groupId, emails) {
   }
 }
 
-async function insertAlertGroups(groupId, alertGroupIds) {
-  const list = Array.isArray(alertGroupIds) ? alertGroupIds : [];
+async function insertAlertDefinitions(groupId, alertDefinitionIds) {
+  const list = Array.isArray(alertDefinitionIds) ? alertDefinitionIds : [];
   if (list.length > 0) {
     const placeholders = list.map((_, i) => `($1, $${i + 2})`).join(', ');
     await db.query(
-      `INSERT INTO escalation_group_alert_groups (escalation_group_id, alert_group_config_id) VALUES ${placeholders}
+      `INSERT INTO escalation_group_alert_groups (escalation_group_id, alert_definition_id) VALUES ${placeholders}
        ON CONFLICT DO NOTHING`,
       [groupId, ...list]
     );
@@ -166,26 +171,39 @@ async function fetchGroupWithRelations(id) {
      WHERE escalation_group_id = $1 ORDER BY email`,
     [id]
   );
-  const alertGroups = await db.query(
-    `SELECT agc.id, agc.name FROM escalation_group_alert_groups ega
-     JOIN alert_group_configs agc ON agc.id = ega.alert_group_config_id
-     WHERE ega.escalation_group_id = $1 ORDER BY agc.name`,
+  const alerts = await db.query(
+    `SELECT ad.id, ad.name, ad.category, ad.signal_code FROM escalation_group_alert_groups ega
+     JOIN alert_definitions ad ON ad.id = ega.alert_definition_id
+     WHERE ega.escalation_group_id = $1 ORDER BY ad.name`,
     [id]
   );
 
   return {
     ...group.rows[0],
     members: members.rows,
-    alert_groups: alertGroups.rows,
+    alerts: alerts.rows,
   };
 }
 
-// ── Available alert groups for selection ──
+// ── Fuzzy search over alert definitions ──
 
-async function listAlertGroupsForSelection(req, res) {
+async function searchAlertDefinitions(req, res) {
   try {
-    const result = await db.query('SELECT id, name, severity FROM alert_group_configs ORDER BY name');
-    sendSuccess(res, result.rows, 'Alert groups retrieved');
+    const { search = '', limit = 15 } = req.query;
+    const q = `%${String(search).trim()}%`;
+    const result = await db.query(
+      `SELECT id, name, category, signal_code, description
+         FROM alert_definitions
+        WHERE name ILIKE $1 OR signal_code ILIKE $1 OR description ILIKE $1
+        ORDER BY CASE
+          WHEN name ILIKE $2 THEN 0
+          WHEN name ILIKE $1 THEN 1
+          ELSE 2
+        END, name
+        LIMIT $3`,
+      [q, `${String(search).trim()}%`, Number(limit) || 15]
+    );
+    sendSuccess(res, result.rows, 'Alert definitions retrieved');
   } catch (error) {
     sendError(res, error.message, 500);
   }
@@ -196,5 +214,5 @@ module.exports = {
   createEscalationGroup,
   updateEscalationGroup,
   deleteEscalationGroup,
-  listAlertGroupsForSelection,
+  searchAlertDefinitions,
 };
