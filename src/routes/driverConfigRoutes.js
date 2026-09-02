@@ -9,14 +9,27 @@ router.get('/criteria', async (req, res) => {
     const { cost_center_id } = req.query;
     let result;
     if (cost_center_id) {
-      // Return both global defaults and cost-center-specific configs for this CC
-      const ccId = Number(cost_center_id);
-      result = await db.query(
-        `SELECT * FROM driver_config_criteria
-         WHERE cost_center_id IS NULL OR cost_center_id = $1
-         ORDER BY cost_center_id IS NOT NULL, name ASC`,
-        [ccId]
-      );
+      // Support comma-separated IDs: "1,2,3"
+      const ccIds = cost_center_id.split(',').map(Number).filter(n => !isNaN(n));
+      if (ccIds.length === 1) {
+        result = await db.query(
+          `SELECT * FROM driver_config_criteria
+           WHERE cost_center_id IS NULL OR cost_center_id = $1
+           ORDER BY cost_center_id IS NOT NULL, name ASC`,
+          [ccIds[0]]
+        );
+      } else if (ccIds.length > 1) {
+        result = await db.query(
+          `SELECT * FROM driver_config_criteria
+           WHERE cost_center_id IS NULL OR cost_center_id = ANY($1::int[])
+           ORDER BY cost_center_id IS NOT NULL, name ASC`,
+          [ccIds]
+        );
+      } else {
+        result = await db.query(
+          'SELECT * FROM driver_config_criteria WHERE cost_center_id IS NULL ORDER BY name ASC'
+        );
+      }
     } else {
       result = await db.query(
         'SELECT * FROM driver_config_criteria WHERE cost_center_id IS NULL ORDER BY name ASC'
