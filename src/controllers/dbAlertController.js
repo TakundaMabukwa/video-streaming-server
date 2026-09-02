@@ -142,13 +142,24 @@ async function getActiveAlerts(req, res) {
     const ccIds = [...new Set([...deviceCC.values()])];
     const perCCMaps = await getPerCCSeverityMaps(ccIds);
 
-    const alerts = groups.map((g) => {
-      const ccId = deviceCC.get(g.device_id);
-      const severityMap = (ccId && perCCMaps[ccId]) || perCCMaps[0] || {};
-      const t = transformDbAlert(g, severityMap);
-      t.count = g.count || 1;
-      return t;
-    });
+    const alerts = groups
+      .filter((g) => {
+        // For telematics alerts, only include those whose alarm_type is defined
+        // in alert_definitions for the vehicle's cost center.
+        if (g.source_type === 'telematics') {
+          const ccId = deviceCC.get(g.device_id);
+          const severityMap = (ccId && perCCMaps[ccId]) || perCCMaps[0] || {};
+          if (!severityMap[g.alarm_type]) return false;
+        }
+        return true;
+      })
+      .map((g) => {
+        const ccId = deviceCC.get(g.device_id);
+        const severityMap = (ccId && perCCMaps[ccId]) || perCCMaps[0] || {};
+        const t = transformDbAlert(g, severityMap);
+        t.count = g.count || 1;
+        return t;
+      });
 
     res.json({ success: true, alerts, count: alerts.length, total: alerts.length, source: 'eps-db' });
   } catch (error) {
@@ -165,11 +176,20 @@ async function getResolvedAlerts(req, res) {
     const ccIds = [...new Set([...deviceCC.values()])];
     const perCCMaps = await getPerCCSeverityMaps(ccIds);
 
-    const alerts = groups.map((g) => {
-      const ccId = deviceCC.get(g.device_id);
-      const severityMap = (ccId && perCCMaps[ccId]) || perCCMaps[0] || {};
-      return transformDbAlert(g, severityMap);
-    });
+    const alerts = groups
+      .filter((g) => {
+        if (g.source_type === 'telematics') {
+          const ccId = deviceCC.get(g.device_id);
+          const severityMap = (ccId && perCCMaps[ccId]) || perCCMaps[0] || {};
+          if (!severityMap[g.alarm_type]) return false;
+        }
+        return true;
+      })
+      .map((g) => {
+        const ccId = deviceCC.get(g.device_id);
+        const severityMap = (ccId && perCCMaps[ccId]) || perCCMaps[0] || {};
+        return transformDbAlert(g, severityMap);
+      });
 
     res.json({ success: true, alerts, count: alerts.length, total: alerts.length, source: 'eps-db' });
   } catch (error) {
@@ -186,11 +206,20 @@ async function getActiveAlertsAll(req, res) {
     const ccIds = [...new Set([...deviceCC.values()])];
     const perCCMaps = await getPerCCSeverityMaps(ccIds);
 
-    const alerts = groups.map((g) => {
-      const ccId = deviceCC.get(g.device_id);
-      const severityMap = (ccId && perCCMaps[ccId]) || perCCMaps[0] || {};
-      return transformDbAlert(g, severityMap);
-    });
+    const alerts = groups
+      .filter((g) => {
+        if (g.source_type === 'telematics') {
+          const ccId = deviceCC.get(g.device_id);
+          const severityMap = (ccId && perCCMaps[ccId]) || perCCMaps[0] || {};
+          if (!severityMap[g.alarm_type]) return false;
+        }
+        return true;
+      })
+      .map((g) => {
+        const ccId = deviceCC.get(g.device_id);
+        const severityMap = (ccId && perCCMaps[ccId]) || perCCMaps[0] || {};
+        return transformDbAlert(g, severityMap);
+      });
 
     res.json({ success: true, alerts, count: alerts.length, total: alerts.length, source: 'eps-db' });
   } catch (error) {

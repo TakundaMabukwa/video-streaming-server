@@ -599,6 +599,13 @@ async function syncGeotabEvents() {
         }
 
         try {
+          // Only create alert/alert_group if this signal_code is defined in alert_definitions
+          // for the vehicle's cost center. Telematics events not in alert_definitions are
+          // still stored in telematics_events (for raw data) but don't create dashboard alerts.
+          if (!telematicsSeverityMap[telematicsSignalCode]) {
+            continue;
+          }
+
           const alertId = `tel-${geotabDeviceId}-${Date.now()}-${inserted}`;
           const deviceName = fleetNumber ? `${fleetNumber}${licensePlate ? ' - ' + licensePlate : ''}` : geotabDeviceId;
 
