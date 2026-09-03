@@ -192,6 +192,28 @@ async function deleteDefinitionOverride(req, res) {
   }
 }
 
+// Delete ALL cost-center overrides for a definition — removes the alert from
+// every cost center's set at once (strict CC model: no global fallback for CC
+// vehicles, so the alert stops coming in everywhere except CC-less vehicles
+// served by the global definition, which is left intact).
+async function deleteAllDefinitionOverrides(req, res) {
+  try {
+    const { definition_id } = req.params;
+    const result = await db.query(
+      'DELETE FROM alert_definition_overrides WHERE alert_definition_id = $1',
+      [Number(definition_id)]
+    );
+    sendSuccess(
+      res,
+      { definition_id: Number(definition_id), removed: result.rowCount },
+      `Removed from ${result.rowCount} cost center set(s)`
+    );
+    invalidateCache();
+  } catch (error) {
+    sendError(res, error.message, 500);
+  }
+}
+
 // ── Alert Group Configs (base/global only) ──
 
 async function listAlertGroupConfigs(req, res) {
@@ -431,6 +453,7 @@ module.exports = {
   upsertDefinitionOverride,
   bulkUpsertDefinitionOverrides,
   deleteDefinitionOverride,
+  deleteAllDefinitionOverrides,
   listAlertGroupConfigs,
   createAlertGroupConfig,
   updateAlertGroupConfig,

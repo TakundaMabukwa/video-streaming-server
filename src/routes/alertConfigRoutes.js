@@ -7,6 +7,7 @@ const {
   upsertDefinitionOverride,
   bulkUpsertDefinitionOverrides,
   deleteDefinitionOverride,
+  deleteAllDefinitionOverrides,
   listAlertGroupConfigs,
   createAlertGroupConfig,
   updateAlertGroupConfig,
@@ -21,6 +22,7 @@ const router = express.Router();
 // Definition Overrides (CC-specific) — must come before /:id routes
 router.put('/definitions/:definition_id/overrides/bulk', bulkUpsertDefinitionOverrides);
 router.put('/definitions/:definition_id/overrides', upsertDefinitionOverride);
+router.delete('/definitions/:definition_id/overrides', deleteAllDefinitionOverrides);
 router.delete('/definitions/:definition_id/overrides/:cc_id', deleteDefinitionOverride);
 
 // Alert Definitions (base/global)
