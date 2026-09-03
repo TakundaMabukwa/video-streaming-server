@@ -104,8 +104,9 @@ async function updateAlertDefinition(req, res) {
 async function deleteAlertDefinition(req, res) {
   try {
     const { id } = req.params;
+    const purged = await purgeDefinitionAlertRows(id);
     await db.query('DELETE FROM alert_definitions WHERE id = $1', [id]);
-    sendSuccess(res, { id }, 'Alert definition deleted');
+    sendSuccess(res, { id, purged }, 'Alert definition deleted');
     invalidateCache();
   } catch (error) {
     sendError(res, error.message, 500);
@@ -192,6 +193,35 @@ async function deleteDefinitionOverride(req, res) {
   }
 }
 
+// Delete stored alert rows for a definition (exact name + signal_code matches
+// in alerts / alert_groups). Deletes BOTH resolved and unresolved rows — deleting
+// the alert type means the alert is no longer needed at all.
+// Executes atomically (all-or-nothing) to avoid partial purges.
+async function purgeDefinitionAlertRows(definitionId) {
+  const def = await db.query(
+    'SELECT name, signal_code FROM alert_definitions WHERE id = $1',
+    [Number(definitionId)]
+  );
+  if (def.rows.length === 0) return { alerts: 0, groups: 0 };
+  const types = [def.rows[0].name, def.rows[0].signal_code].filter(Boolean);
+  if (types.length === 0) return { alerts: 0, groups: 0 };
+
+  const client = await db.getClient();
+  try {
+    await client.query('BEGIN');
+    // alerts rows are deleted first so alert_groups.last_alert_id never dangles.
+    const a = await client.query('DELETE FROM alerts WHERE alarm_type = ANY($1::text[])', [types]);
+    const g = await client.query('DELETE FROM alert_groups WHERE alarm_type = ANY($1::text[])', [types]);
+    await client.query('COMMIT');
+    return { alerts: a.rowCount, groups: g.rowCount };
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
 // Delete ALL cost-center overrides for a definition — removes the alert from
 // every cost center's set at once (strict CC model: no global fallback for CC
 // vehicles, so the alert stops coming in everywhere except CC-less vehicles
@@ -199,14 +229,15 @@ async function deleteDefinitionOverride(req, res) {
 async function deleteAllDefinitionOverrides(req, res) {
   try {
     const { definition_id } = req.params;
+    const purged = await purgeDefinitionAlertRows(definition_id);
     const result = await db.query(
       'DELETE FROM alert_definition_overrides WHERE alert_definition_id = $1',
       [Number(definition_id)]
     );
     sendSuccess(
       res,
-      { definition_id: Number(definition_id), removed: result.rowCount },
-      `Removed from ${result.rowCount} cost center set(s)`
+      { definition_id: Number(definition_id), removed: result.rowCount, purged },
+      `Removed from ${result.rowCount} cost center set(s), purged ${purged.alerts} alert(s) / ${purged.groups} group(s)`
     );
     invalidateCache();
   } catch (error) {
