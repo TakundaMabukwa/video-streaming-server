@@ -801,6 +801,17 @@ const MIGRATIONS_SQL = `
   CREATE INDEX IF NOT EXISTS idx_repair_requests_fleet ON repair_requests(fleet_number);
   CREATE INDEX IF NOT EXISTS idx_repair_requests_status ON repair_requests(status);
   CREATE INDEX IF NOT EXISTS idx_repair_requests_ext_job ON repair_requests(external_job_number);
+
+  -- STRICT CC MODEL backfill: every alert definition belongs to every active
+  -- cost center's set unless explicitly removed. Inserts missing overrides,
+  -- copying the base severity/description. Idempotent (ON CONFLICT DO NOTHING),
+  -- never overwrites existing per-CC customizations.
+  INSERT INTO alert_definition_overrides (alert_definition_id, cost_center_id, severity, description, is_active)
+  SELECT d.id, cc.id, d.severity, d.description, NULL
+  FROM alert_definitions d
+  CROSS JOIN cost_centers cc
+  WHERE cc.is_active IS DISTINCT FROM false
+  ON CONFLICT (alert_definition_id, cost_center_id) DO NOTHING;
 `;
 
 async function initializeDatabase() {
