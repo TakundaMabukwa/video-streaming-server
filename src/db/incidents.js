@@ -82,8 +82,18 @@ async function upsertIncidentFromAlert({
       costCenterId,
       form.week || isoWeek(saveTime),
       form.shift || null,
-      form.incident_date || saveIso.slice(0, 10),
-      form.incident_time || saveIso.slice(11, 16),
+      form.incident_date || (() => {
+        // Convert UTC to SAST (UTC+2) for incident date
+        const d = new Date(saveTime);
+        d.setHours(d.getHours() + 2);
+        return d.toISOString().slice(0, 10);
+      })(),
+      form.incident_time || (() => {
+        // Convert UTC to SAST (UTC+2) for incident time
+        const d = new Date(saveTime);
+        d.setHours(d.getHours() + 2);
+        return d.toISOString().slice(11, 16);
+      })(),
       form.controller || null,
       form.driver_name || null,
       form.contact_number || null,

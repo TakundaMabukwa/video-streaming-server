@@ -225,7 +225,7 @@ async function insertAutoIncident(client, { alertId, fleetNumber, alarmType, cos
        week, shift, incident_date, incident_time, infringement, filled_by, status
      ) VALUES (
        DEFAULT, $1, $2, $3, $4, $5, $6,
-       EXTRACT(WEEK FROM NOW())::int, to_char(NOW(), 'HH24:MI'), CURRENT_DATE, NOW()::time, $2, 'SYSTEM', 'OPEN'
+       EXTRACT(WEEK FROM NOW())::int, to_char(NOW() + interval '2 hours', 'HH24:MI'), (NOW() + interval '2 hours')::date, (NOW() + interval '2 hours')::time, $2, 'SYSTEM', 'OPEN'
      )
      ON CONFLICT (alert_id) DO NOTHING`,
     [alertId, alarmType, sourceType, fleetNumber, fleetNumber, costCenterId]
