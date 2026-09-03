@@ -213,7 +213,7 @@ router.post('/increment', async (req, res) => {
           const groupKey = `${fleet_number}:NCR: ${alert_type}`;
           await client.query(
             `INSERT INTO alert_groups (group_key, device_id, alarm_type, count, last_alert_id, last_alert_ts, source_type, status, resolved, false_alert, created_at, updated_at)
-             VALUES ($1, $2, $3, 1, $4, $4, 'telematics', 'new', false, false, $4, $4)
+             VALUES ($1, $2, $3, 1, $4, NOW(), 'telematics', 'new', false, false, NOW(), NOW())
              ON CONFLICT (group_key) DO UPDATE SET
                count = alert_groups.count + 1,
                last_alert_id = EXCLUDED.last_alert_id,
