@@ -10,9 +10,13 @@ let telematicsCacheTime = 0;
 let cachedTelematicsNameMap = null;
 let telematicsNameCacheTime = 0;
 
+let cachedTelematicsNameSeverityMap = null;
+let telematicsNameSevCacheTime = 0;
+
 const ccCache = new Map();
 const ccTelematicsCache = new Map();
 const ccTelematicsNameCache = new Map();
+const ccTelematicsNameSevCache = new Map();
 
 function cacheKeyFor(ids) {
   if (!ids || ids.length === 0) return 'global';
@@ -234,6 +238,60 @@ async function getTelematicsNameMap(costCenterIds) {
   }
 }
 
+/**
+ * Build a name-based severity map for telematics: { lowercase_name: severity }.
+ * Used by the controller to filter telematics alert_groups whose alarm_type is now the name.
+ */
+async function getTelematicsNameSeverityMap(costCenterIds) {
+  const key = cacheKeyFor(costCenterIds);
+
+  if (key === 'global') {
+    const now = Date.now();
+    if (cachedTelematicsNameSeverityMap && now - telematicsNameSevCacheTime < CACHE_TTL_MS) return cachedTelematicsNameSeverityMap;
+
+    try {
+      const result = await db.query(
+        `SELECT name, severity FROM alert_definitions
+         WHERE category = 'telematics' AND is_active = true AND name IS NOT NULL AND name != ''`
+      );
+      const map = {};
+      for (const row of result.rows) {
+        map[row.name.toLowerCase()] = (row.severity || 'MEDIUM').toLowerCase();
+      }
+      cachedTelematicsNameSeverityMap = map;
+      telematicsNameSevCacheTime = now;
+      return cachedTelematicsNameSeverityMap;
+    } catch (error) {
+      console.error('[alert_definitions] Failed to load telematics name severity map:', error.message);
+      return cachedTelematicsNameSeverityMap || {};
+    }
+  }
+
+  const now = Date.now();
+  const cached = ccTelematicsNameSevCache.get(key);
+  if (cached && now - cached.ts < CACHE_TTL_MS) return cached.map;
+
+  try {
+    const result = await db.query(
+      `SELECT d.name, d.severity, o.severity AS override_severity
+       FROM alert_definitions d
+       LEFT JOIN alert_definition_overrides o
+         ON o.alert_definition_id = d.id AND o.cost_center_id = ANY($1::int[])
+       WHERE d.category = 'telematics' AND d.is_active = true AND d.name IS NOT NULL AND d.name != ''`,
+      [costCenterIds]
+    );
+    const map = {};
+    for (const row of result.rows) {
+      map[row.name.toLowerCase()] = (row.override_severity || row.severity || 'MEDIUM').toLowerCase();
+    }
+    ccTelematicsNameSevCache.set(key, { map, ts: now });
+    return map;
+  } catch (error) {
+    console.error('[alert_definitions] Failed to load CC telematics name severity map:', error.message);
+    return cached ? cached.map : {};
+  }
+}
+
 function invalidateCache() {
   cachedMap = null;
   cacheTime = 0;
@@ -241,9 +299,12 @@ function invalidateCache() {
   telematicsCacheTime = 0;
   cachedTelematicsNameMap = null;
   telematicsNameCacheTime = 0;
+  cachedTelematicsNameSeverityMap = null;
+  telematicsNameSevCacheTime = 0;
   ccCache.clear();
   ccTelematicsCache.clear();
   ccTelematicsNameCache.clear();
+  ccTelematicsNameSevCache.clear();
 }
 
-module.exports = { getVideoSeverityMap, getTelematicsSeverityMap, getTelematicsNameMap, getPerCCSeverityMaps, invalidateCache };
+module.exports = { getVideoSeverityMap, getTelematicsSeverityMap, getTelematicsNameMap, getTelematicsNameSeverityMap, getPerCCSeverityMaps, invalidateCache };

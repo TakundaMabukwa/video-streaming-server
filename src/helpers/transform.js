@@ -33,7 +33,8 @@ function toTitle(str) {
  */
 function transformDbAlert(record, severityMap) {
   const alarmType = record.alarm_type || '';
-  const priority = (severityMap && severityMap[alarmType]) || PRIORITY_MAP[alarmType] || 'medium';
+  const alarmKey = alarmType.toLowerCase();
+  const priority = (severityMap && severityMap[alarmKey]) || PRIORITY_MAP[alarmType] || 'medium';
   const documents = Array.isArray(record.documents) ? record.documents : [];
   const ts = record.last_alert_ts || record.alarm_ts;
   const id = record.last_alert_id || record.id;

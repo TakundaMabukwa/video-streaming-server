@@ -608,7 +608,7 @@ async function syncGeotabEvents() {
             id: alertId,
             deviceId: geotabDeviceId,
             deviceName,
-            alarmType: matchedDef.signalCode,
+            alarmType: matchedDef.name,
             alarmTs: eventTime,
             lat: evtLat,
             lon: evtLon,
@@ -619,7 +619,7 @@ async function syncGeotabEvents() {
           await db.upsertAlertGroup({
             deviceId: geotabDeviceId,
             deviceName,
-            alarmType: matchedDef.signalCode,
+            alarmType: matchedDef.name,
             alarmText: `${eventName}${zoneNameFromEvent ? ' in zone ' + zoneNameFromEvent : ''}`,
             alertId,
             alarmTs: eventTime,
@@ -627,7 +627,7 @@ async function syncGeotabEvents() {
             lon: evtLon,
             sourceType: 'telematics',
           });
-          console.log(`[GEOTAB] Telematics alert created: ${alertId} (${matchedDef.signalCode}) for device ${geotabDeviceId}`);
+          console.log(`[GEOTAB] Telematics alert created: ${alertId} (${matchedDef.name}) for device ${geotabDeviceId}`);
         } catch (alertErr) {
           console.error('[GEOTAB] Failed to create telematics alert:', alertErr.message, alertErr.stack);
         }
