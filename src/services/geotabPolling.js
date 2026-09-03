@@ -1,7 +1,7 @@
 const db = require('../db');
 const https = require('https');
 const { fetchVehiclesFromSupabase } = require('../helpers/supabaseClient');
-const { getTelematicsSeverityMap } = require('../db/alert_definitions');
+const { getTelematicsNameMap } = require('../db/alert_definitions');
 const { processAlertDeduction } = require('./driverScoringService');
 
 const GEOTAB_URL = 'https://my.geotab.com/apiv1';
@@ -567,16 +567,14 @@ async function syncGeotabEvents() {
         }
 
         // Also store as alert in alerts + alert_groups tables (telematics source)
-        // Resolve the telematics signal_code + severity map from alert_definitions (CC-aware)
+        // Dynamically match the Geotab event name against alert_definitions.name
         const { findVehicleCostCenterId } = require('./costCenterLookup');
         const eventCC = await findVehicleCostCenterId(fleetNumber || geotabDeviceId).catch(() => null);
-        const telematicsSeverityMap = await getTelematicsSeverityMap(eventCC ? [eventCC] : []).catch(() => ({}));
-        const telematicsSignalCode = mapEventToSignalCode(eventName || '');
+        const telematicsNameMap = await getTelematicsNameMap(eventCC ? [eventCC] : []).catch(() => ({}));
+        const matchedDef = matchAlertDefinition(eventName || '', telematicsNameMap);
 
-        // Gate the real-time broadcast: only push telematics events whose signal_code is
-        // defined in alert_definitions for the vehicle's cost center (e.g. no-go/high-risk
-        // are seeded; everything else is suppressed unless explicitly defined).
-        if (wsBroadcast && insertResult.rows.length > 0 && telematicsSeverityMap[telematicsSignalCode]) {
+        // Gate: only push telematics events that match an active alert_definition
+        if (wsBroadcast && insertResult.rows.length > 0 && matchedDef) {
           const row = insertResult.rows[0];
           wsBroadcast('new_event', {
             id: row.id,
@@ -585,7 +583,7 @@ async function syncGeotabEvents() {
             licensePlate,
             eventType: eventName,
             eventCode,
-            severity,
+            severity: matchedDef.severity.toUpperCase(),
             latitude: evtLat,
             longitude: evtLon,
             speed: evtSpeed,
@@ -599,22 +597,18 @@ async function syncGeotabEvents() {
         }
 
         try {
-          // Only create alert/alert_group if this signal_code is defined in alert_definitions
-          // for the vehicle's cost center. Telematics events not in alert_definitions are
-          // still stored in telematics_events (for raw data) but don't create dashboard alerts.
-          if (!telematicsSeverityMap[telematicsSignalCode]) {
+          if (!matchedDef) {
             continue;
           }
 
           const alertId = `tel-${geotabDeviceId}-${Date.now()}-${inserted}`;
           const deviceName = fleetNumber ? `${fleetNumber}${licensePlate ? ' - ' + licensePlate : ''}` : geotabDeviceId;
 
-          // Insert into alerts table
           await db.upsertAlert({
             id: alertId,
             deviceId: geotabDeviceId,
             deviceName,
-            alarmType: telematicsSignalCode,
+            alarmType: matchedDef.signalCode,
             alarmTs: eventTime,
             lat: evtLat,
             lon: evtLon,
@@ -622,11 +616,10 @@ async function syncGeotabEvents() {
             sourceType: 'telematics',
           });
 
-          // Upsert into alert_groups
           await db.upsertAlertGroup({
             deviceId: geotabDeviceId,
             deviceName,
-            alarmType: telematicsSignalCode,
+            alarmType: matchedDef.signalCode,
             alarmText: `${eventName}${zoneNameFromEvent ? ' in zone ' + zoneNameFromEvent : ''}`,
             alertId,
             alarmTs: eventTime,
@@ -634,7 +627,7 @@ async function syncGeotabEvents() {
             lon: evtLon,
             sourceType: 'telematics',
           });
-          console.log(`[GEOTAB] Telematics alert created: ${alertId} (${telematicsSignalCode}) for device ${geotabDeviceId}`);
+          console.log(`[GEOTAB] Telematics alert created: ${alertId} (${matchedDef.signalCode}) for device ${geotabDeviceId}`);
         } catch (alertErr) {
           console.error('[GEOTAB] Failed to create telematics alert:', alertErr.message, alertErr.stack);
         }
@@ -660,21 +653,29 @@ let wsBroadcast = null;
 function setWsBroadcast(fn) { wsBroadcast = fn; }
 
 // Map a raw Geotab exception event name to a telematics alert_definitions signal_code
-function mapEventToSignalCode(eventName) {
-  const eventLower = (eventName || '').toLowerCase();
-  if (eventLower.includes('speed')) return 'speeding';
-  if (eventLower.includes('braking') || eventLower.includes('harsh')) return 'harshBraking';
-  if (eventLower.includes('cornering')) return 'harshCornering';
-  if (eventLower.includes('acceleration') || eventLower.includes('rapid')) return 'rapidAcceleration';
-  if (eventLower.includes('no go') || eventLower.includes('nogo')) return 'noGoZoneEntry';
-  if (eventLower.includes('high risk') || eventLower.includes('highrisk')) return 'highRiskZoneEntry';
-  if (eventLower.includes('zone') || eventLower.includes('fence')) return 'zoneBreach';
-  if (eventLower.includes('idle')) return 'idling';
-  if (eventLower.includes('tow')) return 'tow';
-  if (eventLower.includes('battery')) return 'batteryLow';
-  if (eventLower.includes('remov') || eventLower.includes('tamper')) return 'deviceRemoved';
-  if (eventLower.includes('seatbelt')) return 'seatBelt';
-  return 'exceptionEvent';
+/**
+ * Match an incoming Geotab event name against alert_definitions.name dynamically.
+ * Tries exact match first, then partial (substring) match.
+ * Returns { signalCode, severity } or null if no match.
+ */
+function matchAlertDefinition(eventName, nameMap) {
+  const eventLower = (eventName || '').trim().toLowerCase();
+  if (!eventLower) return null;
+
+  // 1. Exact match
+  if (nameMap[eventLower]) return nameMap[eventLower];
+
+  // 2. DB name is contained in event name (e.g. "driver fatigue" in "Driver Fatigue 3h (Low)")
+  for (const [dbName, def] of Object.entries(nameMap)) {
+    if (eventLower.includes(dbName)) return def;
+  }
+
+  // 3. Event name is contained in DB name
+  for (const [dbName, def] of Object.entries(nameMap)) {
+    if (dbName.includes(eventLower)) return def;
+  }
+
+  return null;
 }
 
 // ── Point-in-polygon test (ray casting) ──
