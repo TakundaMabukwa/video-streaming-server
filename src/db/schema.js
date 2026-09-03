@@ -756,6 +756,23 @@ const MIGRATIONS_SQL = `
     PRIMARY KEY (escalation_group_id, alert_definition_id)
   );
   CREATE INDEX IF NOT EXISTS idx_escalation_alertgroups_grp ON escalation_group_alert_groups(escalation_group_id);
+
+  -- Repair requests
+  CREATE TABLE IF NOT EXISTS repair_requests (
+    id SERIAL PRIMARY KEY,
+    alert_id TEXT,
+    fleet_number TEXT,
+    registration TEXT,
+    device_id TEXT,
+    cost_center_id INTEGER,
+    status TEXT DEFAULT 'pending',
+    notes TEXT,
+    created_by TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  );
+  CREATE INDEX IF NOT EXISTS idx_repair_requests_fleet ON repair_requests(fleet_number);
+  CREATE INDEX IF NOT EXISTS idx_repair_requests_status ON repair_requests(status);
 `;
 
 async function initializeDatabase() {
