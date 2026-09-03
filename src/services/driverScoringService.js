@@ -125,7 +125,7 @@ async function processAlertDeduction(fleet_number, alert_type) {
         const now = new Date().toISOString();
         await client.query(
           `INSERT INTO alerts (id, device_id, alarm_type, alarm_ts, source_type, status, resolved, false_alert, notes, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, 'telematics', 'new', false, false, $5, $4, $4)
+           VALUES ($1, $2, $3, $4, 'telematics', 'new', false, false, $5, NOW(), NOW())
            ON CONFLICT (id) DO NOTHING`,
           [ncrId, fleet_number, `NCR: ${alert_type}`, now, `Auto-generated NCR after ${alertEntry.count} ${alert_type} alerts`]
         );
