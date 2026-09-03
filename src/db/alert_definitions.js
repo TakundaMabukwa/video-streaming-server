@@ -251,12 +251,14 @@ async function getTelematicsNameSeverityMap(costCenterIds) {
 
     try {
       const result = await db.query(
-        `SELECT name, severity FROM alert_definitions
+        `SELECT name, signal_code, severity FROM alert_definitions
          WHERE category = 'telematics' AND is_active = true AND name IS NOT NULL AND name != ''`
       );
       const map = {};
       for (const row of result.rows) {
-        map[row.name.toLowerCase()] = (row.severity || 'MEDIUM').toLowerCase();
+        const sev = (row.severity || 'MEDIUM').toLowerCase();
+        map[row.name.toLowerCase()] = sev;
+        if (row.signal_code) map[row.signal_code.toLowerCase()] = sev;
       }
       cachedTelematicsNameSeverityMap = map;
       telematicsNameSevCacheTime = now;
@@ -273,7 +275,7 @@ async function getTelematicsNameSeverityMap(costCenterIds) {
 
   try {
     const result = await db.query(
-      `SELECT d.name, d.severity, o.severity AS override_severity
+      `SELECT d.name, d.signal_code, d.severity, o.severity AS override_severity
        FROM alert_definitions d
        LEFT JOIN alert_definition_overrides o
          ON o.alert_definition_id = d.id AND o.cost_center_id = ANY($1::int[])
@@ -282,7 +284,9 @@ async function getTelematicsNameSeverityMap(costCenterIds) {
     );
     const map = {};
     for (const row of result.rows) {
-      map[row.name.toLowerCase()] = (row.override_severity || row.severity || 'MEDIUM').toLowerCase();
+      const sev = (row.override_severity || row.severity || 'MEDIUM').toLowerCase();
+      map[row.name.toLowerCase()] = sev;
+      if (row.signal_code) map[row.signal_code.toLowerCase()] = sev;
     }
     ccTelematicsNameSevCache.set(key, { map, ts: now });
     return map;
