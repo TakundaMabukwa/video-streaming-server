@@ -1,17 +1,97 @@
 const express = require('express');
 const router = express.Router();
 const { query } = require('../db');
+const { createSolfloJob, getConfig } = require('../services/solfloJobs');
 
-// POST /api/repair-requests - Create a repair request
+function formatSAST(iso) {
+  try {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return String(iso || '');
+    const parts = new Intl.DateTimeFormat('en-ZA', {
+      timeZone: 'Africa/Johannesburg',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    }).format(d);
+    return `${parts} SAST`;
+  } catch {
+    return String(iso || '');
+  }
+}
+
+// POST /api/repair-requests - Create a repair request + forward to Solflo job cards
 router.post('/', async (req, res) => {
   try {
-    const { alert_id, fleet_number, registration, device_id, cost_center_id, notes, created_by } = req.body || {};
+    const {
+      alert_id, fleet_number, registration, device_id, cost_center_id, notes, created_by,
+      contact_name, contact_phone, contact_email, available_at, issue_description, priority, account_code,
+    } = req.body || {};
+
+    const fleet = String(fleet_number || '').trim();
+    if (!fleet) return res.status(400).json({ success: false, message: 'fleet_number is required' });
+    if (!String(contact_name || '').trim()) return res.status(400).json({ success: false, message: 'contact_name is required' });
+    if (!String(contact_phone || '').trim()) return res.status(400).json({ success: false, message: 'contact_phone is required' });
+    if (!String(contact_email || '').trim()) return res.status(400).json({ success: false, message: 'contact_email is required' });
+    if (!available_at) return res.status(400).json({ success: false, message: 'available_at is required' });
+    if (!String(issue_description || '').trim()) return res.status(400).json({ success: false, message: 'issue_description is required' });
+
+    const prio = ['low', 'medium', 'high'].includes(String(priority || '').toLowerCase())
+      ? String(priority).toLowerCase()
+      : 'medium';
+    const { defaultAccountCode } = getConfig();
+    const acct = String(account_code || defaultAccountCode || 'SRS-0001').trim();
+
+    const jobDescription = [
+      String(issue_description).trim(),
+      `Alert: ${(req.body.alarm_type || req.body.alarmType || '').toString().trim() || 'N/A'} (${fleet} / ${String(registration || '').trim() || 'N/A'})`,
+      `Contact: ${String(contact_name).trim()} - ${String(contact_phone).trim()} - ${String(contact_email).trim()}`,
+      `Vehicle available: ${formatSAST(available_at)}`,
+      `Requested by: ${String(created_by || 'SRS user').trim()} via SRS alerts`,
+    ].join('\n');
+
+    let external = null;
+    let externalError = null;
+    try {
+      external = await createSolfloJob({
+        vehicle_reg: fleet,
+        job_description: jobDescription,
+        priority: prio,
+        account_code: acct,
+      });
+    } catch (err) {
+      externalError = err;
+      console.error('[RepairRequests] Solflo create failed:', err.message);
+    }
+
+    const externalJob = external?.job || null;
     const result = await query(
-      `INSERT INTO repair_requests (alert_id, fleet_number, registration, device_id, cost_center_id, notes, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
-      [alert_id || null, fleet_number || null, registration || null, device_id || null, cost_center_id || null, notes || null, created_by || null]
+      `INSERT INTO repair_requests (alert_id, fleet_number, registration, device_id, cost_center_id, notes, created_by,
+        contact_name, contact_phone, contact_email, available_at, issue_description, job_description, priority, account_code,
+        external_job_number, external_job_type, external_status, external_response)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::timestamptz,$12,$13,$14,$15,$16,$17,$18,$19::jsonb) RETURNING *`,
+      [
+        alert_id || null, fleet, registration || null, device_id || null, cost_center_id || null,
+        notes || null, created_by || null,
+        String(contact_name).trim(), String(contact_phone).trim(), String(contact_email).trim(),
+        available_at, String(issue_description).trim(), jobDescription, prio, acct,
+        externalJob?.job_number || null, external?.job_type || null,
+        external ? 'created' : 'failed',
+        JSON.stringify(external || { error: externalError?.message || 'unknown' }),
+      ]
     );
-    res.json({ success: true, repair: result.rows[0] });
+
+    if (!external) {
+      return res.status(502).json({
+        success: false,
+        message: 'Failed to log job. Contact monique@soltrack.co.za',
+        repair: result.rows[0],
+        error: externalError?.message || 'Solflo create failed',
+      });
+    }
+    res.json({ success: true, repair: result.rows[0], job: externalJob, job_type: external?.job_type || null });
   } catch (err) {
     console.error('[RepairRequests] Create error:', err.message);
     res.status(500).json({ success: false, message: err.message });

@@ -757,6 +757,21 @@ const MIGRATIONS_SQL = `
   );
   CREATE INDEX IF NOT EXISTS idx_escalation_alertgroups_grp ON escalation_group_alert_groups(escalation_group_id);
 
+  -- Repair requests: Solflo external job integration columns
+  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS contact_name TEXT;
+  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS contact_phone TEXT;
+  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS contact_email TEXT;
+  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS available_at TIMESTAMPTZ;
+  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS issue_description TEXT;
+  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS job_description TEXT;
+  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS priority TEXT DEFAULT 'medium';
+  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS account_code TEXT DEFAULT 'SRS-0001';
+  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS external_job_number TEXT;
+  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS external_job_type TEXT;
+  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS external_status TEXT DEFAULT 'pending';
+  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS external_response JSONB DEFAULT '{}'::jsonb;
+  CREATE INDEX IF NOT EXISTS idx_repair_requests_ext_job ON repair_requests(external_job_number);
+
   -- Repair requests
   CREATE TABLE IF NOT EXISTS repair_requests (
     id SERIAL PRIMARY KEY,
@@ -768,11 +783,24 @@ const MIGRATIONS_SQL = `
     status TEXT DEFAULT 'pending',
     notes TEXT,
     created_by TEXT,
+    contact_name TEXT,
+    contact_phone TEXT,
+    contact_email TEXT,
+    available_at TIMESTAMPTZ,
+    issue_description TEXT,
+    job_description TEXT,
+    priority TEXT DEFAULT 'medium',
+    account_code TEXT DEFAULT 'SRS-0001',
+    external_job_number TEXT,
+    external_job_type TEXT,
+    external_status TEXT DEFAULT 'pending',
+    external_response JSONB DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
   );
   CREATE INDEX IF NOT EXISTS idx_repair_requests_fleet ON repair_requests(fleet_number);
   CREATE INDEX IF NOT EXISTS idx_repair_requests_status ON repair_requests(status);
+  CREATE INDEX IF NOT EXISTS idx_repair_requests_ext_job ON repair_requests(external_job_number);
 `;
 
 async function initializeDatabase() {
