@@ -1,5 +1,7 @@
 const apiClient = require('../helpers/apiClient');
 const db = require('../db');
+const { getVideoSeverityMap } = require('../db/alert_definitions');
+const { resolveFleetNumber, findVehicleCostCenterId } = require('./costCenterLookup');
 
 let syncState = {
   isRunning: false,
@@ -284,6 +286,41 @@ async function fetchReplayUrl(deviceId, channelId, startTime, endTime) {
   return null;
 }
 
+async function gateVideoRecordsByCostCenter(records) {
+  const byDevice = new Map();
+  for (const r of records) {
+    const did = r.deviceId || '';
+    if (!byDevice.has(did)) byDevice.set(did, []);
+    byDevice.get(did).push(r);
+  }
+
+  const globalVideoMap = await getVideoSeverityMap([]).catch(() => ({}));
+  const ccVideoMaps = {};
+  const kept = [];
+  let gatedOut = 0;
+
+  await Promise.all([...byDevice.entries()].map(async ([did, recs]) => {
+    let allowed = globalVideoMap;
+    try {
+      const fleet = await resolveFleetNumber({ deviceId: did, vehicleRegistration: recs[0]?.deviceName }).catch(() => null);
+      const ccId = fleet ? await findVehicleCostCenterId(fleet).catch(() => null) : null;
+      if (ccId) {
+        if (!ccVideoMaps[ccId]) ccVideoMaps[ccId] = await getVideoSeverityMap([ccId]).catch(() => ({}));
+        allowed = ccVideoMaps[ccId];
+      }
+    } catch { /* fall back to global map */ }
+    for (const r of recs) {
+      if (allowed[String(r.alarmType || '').toLowerCase()]) kept.push(r);
+      else gatedOut++;
+    }
+  }));
+
+  if (gatedOut > 0) {
+    console.log(`[SYNC] Gated out ${gatedOut} video alert(s) not in device cost-center set`);
+  }
+  return kept;
+}
+
 async function syncAlerts(deviceIds, startTime, endTime) {
   let pageIndex = 1;
   let hasMore = true;
@@ -308,7 +345,19 @@ async function syncAlerts(deviceIds, startTime, endTime) {
 
     const ids = records.map(r => r.id);
     const existsMap = await db.batchAlertExists(ids);
-    const newRecords = records.filter(r => !existsMap[r.id]);
+    let newRecords = records.filter(r => !existsMap[r.id]);
+
+    // STRICT CC GATE: only store video alerts whose signal code is in the
+    // device's cost-center set (CC vehicles), or in the global set (CC-less
+    // vehicles). Alerts not configured for that cost center are dropped here
+    // and never reach alerts / alert_groups.
+    if (newRecords.length > 0) {
+      try {
+        newRecords = await gateVideoRecordsByCostCenter(newRecords);
+      } catch (gateErr) {
+        console.error('[SYNC] CC gate error (storing unfiltered):', gateErr.message);
+      }
+    }
 
     if (newRecords.length > 0) {
       emptyPageCount = 0;

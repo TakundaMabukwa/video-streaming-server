@@ -3,9 +3,49 @@ const syncService = require('../services/syncService');
 const { sendSuccess, sendError } = require('../helpers/response');
 const { uploadDocument } = require('../helpers/storage');
 const { transformDbAlert } = require('../helpers/transform');
-const { getVideoSeverityMap, getTelematicsNameSeverityMap, getPerCCSeverityMaps } = require('../db/alert_definitions');
+const { getTelematicsNameSeverityMap, getPerCCSeverityMaps } = require('../db/alert_definitions');
 const { findVehicleCostCenterId, resolveFleetNumber } = require('../services/costCenterLookup');
 const { applyNcrDeduction } = require('../services/driverScoringService');
+
+/**
+ * STRICT COST-CENTER ALERT RULE.
+ * Builds the per-device filter + severity lookup for a batch of alert groups:
+ * - Device belongs to cost center(s) → ONLY that CC's explicitly-added alert
+ *   definitions apply. No global fallback, ever.
+ * - Device matches no cost center → active GLOBAL definitions apply.
+ * - `NCR:` rows always pass (system-generated from already-gated alerts).
+ */
+async function buildStrictAlertFilter(deviceCC) {
+  const ccIds = [...new Set([...deviceCC.values()])];
+  const perCCMaps = await getPerCCSeverityMaps(ccIds);
+  const globalTelNameMap = await getTelematicsNameSeverityMap([]).catch(() => ({}));
+  const telNameMapByCC = {};
+  for (const cc of ccIds) {
+    telNameMapByCC[cc] = await getTelematicsNameSeverityMap([cc]).catch(() => ({}));
+  }
+
+  const passes = (g) => {
+    if (String(g.alarm_type || '').startsWith('NCR:')) return true;
+    const ccId = deviceCC.get(g.device_id);
+    const alarmKey = (g.alarm_type || '').toLowerCase();
+    if (g.source_type === 'telematics') {
+      const nameMap = ccId ? (telNameMapByCC[ccId] || {}) : globalTelNameMap;
+      return !!nameMap[alarmKey];
+    }
+    const sigMap = ccId ? (perCCMaps[ccId] || {}) : (perCCMaps[0] || {});
+    return !!sigMap[alarmKey];
+  };
+
+  const severityFor = (g) => {
+    const ccId = deviceCC.get(g.device_id);
+    if (g.source_type === 'telematics') {
+      return ccId ? (telNameMapByCC[ccId] || {}) : globalTelNameMap;
+    }
+    return ccId ? (perCCMaps[ccId] || {}) : (perCCMaps[0] || {});
+  };
+
+  return { passes, severityFor };
+}
 
 async function batchResolveDeviceCC(alertGroups) {
   const deviceIds = [...new Set(alertGroups.map(g => g.device_id).filter(Boolean))];
@@ -139,33 +179,12 @@ async function getActiveAlerts(req, res) {
     const groups = await db.getActiveAlertGroupsWithMedia({ limit });
 
     const { deviceCC } = await batchResolveDeviceCC(groups);
-    const ccIds = [...new Set([...deviceCC.values()])];
-    const perCCMaps = await getPerCCSeverityMaps(ccIds);
-    const globalTelNameMap = await getTelematicsNameSeverityMap([]).catch(() => ({}));
-    const telNameMapByCC = {};
-    for (const cc of ccIds) {
-      telNameMapByCC[cc] = await getTelematicsNameSeverityMap([cc]).catch(() => globalTelNameMap);
-    }
+    const { passes, severityFor } = await buildStrictAlertFilter(deviceCC);
 
     const alerts = groups
-      .filter((g) => {
-        if (g.source_type === 'telematics') {
-          const ccId = deviceCC.get(g.device_id);
-          const nameMap = (ccId && telNameMapByCC[ccId]) || globalTelNameMap;
-          const alarmKey = (g.alarm_type || '').toLowerCase();
-          if (!nameMap[alarmKey]) return false;
-        }
-        return true;
-      })
+      .filter((g) => passes(g))
       .map((g) => {
-        const ccId = deviceCC.get(g.device_id);
-        let severityMap;
-        if (g.source_type === 'telematics') {
-          severityMap = (ccId && telNameMapByCC[ccId]) || globalTelNameMap;
-        } else {
-          severityMap = (ccId && perCCMaps[ccId]) || perCCMaps[0] || {};
-        }
-        const t = transformDbAlert(g, severityMap);
+        const t = transformDbAlert(g, severityFor(g));
         t.count = g.count || 1;
         return t;
       });
@@ -182,33 +201,14 @@ async function getResolvedAlerts(req, res) {
     const groups = await db.getResolvedAlertGroupsWithMedia({ limit });
 
     const { deviceCC } = await batchResolveDeviceCC(groups);
-    const ccIds = [...new Set([...deviceCC.values()])];
-    const perCCMaps = await getPerCCSeverityMaps(ccIds);
-    const globalTelNameMap = await getTelematicsNameSeverityMap([]).catch(() => ({}));
-    const telNameMapByCC = {};
-    for (const cc of ccIds) {
-      telNameMapByCC[cc] = await getTelematicsNameSeverityMap([cc]).catch(() => globalTelNameMap);
-    }
+    const { passes, severityFor } = await buildStrictAlertFilter(deviceCC);
 
     const alerts = groups
-      .filter((g) => {
-        if (g.source_type === 'telematics') {
-          const ccId = deviceCC.get(g.device_id);
-          const nameMap = (ccId && telNameMapByCC[ccId]) || globalTelNameMap;
-          const alarmKey = (g.alarm_type || '').toLowerCase();
-          if (!nameMap[alarmKey]) return false;
-        }
-        return true;
-      })
+      .filter((g) => passes(g))
       .map((g) => {
-        const ccId = deviceCC.get(g.device_id);
-        let severityMap;
-        if (g.source_type === 'telematics') {
-          severityMap = (ccId && telNameMapByCC[ccId]) || globalTelNameMap;
-        } else {
-          severityMap = (ccId && perCCMaps[ccId]) || perCCMaps[0] || {};
-        }
-        return transformDbAlert(g, severityMap);
+        const t = transformDbAlert(g, severityFor(g));
+        t.count = g.count || 1;
+        return t;
       });
 
     res.json({ success: true, alerts, count: alerts.length, total: alerts.length, source: 'eps-db' });
@@ -223,34 +223,11 @@ async function getActiveAlertsAll(req, res) {
     const groups = await db.getActiveAlertGroupsAll({ limit });
 
     const { deviceCC } = await batchResolveDeviceCC(groups);
-    const ccIds = [...new Set([...deviceCC.values()])];
-    const perCCMaps = await getPerCCSeverityMaps(ccIds);
-    const globalTelNameMap = await getTelematicsNameSeverityMap([]).catch(() => ({}));
-    const telNameMapByCC = {};
-    for (const cc of ccIds) {
-      telNameMapByCC[cc] = await getTelematicsNameSeverityMap([cc]).catch(() => globalTelNameMap);
-    }
+    const { passes, severityFor } = await buildStrictAlertFilter(deviceCC);
 
     const alerts = groups
-      .filter((g) => {
-        if (g.source_type === 'telematics') {
-          const ccId = deviceCC.get(g.device_id);
-          const nameMap = (ccId && telNameMapByCC[ccId]) || globalTelNameMap;
-          const alarmKey = (g.alarm_type || '').toLowerCase();
-          if (!nameMap[alarmKey]) return false;
-        }
-        return true;
-      })
-      .map((g) => {
-        const ccId = deviceCC.get(g.device_id);
-        let severityMap;
-        if (g.source_type === 'telematics') {
-          severityMap = (ccId && telNameMapByCC[ccId]) || globalTelNameMap;
-        } else {
-          severityMap = (ccId && perCCMaps[ccId]) || perCCMaps[0] || {};
-        }
-        return transformDbAlert(g, severityMap);
-      });
+      .filter((g) => passes(g))
+      .map((g) => transformDbAlert(g, severityFor(g)));
 
     res.json({ success: true, alerts, count: alerts.length, total: alerts.length, source: 'eps-db' });
   } catch (error) {

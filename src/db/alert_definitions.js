@@ -24,18 +24,26 @@ function cacheKeyFor(ids) {
 }
 
 /**
- * Build signal_code → severity map from base definitions + CC overrides.
- * CC override severity wins over base severity.
+ * Build signal_code → severity map from CC-scoped rows.
+ * Keys are lowercased for case-insensitive lookup.
  */
 function buildMap(rows) {
   const map = {};
   for (const row of rows) {
     if (row.signal_code) {
-      map[row.signal_code] = (row.override_severity || row.severity || 'MEDIUM').toLowerCase();
+      map[String(row.signal_code).toLowerCase()] = (row.override_severity || row.severity || 'MEDIUM').toLowerCase();
     }
   }
   return map;
 }
+
+// STRICT COST-CENTER RULE (applies to every map builder below):
+// - When costCenterIds is non-empty (vehicle belongs to cost center(s)), the map
+//   contains ONLY alert definitions explicitly added to those cost centers
+//   (INNER JOIN alert_definition_overrides, inactive overrides excluded).
+//   There is NO fallback to global definitions.
+// - When empty (vehicle matches no cost center), the map contains the active
+//   global definitions. Global is ONLY for CC-less vehicles.
 
 async function getVideoSeverityMap(costCenterIds) {
   const key = cacheKeyFor(costCenterIds);
@@ -68,9 +76,10 @@ async function getVideoSeverityMap(costCenterIds) {
               d.severity,
               o.severity AS override_severity
        FROM alert_definitions d
-       LEFT JOIN alert_definition_overrides o
+       INNER JOIN alert_definition_overrides o
          ON o.alert_definition_id = d.id AND o.cost_center_id = ANY($1::int[])
-       WHERE d.category = 'video' AND d.is_active = true`,
+       WHERE d.category = 'video' AND d.is_active = true
+         AND o.is_active IS DISTINCT FROM false`,
       [costCenterIds]
     );
     const map = buildMap(result.rows);
@@ -113,9 +122,10 @@ async function getTelematicsSeverityMap(costCenterIds) {
               d.severity,
               o.severity AS override_severity
        FROM alert_definitions d
-       LEFT JOIN alert_definition_overrides o
+       INNER JOIN alert_definition_overrides o
          ON o.alert_definition_id = d.id AND o.cost_center_id = ANY($1::int[])
-       WHERE d.category = 'telematics' AND d.is_active = true`,
+       WHERE d.category = 'telematics' AND d.is_active = true
+         AND o.is_active IS DISTINCT FROM false`,
       [costCenterIds]
     );
     const map = buildMap(result.rows);
@@ -128,9 +138,10 @@ async function getTelematicsSeverityMap(costCenterIds) {
 }
 
 /**
- * Build per-CC severity maps: { [ccId]: { [signal_code]: severity } }.
- * Each cost center gets its own override-aware map.
- * Falls back to global (base) severity when no override exists.
+ * Build per-CC severity maps: { [ccId]: { [lowercase_signal_code]: severity } }.
+ * STRICT: each cost center gets ONLY its explicitly-added definitions
+ * (INNER JOIN overrides). CCs with no overrides get an EMPTY map — never global.
+ * Key 0 holds the global map and is ONLY for CC-less vehicles.
  * @param {number[]} ccIds - cost center IDs
  * @param {string|string[]} categories - 'video', 'telematics', or array of both
  */
@@ -150,9 +161,10 @@ async function getPerCCSeverityMaps(ccIds, categories = ['video', 'telematics'])
     const result = await db.query(
       `SELECT d.signal_code, d.severity, o.severity AS override_severity, o.cost_center_id
        FROM alert_definitions d
-       LEFT JOIN alert_definition_overrides o
+       INNER JOIN alert_definition_overrides o
          ON o.alert_definition_id = d.id AND o.cost_center_id = ANY($1::int[])
-       WHERE d.category = ANY($2::text[]) AND d.is_active = true`,
+       WHERE d.category = ANY($2::text[]) AND d.is_active = true
+         AND o.is_active IS DISTINCT FROM false`,
       [ccIds, cats]
     );
 
@@ -160,16 +172,18 @@ async function getPerCCSeverityMaps(ccIds, categories = ['video', 'telematics'])
       if (!row.signal_code) continue;
       const ccKey = row.cost_center_id || 0;
       if (!perCC[ccKey]) perCC[ccKey] = {};
-      perCC[ccKey][row.signal_code] = (row.override_severity || row.severity || 'MEDIUM').toLowerCase();
+      perCC[ccKey][String(row.signal_code).toLowerCase()] = (row.override_severity || row.severity || 'MEDIUM').toLowerCase();
     }
-
-    const videoMap = await getVideoSeverityMap([]);
-    const telematicsMap = await getTelematicsSeverityMap([]);
-    const globalMap = { ...telematicsMap, ...videoMap };
 
     for (const ccId of ccIds) {
-      if (!perCC[ccId]) perCC[ccId] = { ...globalMap };
+      if (!perCC[ccId]) perCC[ccId] = {};
     }
+
+    // Key 0 = global merged map, ONLY for CC-less vehicles. Never used as a
+    // fallback for vehicles that belong to a cost center.
+    const videoMap = await getVideoSeverityMap([]);
+    const telematicsMap = await getTelematicsSeverityMap([]);
+    perCC[0] = { ...telematicsMap, ...videoMap };
 
     return perCC;
   } catch (error) {
@@ -218,9 +232,10 @@ async function getTelematicsNameMap(costCenterIds) {
     const result = await db.query(
       `SELECT d.name, d.signal_code, d.severity, o.severity AS override_severity
        FROM alert_definitions d
-       LEFT JOIN alert_definition_overrides o
+       INNER JOIN alert_definition_overrides o
          ON o.alert_definition_id = d.id AND o.cost_center_id = ANY($1::int[])
-       WHERE d.category = 'telematics' AND d.is_active = true AND d.name IS NOT NULL AND d.name != ''`,
+       WHERE d.category = 'telematics' AND d.is_active = true AND d.name IS NOT NULL AND d.name != ''
+         AND o.is_active IS DISTINCT FROM false`,
       [costCenterIds]
     );
     const map = {};
@@ -277,9 +292,10 @@ async function getTelematicsNameSeverityMap(costCenterIds) {
     const result = await db.query(
       `SELECT d.name, d.signal_code, d.severity, o.severity AS override_severity
        FROM alert_definitions d
-       LEFT JOIN alert_definition_overrides o
+       INNER JOIN alert_definition_overrides o
          ON o.alert_definition_id = d.id AND o.cost_center_id = ANY($1::int[])
-       WHERE d.category = 'telematics' AND d.is_active = true AND d.name IS NOT NULL AND d.name != ''`,
+       WHERE d.category = 'telematics' AND d.is_active = true AND d.name IS NOT NULL AND d.name != ''
+         AND o.is_active IS DISTINCT FROM false`,
       [costCenterIds]
     );
     const map = {};
