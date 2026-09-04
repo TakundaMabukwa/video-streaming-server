@@ -12,6 +12,7 @@ function startWebSocket(port = 3004) {
     console.log(`[WS] Client connected (${clients.size} total)`);
 
     ws.isAlive = true;
+    ws._presenceJoins = new Map(); // alertId -> user, to clean up on disconnect
     ws.on('pong', () => { ws.isAlive = true; });
 
     ws.on('message', (raw) => {
@@ -20,9 +21,21 @@ function startWebSocket(port = 3004) {
         if (msg && msg.type) {
           const data = msg.data || {};
           if (msg.type === 'alert-user-active') {
-            joinAlert(String(data.alertId || data.alert_id || '').trim(), String(data.user || '').trim());
+            const alertId = String(data.alertId || data.alert_id || '').trim();
+            const user = String(data.user || '').trim();
+            if (alertId && user) {
+              joinAlert(alertId, user);
+              ws._presenceJoins.set(alertId, user);
+            }
           } else if (msg.type === 'alert-user-inactive') {
-            leaveAlert(String(data.alertId || data.alert_id || '').trim(), String(data.user || '').trim());
+            const alertId = String(data.alertId || data.alert_id || '').trim();
+            const user = String(data.user || '').trim();
+            if (alertId && user) {
+              leaveAlert(alertId, user);
+              if (ws._presenceJoins.get(alertId) === user) {
+                ws._presenceJoins.delete(alertId);
+              }
+            }
           }
           const envelope = JSON.stringify({ type: msg.type, data, timestamp: new Date().toISOString() });
           for (const other of clients) {
@@ -34,12 +47,22 @@ function startWebSocket(port = 3004) {
       } catch (_) { /* ignore non-JSON */ }
     });
 
+    const cleanupPresence = () => {
+      const joins = ws._presenceJoins;
+      ws._presenceJoins = new Map();
+      for (const [alertId, user] of joins) {
+        leaveAlert(alertId, user);
+      }
+    };
+
     ws.on('close', () => {
+      cleanupPresence();
       clients.delete(ws);
       console.log(`[WS] Client disconnected (${clients.size} total)`);
     });
 
     ws.on('error', () => {
+      cleanupPresence();
       clients.delete(ws);
     });
 
