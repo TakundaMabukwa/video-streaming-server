@@ -1,4 +1,5 @@
 const { WebSocketServer } = require('ws');
+const { joinAlert, leaveAlert } = require('./presence');
 
 let wss = null;
 const clients = new Set();
@@ -17,7 +18,13 @@ function startWebSocket(port = 3004) {
       try {
         const msg = JSON.parse(String(raw));
         if (msg && msg.type) {
-          const envelope = JSON.stringify({ type: msg.type, data: msg.data || {}, timestamp: new Date().toISOString() });
+          const data = msg.data || {};
+          if (msg.type === 'alert-user-active') {
+            joinAlert(String(data.alertId || data.alert_id || '').trim(), String(data.user || '').trim());
+          } else if (msg.type === 'alert-user-inactive') {
+            leaveAlert(String(data.alertId || data.alert_id || '').trim(), String(data.user || '').trim());
+          }
+          const envelope = JSON.stringify({ type: msg.type, data, timestamp: new Date().toISOString() });
           for (const other of clients) {
             if (other !== ws && other.readyState === 1) {
               try { other.send(envelope); } catch (_) { /* skip */ }

@@ -14,6 +14,7 @@ const telematicsRoutes = require('./telematicsRoutes');
 const policeRoutes = require('./policeRoutes');
 const incidentsRoutes = require('./incidentsRoutes');
 const repairRoutes = require('./repairRoutes');
+const presenceRoutes = require('./presenceRoutes');
 
 const router = express.Router();
 
@@ -32,5 +33,6 @@ router.use('/telematics', telematicsRoutes);
 router.use('/police', policeRoutes);
 router.use('/incidents', incidentsRoutes);
 router.use('/repair-requests', repairRoutes);
+router.use('/presence', presenceRoutes);
 
 module.exports = router;
