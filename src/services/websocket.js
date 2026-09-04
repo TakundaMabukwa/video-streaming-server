@@ -20,16 +20,14 @@ function startWebSocket(port = 3004) {
         const msg = JSON.parse(String(raw));
         if (msg && msg.type) {
           const data = msg.data || {};
+          const alertId = String(data.alertId || data.alert_id || '').trim();
+          const user = String(data.user || '').trim();
           if (msg.type === 'alert-user-active') {
-            const alertId = String(data.alertId || data.alert_id || '').trim();
-            const user = String(data.user || '').trim();
             if (alertId && user) {
               joinAlert(alertId, user);
               ws._presenceJoins.set(alertId, user);
             }
           } else if (msg.type === 'alert-user-inactive') {
-            const alertId = String(data.alertId || data.alert_id || '').trim();
-            const user = String(data.user || '').trim();
             if (alertId && user) {
               leaveAlert(alertId, user);
               if (ws._presenceJoins.get(alertId) === user) {
@@ -37,10 +35,14 @@ function startWebSocket(port = 3004) {
               }
             }
           }
-          const envelope = JSON.stringify({ type: msg.type, data, timestamp: new Date().toISOString() });
-          for (const other of clients) {
-            if (other !== ws && other.readyState === 1) {
-              try { other.send(envelope); } catch (_) { /* skip */ }
+          // Targeted relay: only send presence events to clients that are
+          // currently viewing the SAME alert. Non-viewers receive nothing.
+          if (alertId) {
+            const envelope = JSON.stringify({ type: msg.type, data, timestamp: new Date().toISOString() });
+            for (const other of clients) {
+              if (other !== ws && other.readyState === 1 && other._presenceJoins && other._presenceJoins.has(alertId)) {
+                try { other.send(envelope); } catch (_) { /* skip */ }
+              }
             }
           }
         }
