@@ -8,6 +8,8 @@ const {
   bulkUpsertDefinitionOverrides,
   deleteDefinitionOverride,
   deleteAllDefinitionOverrides,
+  listDefinitionApplicableCcs,
+  listAllDefinitionApplicableCcs,
   listAlertGroupConfigs,
   createAlertGroupConfig,
   updateAlertGroupConfig,
@@ -15,6 +17,8 @@ const {
   upsertGroupConfigOverride,
   bulkUpsertGroupConfigOverrides,
   deleteGroupConfigOverride,
+  listGroupApplicableCcs,
+  listAllGroupApplicableCcs,
 } = require('../controllers/alertConfigController');
 
 const router = express.Router();
@@ -24,6 +28,10 @@ router.put('/definitions/:definition_id/overrides/bulk', bulkUpsertDefinitionOve
 router.put('/definitions/:definition_id/overrides', upsertDefinitionOverride);
 router.delete('/definitions/:definition_id/overrides', deleteAllDefinitionOverrides);
 router.delete('/definitions/:definition_id/overrides/:cc_id', deleteDefinitionOverride);
+
+// Applicable cost centers for a definition (which CCs an override exists for)
+router.get('/definitions/applicable-ccs', listAllDefinitionApplicableCcs);
+router.get('/definitions/:id/applicable-ccs', listDefinitionApplicableCcs);
 
 // Alert Definitions (base/global)
 router.get('/definitions', listAlertDefinitions);
@@ -35,6 +43,10 @@ router.delete('/definitions/:id', deleteAlertDefinition);
 router.put('/groups/:group_id/overrides/bulk', bulkUpsertGroupConfigOverrides);
 router.put('/groups/:group_id/overrides', upsertGroupConfigOverride);
 router.delete('/groups/:group_id/overrides/:cc_id', deleteGroupConfigOverride);
+
+// Applicable cost centers for a group (which CCs an override exists for)
+router.get('/groups/applicable-ccs', listAllGroupApplicableCcs);
+router.get('/groups/:id/applicable-ccs', listGroupApplicableCcs);
 
 // Alert Group Configs (base/global)
 router.get('/groups', listAlertGroupConfigs);

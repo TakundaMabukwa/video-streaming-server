@@ -222,6 +222,37 @@ async function purgeDefinitionAlertRows(definitionId) {
   }
 }
 
+// List the cost centers that currently have an override for a definition —
+// i.e. the cost centers this alert type is applicable to (in-set for).
+async function listDefinitionApplicableCcs(req, res) {
+  try {
+    const { id } = req.params;
+    const result = await db.query(
+      'SELECT DISTINCT cost_center_id FROM alert_definition_overrides WHERE alert_definition_id = $1',
+      [Number(id)]
+    );
+    sendSuccess(res, { definition_id: Number(id), cost_center_ids: result.rows.map(r => r.cost_center_id) }, 'Applicable cost centers retrieved');
+  } catch (error) {
+    sendError(res, error.message, 500);
+  }
+}
+
+// All applicable CCs for every definition at once — { [definitionId]: [ccIds] }.
+// Used by the settings display to show which cost centers each alert type applies to.
+async function listAllDefinitionApplicableCcs(req, res) {
+  try {
+    const result = await db.query('SELECT alert_definition_id, cost_center_id FROM alert_definition_overrides');
+    const map = {};
+    for (const r of result.rows) {
+      if (!map[r.alert_definition_id]) map[r.alert_definition_id] = [];
+      map[r.alert_definition_id].push(r.cost_center_id);
+    }
+    sendSuccess(res, { cost_center_map: map }, 'Applicable cost centers retrieved');
+  } catch (error) {
+    sendError(res, error.message, 500);
+  }
+}
+
 // Delete ALL cost-center overrides for a definition — removes the alert from
 // every cost center's set at once (strict CC model: no global fallback for CC
 // vehicles, so the alert stops coming in everywhere except CC-less vehicles
@@ -462,6 +493,36 @@ async function bulkUpsertGroupConfigOverrides(req, res) {
   }
 }
 
+// List the cost centers that currently have an override for a group config —
+// i.e. the cost centers this group is applicable to/customized for.
+async function listGroupApplicableCcs(req, res) {
+  try {
+    const { id } = req.params;
+    const result = await db.query(
+      'SELECT DISTINCT cost_center_id FROM alert_group_config_overrides WHERE group_config_id = $1',
+      [Number(id)]
+    );
+    sendSuccess(res, { group_id: Number(id), cost_center_ids: result.rows.map(r => r.cost_center_id) }, 'Applicable cost centers retrieved');
+  } catch (error) {
+    sendError(res, error.message, 500);
+  }
+}
+
+// All applicable CCs for every group at once — { [groupId]: [ccIds] }.
+async function listAllGroupApplicableCcs(req, res) {
+  try {
+    const result = await db.query('SELECT group_config_id, cost_center_id FROM alert_group_config_overrides');
+    const map = {};
+    for (const r of result.rows) {
+      if (!map[r.group_config_id]) map[r.group_config_id] = [];
+      map[r.group_config_id].push(r.cost_center_id);
+    }
+    sendSuccess(res, { cost_center_map: map }, 'Applicable cost centers retrieved');
+  } catch (error) {
+    sendError(res, error.message, 500);
+  }
+}
+
 async function deleteGroupConfigOverride(req, res) {
   try {
     const { group_id, cc_id } = req.params;
@@ -485,6 +546,8 @@ module.exports = {
   bulkUpsertDefinitionOverrides,
   deleteDefinitionOverride,
   deleteAllDefinitionOverrides,
+  listDefinitionApplicableCcs,
+  listAllDefinitionApplicableCcs,
   listAlertGroupConfigs,
   createAlertGroupConfig,
   updateAlertGroupConfig,
@@ -492,4 +555,6 @@ module.exports = {
   upsertGroupConfigOverride,
   bulkUpsertGroupConfigOverrides,
   deleteGroupConfigOverride,
+  listGroupApplicableCcs,
+  listAllGroupApplicableCcs,
 };
