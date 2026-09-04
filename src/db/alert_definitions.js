@@ -213,7 +213,7 @@ async function getTelematicsNameMap(costCenterIds) {
       );
       const map = {};
       for (const row of result.rows) {
-        map[row.name.toLowerCase()] = { signalCode: row.signal_code, severity: (row.severity || 'MEDIUM').toLowerCase() };
+        map[row.name.toLowerCase()] = { name: row.name, signalCode: row.signal_code, severity: (row.severity || 'MEDIUM').toLowerCase() };
       }
       cachedTelematicsNameMap = map;
       telematicsNameCacheTime = now;
@@ -241,6 +241,7 @@ async function getTelematicsNameMap(costCenterIds) {
     const map = {};
     for (const row of result.rows) {
       map[row.name.toLowerCase()] = {
+        name: row.name,
         signalCode: row.signal_code,
         severity: (row.override_severity || row.severity || 'MEDIUM').toLowerCase(),
       };
