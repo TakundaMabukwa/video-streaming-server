@@ -13,6 +13,20 @@ function startWebSocket(port = 3004) {
     ws.isAlive = true;
     ws.on('pong', () => { ws.isAlive = true; });
 
+    ws.on('message', (raw) => {
+      try {
+        const msg = JSON.parse(String(raw));
+        if (msg && msg.type) {
+          const envelope = JSON.stringify({ type: msg.type, data: msg.data || {}, timestamp: new Date().toISOString() });
+          for (const other of clients) {
+            if (other !== ws && other.readyState === 1) {
+              try { other.send(envelope); } catch (_) { /* skip */ }
+            }
+          }
+        }
+      } catch (_) { /* ignore non-JSON */ }
+    });
+
     ws.on('close', () => {
       clients.delete(ws);
       console.log(`[WS] Client disconnected (${clients.size} total)`);
