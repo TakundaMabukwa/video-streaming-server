@@ -132,6 +132,14 @@ async function start() {
       console.error(`[GEOTAB] Polling failed to start: ${err.message}`);
     }
 
+    // Connect broadcast to alert controller for real-time resolve/close notifications
+    try {
+      const dbAlertController = require('./controllers/dbAlertController');
+      dbAlertController.setWsBroadcast(broadcast);
+    } catch (err) {
+      console.error(`[AlertController] Broadcast init failed: ${err.message}`);
+    }
+
     const syncService = require('./services/syncService');
     server = app.listen(config.port, async () => {
       console.log(`Server running on port ${config.port} in ${config.nodeEnv} mode`);

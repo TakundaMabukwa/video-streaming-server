@@ -7,6 +7,9 @@ const { getTelematicsNameSeverityMap, getPerCCSeverityMaps } = require('../db/al
 const { findVehicleCostCenterId, resolveFleetNumber } = require('../services/costCenterLookup');
 const { applyNcrDeduction } = require('../services/driverScoringService');
 
+let wsBroadcast = null;
+function setWsBroadcast(fn) { wsBroadcast = fn; }
+
 /**
  * STRICT COST-CENTER ALERT RULE.
  * Builds the per-device filter + severity lookup for a batch of alert groups:
@@ -728,6 +731,43 @@ async function resolveAlert(req, res) {
         ? `Alert group ${group.group_key} resolved (${count} alerts)${resolveScope === 'all_group' ? ' + all children' : ''}`
         : `Alert ${id} resolved successfully`,
     });
+
+    if (wsBroadcast) {
+      const broadcastPayload = {
+        id,
+        alert_id: id,
+        status: 'resolved',
+        resolved: true,
+        false_alert: isFalse,
+        closureType,
+        resolved_by: userId || null,
+      };
+      wsBroadcast('alert-status-changed', { alert: broadcastPayload });
+      if (resolveScope === 'all_group' && group) {
+        try {
+          const childResult = await db.query(
+            `SELECT last_alert_id FROM alert_groups WHERE device_id = $1 AND alarm_type = $2 AND resolved = FALSE`,
+            [group.device_id, group.alarm_type]
+          );
+          for (const row of childResult.rows) {
+            if (String(row.last_alert_id) !== String(id)) {
+              wsBroadcast('alert-status-changed', {
+                alert: {
+                  id: row.last_alert_id,
+                  alert_id: row.last_alert_id,
+                  status: 'resolved',
+                  resolved: true,
+                  false_alert: isFalse,
+                  resolved_by: userId || null,
+                },
+              });
+            }
+          }
+        } catch (broadcastErr) {
+          console.error('[ResolveAlert] Broadcast children error:', broadcastErr.message);
+        }
+      }
+    }
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -763,6 +803,43 @@ async function markFalseAlert(req, res) {
       count: group ? group.count : 1,
       message: group ? `Alert group ${group.group_key} marked as false (${group.count} alerts)` : `Alert ${id} marked as false alarm`,
     });
+
+    if (wsBroadcast) {
+      wsBroadcast('alert-status-changed', {
+        alert: {
+          id,
+          alert_id: id,
+          status: 'resolved',
+          resolved: true,
+          false_alert: true,
+          resolved_by: userId || null,
+        },
+      });
+      if (group) {
+        try {
+          const childResult = await db.query(
+            `SELECT last_alert_id FROM alert_groups WHERE device_id = $1 AND alarm_type = $2 AND resolved = FALSE`,
+            [group.device_id, group.alarm_type]
+          );
+          for (const row of childResult.rows) {
+            if (String(row.last_alert_id) !== String(id)) {
+              wsBroadcast('alert-status-changed', {
+                alert: {
+                  id: row.last_alert_id,
+                  alert_id: row.last_alert_id,
+                  status: 'resolved',
+                  resolved: true,
+                  false_alert: true,
+                  resolved_by: userId || null,
+                },
+              });
+            }
+          }
+        } catch (broadcastErr) {
+          console.error('[MarkFalse] Broadcast children error:', broadcastErr.message);
+        }
+      }
+    }
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -938,6 +1015,21 @@ async function resolveAlertsBulk(req, res) {
       total: alertIds.length,
       message: `${uniqueIds.length} groups resolved (${groupResult.rows.length} alert types)`,
     });
+
+    if (wsBroadcast) {
+      for (const bid of uniqueIds) {
+        wsBroadcast('alert-status-changed', {
+          alert: {
+            id: bid,
+            alert_id: bid,
+            status: 'resolved',
+            resolved: true,
+            false_alert: isFalse,
+            resolved_by: userId || null,
+          },
+        });
+      }
+    }
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -975,4 +1067,5 @@ module.exports = {
   uploadDocumentToAlert,
   followUpAlert,
   clearFollowUp,
+  setWsBroadcast,
 };
