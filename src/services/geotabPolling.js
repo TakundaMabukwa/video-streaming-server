@@ -172,6 +172,14 @@ async function syncNewFleetVehicles() {
 
     await db.upsertNewFleetVehicles(enriched);
     console.log(`[FLEET] Midnight sync: ${enriched.length} vehicles fetched (new-only)`);
+
+    // Refresh the Soltrack in-memory fleet dict so new vehicles resolve immediately
+    try {
+      const soltrackClient = require('./soltrackClient');
+      await soltrackClient.refreshFleetDict();
+    } catch (err) {
+      console.error('[FLEET] Soltrack dict refresh failed:', err.message);
+    }
   } catch (error) {
     console.error('[FLEET] Failed to sync new fleet vehicles:', error.message);
   }

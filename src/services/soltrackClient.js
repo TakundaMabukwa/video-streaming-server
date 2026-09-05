@@ -1,7 +1,6 @@
 const { WebSocket } = require('ws');
 const db = require('../db');
 const { getTelematicsNameMap } = require('../db/alert_definitions');
-const { findVehicleCostCenterId } = require('./costCenterLookup');
 const { matchAlertDefinition } = require('../helpers/alertMatching');
 const { checkZoneBreaches } = require('./geotabPolling');
 
@@ -12,15 +11,51 @@ let stopping = false;
 let wsBroadcast = null;
 let seq = 0;
 
-// reg -> { fleetNumber, ccId, ts, negative } cache
-const vehicleCache = new Map();
-const VEHICLE_CACHE_TTL = 5 * 60 * 1000;
-const NEGATIVE_CACHE_TTL = 60 * 1000;
+// In-memory fleet dictionary (refresh interval + after midnight sync).
+// Normalized key -> { fleetNumber, ccId }
+const fleetDict = new Map();
+let dictTimer = null;
+const DICT_TTL = 15 * 60 * 1000;
+
+// lastLogged[normalizedReg] -> ts, to rate-limit unknown-register skips
+const lastLogged = new Map();
+const LOG_TTL = 5 * 60 * 1000;
 
 function setWsBroadcast(fn) { wsBroadcast = fn; }
 
 function normalizeReg(reg) {
   return String(reg || '').trim().replace(/\s+/g, '').toUpperCase();
+}
+
+// Load all fleet_vehicles into memory once, then refresh on an interval.
+// Frame-time vehicle resolution never touches the DB.
+async function loadFleetDict() {
+  let rows;
+  try {
+    rows = (await db.query(
+      'SELECT fleet_number, registration_number, cost_center_id FROM fleet_vehicles'
+    )).rows;
+  } catch (err) {
+    console.error('[SOLTRACK] Fleet dict load error:', err.message);
+    return;
+  }
+  const next = new Map();
+  for (const r of rows) {
+    if (!r || !r.fleet_number) continue;
+    const entry = { fleetNumber: r.fleet_number, ccId: r.cost_center_id == null ? null : r.cost_center_id };
+    if (r.registration_number) next.set(normalizeReg(r.registration_number), entry);
+    next.set(normalizeReg(r.fleet_number), entry);
+  }
+  fleetDict.clear();
+  for (const [k, v] of next) fleetDict.set(k, { ...v });
+  console.log(`[SOLTRACK] Fleet dict refreshed: ${fleetDict.size} keys from ${rows.length} vehicles`);
+}
+
+// Pure in-memory resolution: reg may be a plate (registration_number) or a fleet code.
+function resolveVehicle(reg) {
+  const key = normalizeReg(reg);
+  if (!key) return null;
+  return fleetDict.get(key) || null;
 }
 
 /**
@@ -52,56 +87,6 @@ function parseFrame(line) {
   };
 }
 
-async function resolveVehicle(reg) {
-  const key = normalizeReg(reg);
-  if (!key) return null;
-
-  const cached = vehicleCache.get(key);
-  if (cached && Date.now() - cached.ts < (cached.negative ? NEGATIVE_CACHE_TTL : VEHICLE_CACHE_TTL)) {
-    return cached.negative ? null : cached;
-  }
-
-  let row = null;
-  try {
-    // Primary: match normalized registration_number (covers reg-based identifiers)
-    row = (
-      await db.query(
-        `SELECT fleet_number, registration_number, cost_center_id FROM fleet_vehicles
-         WHERE LOWER(REPLACE(TRIM(registration_number), ' ', '')) = $1
-         LIMIT 1`,
-        [String(key).toLowerCase()]
-      )
-    ).rows[0] || null;
-
-    // Fallback: the frame reg may itself be a fleet_number
-    if (!row) {
-      row = (
-        await db.query(
-          'SELECT fleet_number, registration_number, cost_center_id FROM fleet_vehicles WHERE fleet_number = $1 LIMIT 1',
-          [reg]
-        )
-      ).rows[0] || null;
-    }
-  } catch (err) {
-    console.error('[SOLTRACK] Fleet lookup error:', err.message);
-    row = null;
-  }
-
-  if (!row || !row.fleet_number) {
-    vehicleCache.set(key, { negative: true, ts: Date.now() });
-    return null;
-  }
-
-  let ccId = row.cost_center_id == null ? null : row.cost_center_id;
-  if (ccId == null) {
-    try { ccId = await findVehicleCostCenterId(row.fleet_number); } catch { ccId = null; }
-  }
-
-  const vehicle = { fleetNumber: row.fleet_number, ccId, ts: Date.now(), negative: false };
-  vehicleCache.set(key, vehicle);
-  return vehicle;
-}
-
 function parseEventTime(locTime, fallback = new Date()) {
   if (!locTime) return fallback;
   const clean = String(locTime).trim();
@@ -111,7 +96,7 @@ function parseEventTime(locTime, fallback = new Date()) {
 }
 
 async function handleFrame(frame) {
-  const vehicle = await resolveVehicle(frame.reg);
+  const vehicle = resolveVehicle(frame.reg);
   if (!vehicle) {
     console.log(`[SOLTRACK] Skipping unknown vehicle reg=${frame.reg}`);
     return { matched: false, reason: 'unknown_vehicle' };
@@ -272,6 +257,9 @@ function start() {
     return;
   }
   stopping = false;
+  loadFleetDict();
+  if (dictTimer) clearInterval(dictTimer);
+  dictTimer = setInterval(loadFleetDict, DICT_TTL);
   connect(url);
 }
 
@@ -314,8 +302,9 @@ function scheduleReconnect(url) {
 
 function stop() {
   stopping = true;
+  if (dictTimer) { clearInterval(dictTimer); dictTimer = null; }
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   if (ws) { try { ws.close(); } catch (_) {} ws = null; }
 }
 
-module.exports = { start, stop, setWsBroadcast, handleFrame, parseFrame, normalizeReg };
+module.exports = { start, stop, setWsBroadcast, handleFrame, parseFrame, normalizeReg, refreshFleetDict: loadFleetDict, resolveVehicle };
