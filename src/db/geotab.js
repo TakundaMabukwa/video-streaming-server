@@ -299,6 +299,60 @@ async function upsertFleetVehicles(vehicles) {
   }
 }
 
+// Insert NEW fleet vehicles only (returns/inserts vehicles not already present).
+// Existing rows are never touched - used by the midnight sync (vehicles rarely change).
+async function upsertNewFleetVehicles(vehicles) {
+  if (!vehicles || vehicles.length === 0) return 0;
+
+  let ccMap = new Map();
+  try {
+    const ccResult = await query('SELECT id, name, code FROM cost_centers');
+    for (const cc of ccResult.rows) {
+      if (cc.name) ccMap.set(String(cc.name).toLowerCase(), cc.id);
+      if (cc.code) ccMap.set(String(cc.code).toLowerCase(), cc.id);
+    }
+  } catch (err) {
+    console.error('[GEOTAB] Failed to resolve cost centers:', err.message);
+  }
+
+  const uniqueMap = new Map();
+  for (const v of vehicles) {
+    const key = `${v.fleet_number || ''}:${v.registration_number || ''}`;
+    uniqueMap.set(key, v);
+  }
+  const uniqueVehicles = Array.from(uniqueMap.values());
+
+  let inserted = 0;
+  const batchSize = 100;
+  for (let i = 0; i < uniqueVehicles.length; i += batchSize) {
+    const batch = uniqueVehicles.slice(i, i + batchSize);
+    const values = batch.map((_, idx) => {
+      const base = idx * 7;
+      return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7})`;
+    }).join(', ');
+
+    const params = batch.flatMap(v => [
+      v.fleet_number || null,
+      v.registration_number || null,
+      v.make || null,
+      v.model || null,
+      v.cost_center || null,
+      v.cost_center_id || (v.cost_center && ccMap.get(String(v.cost_center).toLowerCase())) || null,
+      new Date(),
+    ]);
+
+    const result = await query(
+      `INSERT INTO fleet_vehicles (fleet_number, registration_number, make, model, cost_center, cost_center_id, last_synced)
+       VALUES ${values}
+       ON CONFLICT (fleet_number, registration_number) DO NOTHING`,
+      params
+    );
+    inserted += result.rowCount || 0;
+  }
+
+  return inserted;
+}
+
 async function getFleetVehicleByFleet(fleetNumber) {
   const result = await query(
     'SELECT * FROM fleet_vehicles WHERE fleet_number = $1 LIMIT 1',
@@ -523,6 +577,7 @@ module.exports = {
   upsertDiagnostics,
   getDiagnostic,
   upsertFleetVehicles,
+  upsertNewFleetVehicles,
   getFleetVehicleByFleet,
   getFleetVehicleByReg,
   getAllFleetVehicles,

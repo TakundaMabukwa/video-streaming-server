@@ -2,6 +2,7 @@ const db = require('../db');
 const https = require('https');
 const { fetchVehiclesFromSupabase } = require('../helpers/supabaseClient');
 const { getTelematicsNameMap } = require('../db/alert_definitions');
+const { matchAlertDefinition } = require('../helpers/alertMatching');
 const { processAlertDeduction } = require('./driverScoringService');
 
 const GEOTAB_URL = 'https://my.geotab.com/apiv1';
@@ -151,9 +152,9 @@ function geotabMultiCall(credentials, calls) {
   });
 }
 
-// ── Sync: Fleet Vehicles from Supabase ──
+// ── Sync: Fleet Vehicles from Supabase (midnight only, new vehicles only) ──
 
-async function syncFleetVehicles() {
+async function syncNewFleetVehicles() {
   try {
     const vehicles = await fetchVehiclesFromSupabase();
     if (vehicles.length === 0) {
@@ -169,10 +170,10 @@ async function syncFleetVehicles() {
       cost_center: v.cost_center || null,
     })).filter(v => v.fleet_number || v.registration_number);
 
-    await db.upsertFleetVehicles(enriched);
-    console.log(`[FLEET] Synced ${enriched.length} vehicles from Supabase`);
+    await db.upsertNewFleetVehicles(enriched);
+    console.log(`[FLEET] Midnight sync: ${enriched.length} vehicles fetched (new-only)`);
   } catch (error) {
-    console.error('[FLEET] Failed to sync fleet vehicles:', error.message);
+    console.error('[FLEET] Failed to sync new fleet vehicles:', error.message);
   }
 }
 
@@ -652,32 +653,6 @@ const apiClient = require('../helpers/apiClient');
 let wsBroadcast = null;
 function setWsBroadcast(fn) { wsBroadcast = fn; }
 
-// Map a raw Geotab exception event name to a telematics alert_definitions signal_code
-/**
- * Match an incoming Geotab event name against alert_definitions.name dynamically.
- * Tries exact match first, then partial (substring) match.
- * Returns { signalCode, severity } or null if no match.
- */
-function matchAlertDefinition(eventName, nameMap) {
-  const eventLower = (eventName || '').trim().toLowerCase();
-  if (!eventLower) return null;
-
-  // 1. Exact match
-  if (nameMap[eventLower]) return nameMap[eventLower];
-
-  // 2. DB name is contained in event name (e.g. "driver fatigue" in "Driver Fatigue 3h (Low)")
-  for (const [dbName, def] of Object.entries(nameMap)) {
-    if (eventLower.includes(dbName)) return def;
-  }
-
-  // 3. Event name is contained in DB name
-  for (const [dbName, def] of Object.entries(nameMap)) {
-    if (dbName.includes(eventLower)) return def;
-  }
-
-  return null;
-}
-
 // ── Point-in-polygon test (ray casting) ──
 function isPointInPolygon(lat, lon, points) {
   let inside = false;
@@ -1047,7 +1022,6 @@ async function fetchAndStoreVehicleStatus() {
 
 async function initialSync() {
   console.log('[GEOTAB] Starting initial sync...');
-  await syncFleetVehicles();
   await syncGeotabGroups();
   await syncGeotabExceptionRules();
   await loadRuleNameCache();
@@ -1076,7 +1050,6 @@ function startPolling(intervalMs = 60000) {
     syncDeviceStatus();
 
     pollingInterval = setInterval(async () => {
-      await syncFleetVehicles();
       await syncGeotabGroups();
       await syncGeotabExceptionRules();
       await syncGeotabDiagnostics();
@@ -1108,4 +1081,4 @@ function stopPolling() {
   }
 }
 
-module.exports = { startPolling, stopPolling, syncGeotabEvents, initialSync, setWsBroadcast };
+module.exports = { startPolling, stopPolling, syncGeotabEvents, initialSync, setWsBroadcast, syncNewFleetVehicles, checkZoneBreaches };

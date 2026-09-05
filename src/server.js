@@ -76,6 +76,10 @@ async function shutdown(signal) {
     stopWebSocket();
   } catch {}
   try {
+    const soltrackClient = require('./services/soltrackClient');
+    soltrackClient.stop();
+  } catch {}
+  try {
     const { stopMidnightCron } = require('./services/driverScoringService');
     stopMidnightCron();
   } catch {}
@@ -138,6 +142,15 @@ async function start() {
       dbAlertController.setWsBroadcast(broadcast);
     } catch (err) {
       console.error(`[AlertController] Broadcast init failed: ${err.message}`);
+    }
+
+    // Start Soltrack telematics client (WebSocket feed - realtime, no polling)
+    try {
+      const soltrackClient = require('./services/soltrackClient');
+      soltrackClient.setWsBroadcast(broadcast);
+      soltrackClient.start();
+    } catch (err) {
+      console.error(`[SOLTRACK] Client init failed: ${err.message}`);
     }
 
     const syncService = require('./services/syncService');

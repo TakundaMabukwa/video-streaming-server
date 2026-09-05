@@ -380,6 +380,19 @@ async function syncNewVehicles() {
 function startMidnightCron() {
   if (midnightInterval) return;
 
+  const runMidnight = () => {
+    syncCostCenters().catch(console.error);
+    syncNewVehicles().catch(console.error);
+    // Fleet mirror: add any newly-registered vehicles (never poll Supabase during the day).
+    // Lazy-required to avoid a load-time circular dependency (geotabPolling imports this module).
+    try {
+      const { syncNewFleetVehicles } = require('./geotabPolling');
+      syncNewFleetVehicles().catch(console.error);
+    } catch (err) {
+      console.error('[Midnight] Fleet mirror sync failed:', err.message);
+    }
+  };
+
   // Calculate ms until next midnight
   const now = new Date();
   const midnight = new Date(now);
@@ -388,14 +401,10 @@ function startMidnightCron() {
 
   // Set initial timeout
   setTimeout(() => {
-    syncCostCenters().catch(console.error);
-    syncNewVehicles().catch(console.error);
-    
+    runMidnight();
+
     // Then run every 24 hours
-    midnightInterval = setInterval(() => {
-      syncCostCenters().catch(console.error);
-      syncNewVehicles().catch(console.error);
-    }, 24 * 60 * 60 * 1000);
+    midnightInterval = setInterval(runMidnight, 24 * 60 * 60 * 1000);
   }, msUntilMidnight);
 
   console.log(`[DriverScoring] Midnight cron scheduled (${Math.round(msUntilMidnight / 1000 / 60)} min until first run)`);

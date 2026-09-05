@@ -8,4 +8,5 @@ module.exports = {
   databaseUrl: process.env.DATABASE_URL,
   supabaseUrl: process.env.SUPABASE_URL,
   supabaseServiceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+  soltrackWebsocketUrl: process.env.SOLTRACK_WEBSOCKET_URL,
 };
