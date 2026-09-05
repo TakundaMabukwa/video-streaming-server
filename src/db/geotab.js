@@ -243,6 +243,7 @@ async function getDiagnostic(id) {
 
 // ── Fleet Vehicles (synced from Supabase) ──
 
+// Full UPSERT of fleet vehicles (add-or-update). Currently unused; kept for explicit refresh.
 async function upsertFleetVehicles(vehicles) {
   if (!vehicles || vehicles.length === 0) return;
 
@@ -258,11 +259,11 @@ async function upsertFleetVehicles(vehicles) {
     console.error('[GEOTAB] Failed to resolve cost centers:', err.message);
   }
 
-  // Deduplicate by fleet_number + registration_number (keep last occurrence)
-const uniqueMap = new Map();
+  // Deduplicate by fleet_number + registration_number (keep last occurrence).
+  // Guard: a vehicle without a fleet_number can't be de-duplicated by the
+  // (fleet_number, registration_number) conflict target (NULL never conflicts) -> junk piles up.
+  const uniqueMap = new Map();
   for (const v of vehicles) {
-    // Guard: skip vehicles without a fleet_number. They can't be de-duplicated by the
-    // (fleet_number, registration_number) conflict target (NULL never conflicts) -> junk piles up.
     if (!v.fleet_number || !String(v.fleet_number).trim()) continue;
     const key = `${String(v.fleet_number).trim()}:${(v.registration_number || '').trim()}`;
     uniqueMap.set(key, v);
@@ -287,17 +288,24 @@ const uniqueMap = new Map();
       new Date(),
     ]);
 
-    const result = await query(
+    await query(
       `INSERT INTO fleet_vehicles (fleet_number, registration_number, make, model, cost_center, cost_center_id, last_synced)
        VALUES ${values}
-       ON CONFLICT (fleet_number, registration_number) DO NOTHING`,
+       ON CONFLICT (fleet_number, registration_number) DO UPDATE SET
+         make = EXCLUDED.make,
+         model = EXCLUDED.model,
+         cost_center = EXCLUDED.cost_center,
+         cost_center_id = EXCLUDED.cost_center_id,
+         last_synced = EXCLUDED.last_synced,
+         updated_at = NOW()`,
       params
     );
   }
 }
 
-// Insert NEW fleet vehicles only (returns/inserts vehicles not already present).
-// Existing rows are never touched - used by the midnight sync (vehicles rarely change).
+// Insert NEW fleet vehicles only (never touches existing rows) - used by the midnight sync.
+// Only genuinely-new vehicles are attempted: existing normalized keys are filtered out up front,
+// and the DB's normalized unique indexes guarantee duplicate plates/fleets can never be inserted.
 async function upsertNewFleetVehicles(vehicles) {
   if (!vehicles || vehicles.length === 0) return 0;
 
@@ -312,12 +320,38 @@ async function upsertNewFleetVehicles(vehicles) {
     console.error('[GEOTAB] Failed to resolve cost centers:', err.message);
   }
 
+  const norm = (s) => String(s || '').trim().replace(/ /g, '').toLowerCase();
+
   const uniqueMap = new Map();
   for (const v of vehicles) {
-    const key = `${v.fleet_number || ''}:${v.registration_number || ''}`;
-    uniqueMap.set(key, v);
+    // Guard: skip vehicles without a fleet_number (see guard comment above).
+    if (!v.fleet_number || !String(v.fleet_number).trim()) continue;
+    const key = `${String(v.fleet_number).trim()}:${(v.registration_number || '').trim()}`;
+    if (!uniqueMap.has(key)) uniqueMap.set(key, v);
   }
-  const uniqueVehicles = Array.from(uniqueMap.values());
+  let uniqueVehicles = Array.from(uniqueMap.values());
+  if (uniqueVehicles.length === 0) return 0;
+
+  try {
+    const existing = await query(
+      `SELECT lower(replace(trim(fleet_number), ' ', '')) AS f,
+              lower(replace(trim(registration_number), ' ', '')) AS r
+       FROM fleet_vehicles
+       WHERE fleet_number IS NOT NULL AND trim(fleet_number) <> ''`
+    );
+    const knownKeys = new Set();
+    for (const row of existing.rows) {
+      knownKeys.add(`${row.f}:${row.r}`);
+    }
+    uniqueVehicles = uniqueVehicles.filter(v => !knownKeys.has(`${norm(v.fleet_number)}:${norm(v.registration_number)}`));
+  } catch (err) {
+    console.error('[GEOTAB] Failed to fetch existing fleet vehicles:', err.message);
+  }
+
+  if (uniqueVehicles.length === 0) {
+    console.log('[FLEET] New-vehicle sync: nothing new to add');
+    return 0;
+  }
 
   let inserted = 0;
   const batchSize = 100;
@@ -341,12 +375,13 @@ async function upsertNewFleetVehicles(vehicles) {
     const result = await query(
       `INSERT INTO fleet_vehicles (fleet_number, registration_number, make, model, cost_center, cost_center_id, last_synced)
        VALUES ${values}
-       ON CONFLICT (fleet_number, registration_number) DO NOTHING`,
+       ON CONFLICT DO NOTHING`,
       params
     );
     inserted += result.rowCount || 0;
   }
 
+  console.log(`[FLEET] New-vehicle sync: inserted ${inserted} new vehicle(s)`);
   return inserted;
 }
 
