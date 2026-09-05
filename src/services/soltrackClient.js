@@ -33,22 +33,25 @@ async function loadFleetDict() {
   let rows;
   try {
     rows = (await db.query(
-      'SELECT fleet_number, registration_number, cost_center_id FROM fleet_vehicles'
+      `SELECT fleet_number, registration_number, cost_center_id FROM fleet_vehicles
+       WHERE fleet_number IS NOT NULL AND fleet_number <> ''`
     )).rows;
   } catch (err) {
     console.error('[SOLTRACK] Fleet dict load error:', err.message);
     return;
   }
   const next = new Map();
+  const fleets = new Set();
   for (const r of rows) {
     if (!r || !r.fleet_number) continue;
+    fleets.add(r.fleet_number);
     const entry = { fleetNumber: r.fleet_number, ccId: r.cost_center_id == null ? null : r.cost_center_id };
     if (r.registration_number) next.set(normalizeReg(r.registration_number), entry);
     next.set(normalizeReg(r.fleet_number), entry);
   }
   fleetDict.clear();
   for (const [k, v] of next) fleetDict.set(k, { ...v });
-  console.log(`[SOLTRACK] Fleet dict refreshed: ${fleetDict.size} keys from ${rows.length} vehicles`);
+  console.log(`[SOLTRACK] Fleet dict refreshed: ${fleetDict.size} keys for ${fleets.size} vehicles`);
 }
 
 // Pure in-memory resolution: reg may be a plate (registration_number) or a fleet code.
