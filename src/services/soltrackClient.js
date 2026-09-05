@@ -17,9 +17,12 @@ const fleetDict = new Map();
 let dictTimer = null;
 const DICT_TTL = 15 * 60 * 1000;
 
-// lastLogged[normalizedReg] -> ts, to rate-limit unknown-register skips
+// lastLogged[normalizedReg] -> true, logs each unknown reg once per process
 const lastLogged = new Map();
-const LOG_TTL = 5 * 60 * 1000;
+
+// Frame throughput counters for a periodic summary line
+const stats = { msgs: 0, frames: 0, unknown: 0, matched: 0, noMatch: 0 };
+let statsTimer = null;
 
 function setWsBroadcast(fn) { wsBroadcast = fn; }
 
@@ -99,9 +102,14 @@ function parseEventTime(locTime, fallback = new Date()) {
 }
 
 async function handleFrame(frame) {
+  stats.frames++;
   const vehicle = resolveVehicle(frame.reg);
   if (!vehicle) {
-    console.log(`[SOLTRACK] Skipping unknown vehicle reg=${frame.reg}`);
+    stats.unknown++;
+    if (!lastLogged.has(normalizeReg(frame.reg))) {
+      lastLogged.set(normalizeReg(frame.reg), true);
+      console.log(`[SOLTRACK] Skipping unknown vehicle reg=${frame.reg}`);
+    }
     return { matched: false, reason: 'unknown_vehicle' };
   }
 
@@ -216,6 +224,7 @@ async function handleFrame(frame) {
         }
 
         console.log(`[SOLTRACK] Alert created: ${alertId} (${matchedDef.name}) for fleet ${fleetNumber} reg ${plate} status="${frame.status}"`);
+        stats.matched++;
         return { matched: true, alertId };
       } catch (err) {
         console.error('[SOLTRACK] Failed to store alert:', err.message);
@@ -224,6 +233,7 @@ async function handleFrame(frame) {
     }
 
     console.log(`[SOLTRACK] Status "${frame.status}" has no matching definition for fleet ${fleetNumber} (cc=${ccId || 'global'})`);
+    stats.noMatch++;
   }
 
   // ── 3. High-risk geozone detection (persists + broadcasts zone_breach) ──
@@ -240,6 +250,7 @@ async function handleFrame(frame) {
 
 function handleRawMessage(raw) {
   const text = String(raw);
+  stats.msgs++;
   // Frames may be batch-delivered or arrive one per message.
   const matches = text.match(/\^([^\n]*)\^/g) || [];
   const rawLines = matches.length > 0 ? matches : (text.includes('|') ? [text.trim()] : []);
@@ -263,6 +274,12 @@ function start() {
   loadFleetDict();
   if (dictTimer) clearInterval(dictTimer);
   dictTimer = setInterval(loadFleetDict, DICT_TTL);
+  if (statsTimer) clearInterval(statsTimer);
+  statsTimer = setInterval(() => {
+    const s = stats;
+    console.log(`[SOLTRACK] 60s: ${s.msgs} msgs, ${s.frames} frames, ${s.matched} matched, ${s.noMatch} no-match, ${s.unknown} unknown`);
+    Object.assign(s, { msgs: 0, frames: 0, matched: 0, noMatch: 0, unknown: 0 });
+  }, 60 * 1000);
   connect(url);
 }
 
@@ -306,6 +323,7 @@ function scheduleReconnect(url) {
 function stop() {
   stopping = true;
   if (dictTimer) { clearInterval(dictTimer); dictTimer = null; }
+  if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   if (ws) { try { ws.close(); } catch (_) {} ws = null; }
 }

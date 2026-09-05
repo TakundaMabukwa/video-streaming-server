@@ -168,7 +168,7 @@ async function syncNewFleetVehicles() {
       make: v.make || null,
       model: v.model || null,
       cost_center: v.cost_center || null,
-    })).filter(v => v.fleet_number || v.registration_number);
+    })).filter(v => v.fleet_number && v.registration_number);
 
     await db.upsertNewFleetVehicles(enriched);
     console.log(`[FLEET] Midnight sync: ${enriched.length} vehicles fetched (new-only)`);

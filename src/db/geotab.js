@@ -259,9 +259,12 @@ async function upsertFleetVehicles(vehicles) {
   }
 
   // Deduplicate by fleet_number + registration_number (keep last occurrence)
-  const uniqueMap = new Map();
+const uniqueMap = new Map();
   for (const v of vehicles) {
-    const key = `${v.fleet_number || ''}:${v.registration_number || ''}`;
+    // Guard: skip vehicles without a fleet_number. They can't be de-duplicated by the
+    // (fleet_number, registration_number) conflict target (NULL never conflicts) -> junk piles up.
+    if (!v.fleet_number || !String(v.fleet_number).trim()) continue;
+    const key = `${String(v.fleet_number).trim()}:${(v.registration_number || '').trim()}`;
     uniqueMap.set(key, v);
   }
   const uniqueVehicles = Array.from(uniqueMap.values());
@@ -284,16 +287,10 @@ async function upsertFleetVehicles(vehicles) {
       new Date(),
     ]);
 
-    await query(
+    const result = await query(
       `INSERT INTO fleet_vehicles (fleet_number, registration_number, make, model, cost_center, cost_center_id, last_synced)
        VALUES ${values}
-       ON CONFLICT (fleet_number, registration_number) DO UPDATE SET
-         make = EXCLUDED.make,
-         model = EXCLUDED.model,
-         cost_center = EXCLUDED.cost_center,
-         cost_center_id = EXCLUDED.cost_center_id,
-         last_synced = EXCLUDED.last_synced,
-         updated_at = NOW()`,
+       ON CONFLICT (fleet_number, registration_number) DO NOTHING`,
       params
     );
   }
