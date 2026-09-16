@@ -10,6 +10,7 @@ const GEOTAB_URL = 'https://my.geotab.com/apiv1';
 // ── Module state ──
 
 let pollingInterval = null;
+let eventPollingInterval = null;
 let cachedCredentials = null;
 let credentialsExpiry = null;
 
@@ -118,7 +119,7 @@ function hexLt(a, b) {
 // recent tail is processed (deduped), keeping alert latency at minutes instead
 // of hours/days.  ~2M versions ≈ a few hours of live traffic at current fleet
 // density (~15 versions / exception event).
-const STALE_VERSION_MARGIN = 0x200000;
+const STALE_VERSION_MARGIN = 0x2000;
 
 // ── Geotab HTTP helpers ──
 
@@ -1207,8 +1208,9 @@ async function initialSync() {
   console.log('[GEOTAB] Initial sync complete');
 }
 
-function startPolling(intervalMs = 60000) {
+function startPolling(intervalMs = 60000, eventIntervalMs = 15000) {
   if (pollingInterval) clearInterval(pollingInterval);
+  if (eventPollingInterval) clearInterval(eventPollingInterval);
 
   const database = process.env.GEOTAB_DATABASE;
   const username = process.env.GEOTAB_USERNAME;
@@ -1230,19 +1232,25 @@ function startPolling(intervalMs = 60000) {
       await syncGeotabExceptionRules();
       await syncGeotabDiagnostics();
       await syncGeotabDevices();
-      await syncGeotabEvents();
       await syncGeotabZones();
       await syncLogRecords();
       await syncDeviceStatus();
       await fetchAndStoreVehicleStatus();
     }, intervalMs);
 
+    // Exception events are the time-critical feed — poll frequently so new
+    // telematics alerts arrive as they happen. The in-flight guard prevents
+    // overlapping cycles when a batch is still being processed.
+    eventPollingInterval = setInterval(async () => {
+      await syncGeotabEvents();
+    }, eventIntervalMs);
+
     // Sync zones less frequently (every 5 minutes)
     setInterval(async () => {
       await syncGeotabZones();
     }, 5 * 60 * 1000);
 
-    console.log(`[GEOTAB] Polling started every ${intervalMs / 1000}s`);
+    console.log(`[GEOTAB] Polling started: metadata every ${intervalMs / 1000}s, events every ${eventIntervalMs / 1000}s`);
   });
 }
 
@@ -1254,6 +1262,10 @@ function stopPolling() {
   if (pollingInterval) {
     clearInterval(pollingInterval);
     pollingInterval = null;
+  }
+  if (eventPollingInterval) {
+    clearInterval(eventPollingInterval);
+    eventPollingInterval = null;
   }
 }
 

@@ -131,7 +131,7 @@ async function start() {
     try {
       const geotabPolling = require('./services/geotabPolling');
       geotabPolling.setWsBroadcast(broadcast);
-      geotabPolling.startPolling(60000);
+      geotabPolling.startPolling(60000, 15000);
     } catch (err) {
       console.error(`[GEOTAB] Polling failed to start: ${err.message}`);
     }
