@@ -101,6 +101,32 @@ function parseEventTime(locTime, fallback = new Date()) {
   return Number.isNaN(d.getTime()) ? fallback : d;
 }
 
+// Unknown-vehicle write throttle: persist each reg at most once per 30s.
+const lastUnknownWrite = new Map();
+const UNKNOWN_WRITE_THROTTLE = 30 * 1000;
+
+async function logUnknownVehicle(reg, frame) {
+  const key = normalizeReg(reg);
+  const now = Date.now();
+  const lastWrite = lastUnknownWrite.get(key);
+  if (lastWrite && now - lastWrite < UNKNOWN_WRITE_THROTTLE) return;
+  lastUnknownWrite.set(key, now);
+  try {
+    await db.query(
+      `INSERT INTO soltrack_unknown (reg, frame, reason, first_seen, last_seen, seen_count)
+       VALUES ($1, $2, $3, now(), now(), 1)
+       ON CONFLICT (upper(replace(trim(reg), ' ', ''))) DO UPDATE SET
+         frame = COALESCE(EXCLUDED.frame, soltrack_unknown.frame),
+         reason = EXCLUDED.reason,
+         last_seen = now(),
+         seen_count = soltrack_unknown.seen_count + 1`,
+      [reg, JSON.stringify(frame), 'unknown_vehicle']
+    );
+  } catch (err) {
+    // Non-critical: diagnostic buffer only
+  }
+}
+
 async function handleFrame(frame) {
   stats.frames++;
   const vehicle = resolveVehicle(frame.reg);
@@ -110,6 +136,7 @@ async function handleFrame(frame) {
       lastLogged.set(normalizeReg(frame.reg), true);
       console.log(`[SOLTRACK] Skipping unknown vehicle reg=${frame.reg}`);
     }
+    await logUnknownVehicle(frame.reg, frame);
     return { matched: false, reason: 'unknown_vehicle' };
   }
 
@@ -189,7 +216,8 @@ async function handleFrame(frame) {
         await db.query(
           `INSERT INTO telematics_events (device_id, vehicle_id, license_plate, fleet_number, plate,
             event_type, event_code, severity, latitude, longitude, speed, description, driver_name, zone_name, raw_data, event_time)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+           ON CONFLICT DO NOTHING`,
           [
             fleetNumber, fleetNumber, plate, fleetNumber, plate,
             matchedDef.name, null, severity,

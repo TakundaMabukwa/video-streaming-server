@@ -13,6 +13,9 @@ let syncState = {
   syncInterval: null,
 };
 
+let wsBroadcast = null;
+function setWsBroadcast(fn) { wsBroadcast = fn; }
+
 const ALERT_TYPE_LIST = [
   'fatigueWarn', 'fatigueAlarm', 'handheldPhoneCall', 'seatBelt',
   'laneShift', 'closeProximity', 'bang', 'hardBraking',
@@ -376,6 +379,27 @@ async function syncAlerts(deviceIds, startTime, endTime) {
         alarmExtension: r.alarmExtension ? JSON.stringify(r.alarmExtension) : null,
       })));
 
+      // Push new video alerts over WS as fast as possible so the frontend
+      // receives them without waiting for its own polling cycle.
+      if (wsBroadcast) {
+        for (const r of newRecords) {
+          try {
+            wsBroadcast('new-alert', {
+              alert: {
+                id: r.id,
+                deviceId: r.deviceId,
+                deviceName: r.deviceName,
+                alarmType: r.alarmType,
+                alarmTs: r.alarmTs ? new Date(r.alarmTs).toISOString() : null,
+                alarmText: r.alarmText,
+                lat: r.lat,
+                lon: r.lon,
+              },
+            });
+          } catch (_) { /* skip */ }
+        }
+      }
+
       const groupMap = {};
       for (const r of newRecords) {
         const key = `${r.deviceId}:${r.alarmType}`.toLowerCase();
@@ -405,7 +429,7 @@ async function syncAlerts(deviceIds, startTime, endTime) {
     console.log(`[SYNC] Page ${pageIndex}: ${newRecords.length} new alerts`);
     hasMore = records.length === 100 && (response.data.total > pageIndex * 100);
     pageIndex++;
-    if (hasMore) await sleep(200);
+    if (hasMore) await sleep(100);
 
     if (emptyPageCount >= 5) {
       console.log(`[SYNC] ${emptyPageCount} consecutive empty pages — stopping pagination`);
@@ -446,13 +470,22 @@ async function runSync() {
     const now = new Date();
     const defaultEnd = now.toISOString().replace('T', ' ').slice(0, 19);
 
+    // High-water mark: resume from the last alert timestamp in the DB (minus a
+    // 10-minute overlap to catch late-arriving / retried alerts), instead of a
+    // sliding wall-clock window that can miss alerts entirely.
     let defaultStart;
-    if (syncState.lastSyncTime) {
-      defaultStart = new Date(syncState.lastSyncTime - 5 * 60 * 1000).toISOString().replace('T', ' ').slice(0, 19);
-    } else {
-      defaultStart = new Date(now.getTime() - 6 * 60 * 1000).toISOString().replace('T', ' ').slice(0, 19);
+    try {
+      const hwmResult = await db.query(`SELECT MAX(alarm_ts) AS latest FROM alerts`);
+      const latestTs = hwmResult.rows[0]?.latest;
+      defaultStart = latestTs
+        ? new Date(new Date(latestTs).getTime() - 10 * 60 * 1000).toISOString().replace('T', ' ').slice(0, 19)
+        : new Date(now.getTime() - 10 * 60 * 1000).toISOString().replace('T', ' ').slice(0, 19);
+      console.log(`[SYNC] High-water mark: latest alarm_ts=${latestTs}, start=${defaultStart}`);
+    } catch (hwmErr) {
+      defaultStart = new Date(now.getTime() - 10 * 60 * 1000).toISOString().replace('T', ' ').slice(0, 19);
     }
 
+    syncState.lastSyncStart = defaultStart;
     const result = await syncAlerts(idsStr, defaultStart, defaultEnd);
 
     syncState.lastSyncTime = now.getTime();
@@ -509,7 +542,7 @@ function getStatus() {
   return { ...rest };
 }
 
-async function startAutoSync(intervalMs = 60000) {
+async function startAutoSync(intervalMs = 30000) {
   await runSync();
   // Media refetch disabled — alerts are synced without constant media fetching.
   syncState.syncInterval = setInterval(async () => {
@@ -533,4 +566,5 @@ module.exports = {
   refetchMissingMedia,
   fetchMediaOnDemand,
   fetchReplayUrl,
+  setWsBroadcast,
 };

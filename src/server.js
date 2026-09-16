@@ -154,10 +154,11 @@ async function start() {
     }
 
     const syncService = require('./services/syncService');
+    syncService.setWsBroadcast(broadcast);
     server = app.listen(config.port, async () => {
       console.log(`Server running on port ${config.port} in ${config.nodeEnv} mode`);
       try {
-        await syncService.startAutoSync(60000);
+        await syncService.startAutoSync(30000);
       } catch (err) {
         console.error(`[SYNC] Auto-sync failed to start: ${err.message}`);
       }

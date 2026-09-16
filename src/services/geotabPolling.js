@@ -21,37 +21,104 @@ let lastLogVersion = null;
 // In-memory cache of Geotab rule names keyed by rule id
 const ruleNameCache = new Map();
 
+// ── High-risk zone caches (Fix G): zones change rarely, so cache per cycle
+//    and cache each device's active zone entries briefly to avoid a DB hit
+//    on every single Soltrack frame. ──
+const ZONES_CACHE_TTL = 5 * 60 * 1000;
+const ACTIVE_ENTRIES_CACHE_TTL = 30 * 1000;
+let zonesCache = { data: null, ts: 0 };
+const activeEntriesCache = new Map(); // deviceId -> { data, ts }
+
+function invalidateZonesCache() {
+  zonesCache = { data: null, ts: 0 };
+}
+
+// ── Persistent cursors (sync_state table) ──
+
+const SYNC_STATE_EVENT_VERSION = 'geotab:event_version';
+
+async function getSyncState(key) {
+  try {
+    const r = await db.query('SELECT value FROM sync_state WHERE key = $1', [key]);
+    return r.rows[0]?.value ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function setSyncState(key, value) {
+  try {
+    await db.query(
+      `INSERT INTO sync_state (key, value, updated_at)
+       VALUES ($1, $2::jsonb, now())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+      [key, typeof value === 'string' ? JSON.stringify(value) : JSON.stringify(value)]
+    );
+  } catch {
+    // sync_state is best-effort; DB replica/-less envs degrade gracefully
+  }
+}
+
 function getRuleName(ruleId) {
   if (!ruleId) return null;
   if (ruleNameCache.has(ruleId)) return ruleNameCache.get(ruleId);
   return ruleId;
 }
 
-async function resolveRuleName(credentials, ruleId) {
-  if (!ruleId || ruleNameCache.has(ruleId)) return getRuleName(ruleId);
+// Resolve a Rule name. Cache hit returns instantly; cache miss returns the
+// rule id immediately (never blocks the ingest loop) and fetches in background.
+function resolveRuleName(credentials, ruleId) {
+  if (!ruleId) return null;
+  if (ruleNameCache.has(ruleId)) return ruleNameCache.get(ruleId);
+  fetchRuleName(credentials, ruleId).catch(() => {});
+  return ruleId;
+}
+
+async function fetchRuleName(credentials, ruleId) {
   try {
     const response = await geotabGetById(credentials, 'Rule', ruleId);
-    if (response.error) return ruleId;
+    if (response.error) return;
     const rules = response.result || [];
     const rule = rules.find((r) => r.id === ruleId);
     if (rule?.name) {
       ruleNameCache.set(ruleId, rule.name);
-      // Also persist to DB asynchronously (fire-and-forget)
       db.upsertExceptionRules([{
         id: rule.id,
         name: rule.name,
         description: rule.description || null,
         raw_data: rule,
       }]).catch(() => {});
-      return rule.name;
     }
   } catch {}
-  return ruleId;
 }
 
-// Prevent feed backlogs from overwhelming the DB on a single poll cycle
-const MAX_EVENTS_PER_POLL = 1000;
+// Feed page/cycle safety bounds. Events are NEVER capped for storage — the
+// pump drains every record the API returns before advancing the cursor.
+const MAX_FEED_PUMP_PAGES = 500;
 const MAX_DIAGNOSTICS_PER_POLL = 5000;
+
+// ── Geotab feed-version helpers (versions are 16-char zero-padded hex) ──
+
+function hexToBig(hex) {
+  return BigInt('0x' + String(hex).replace(/^0+/, '') || '0');
+}
+function bigToHex(n) {
+  return n.toString(16).padStart(16, '0');
+}
+function hexSub(hex, amount) {
+  return bigToHex(hexToBig(hex) - BigInt(amount));
+}
+function hexLt(a, b) {
+  return hexToBig(a) < hexToBig(b);
+}
+
+// If the persisted cursor is more than this many versions behind the live head
+// the pump would re-drain millions of already-stored records before reaching
+// recent events.  Detect this and auto-jump to (head − margin) so only the
+// recent tail is processed (deduped), keeping alert latency at minutes instead
+// of hours/days.  ~2M versions ≈ a few hours of live traffic at current fleet
+// density (~15 versions / exception event).
+const STALE_VERSION_MARGIN = 0x200000;
 
 // ── Geotab HTTP helpers ──
 
@@ -430,227 +497,315 @@ function getSeverity(ruleName) {
 
 // ── Sync: Exception Events ──
 
+// Load the persisted feed cursor; falls back to in-memory cursor on first boot.
+// NOTE: Geotab feed versions are hex strings (e.g. "0000000056b3e870") - the
+// value must NEVER be run through parseFloat, which returns 0 for any hex
+// string and would reset the feed to the very beginning on every restart,
+// silently re-draining the entire exception-event history (and producing no
+// new alerts for a very long time).
+async function getEventCursor() {
+  if (lastEventVersion !== null && lastEventVersion !== undefined) return lastEventVersion;
+  const stored = await getSyncState(SYNC_STATE_EVENT_VERSION);
+  if (stored !== null && stored !== undefined) {
+    // sync_state.value is a jsonb: a stored string arrives as raw text (hex),
+    // a legacy number arrives as a number. Always keep the raw representation.
+    lastEventVersion = String(stored).replace(/^["']+|["']+$/g, '') || null;
+  }
+  return lastEventVersion;
+}
+
+// In-flight guard: prevents overlapping pump cycles when processing 50k-record
+// pages takes longer than the poll interval.  Without this, multiple concurrent
+// syncGeotabEvents calls each capture the same lastEventVersion at the start,
+// thrash the cursor, and never print the per-cycle summary (so it appears as if
+// no events are being processed).
+let eventsSyncInFlight = false;
+
 async function syncGeotabEvents() {
+  if (eventsSyncInFlight) {
+    console.log('[GEOTAB] ExceptionEvent sync already in flight, skipping cycle');
+    return;
+  }
   const database = process.env.GEOTAB_DATABASE;
   const username = process.env.GEOTAB_USERNAME;
   const password = process.env.GEOTAB_PASSWORD;
   if (!database || !username || !password) return;
 
+  eventsSyncInFlight = true;
   try {
     const credentials = await geotabAuthenticate(database, username, password);
-    // Use null for first call; Geotab returns only new records and a toVersion cursor
-    const feed = await geotabGetFeed(credentials, 'ExceptionEvent', lastEventVersion);
 
-    if (feed.error) {
-      console.error('[GEOTAB] ExceptionEvent feed error:', feed.error.message);
-      return;
-    }
+    // Build a device map once per cycle (avoids a DB hit per event).
+    const allDevices = await db.getAllGeotabDevices().catch(() => []);
+    const deviceMap = new Map(allDevices.map(d => [d.id, d]));
+    console.log(`[GEOTAB] Cached ${deviceMap.size} devices for event processing`);
 
-    const result = feed.result || {};
-    let events = result.data || [];
-    if (result.toVersion) lastEventVersion = result.toVersion;
+    // Probe the live head cheaply (GetFeed without fromVersion returns 0
+    // records but reports the current max toVersion).  If the persisted cursor
+    // is missing, numeric "0", or more than STALE_VERSION_MARGIN behind the
+    // head, jump to (head − margin) so the pump fetches only the RECENT tail
+    // instead of silently re-draining months of history on restart.
+    let fromVersion = null;
+    try {
+      const headProbe = await geotabGetFeed(credentials, 'ExceptionEvent', null);
+      const liveHead = headProbe.result?.toVersion || null;
+      const savedCursor = await getEventCursor();
+      const cursorLooksStale =
+        !savedCursor ||
+        savedCursor === '0' ||
+        String(savedCursor).replace(/^0+/, '') === '' ||
+        (liveHead && !/^[0-9a-f]+$/i.test(savedCursor)) ||
+        (liveHead && hexLt(savedCursor, hexSub(liveHead, STALE_VERSION_MARGIN)));
 
-    if (events.length === 0) {
-      if (lastEventVersion === null) {
-        console.log('[GEOTAB] ExceptionEvent: no new records, cursor not yet set');
+      if (cursorLooksStale && liveHead) {
+        const jumpTo = hexSub(liveHead, STALE_VERSION_MARGIN);
+        console.log(`[GEOTAB] Cursor is stale/missing (${savedCursor}) — jumping to recent head: ${jumpTo} (live head=${liveHead})`);
+        lastEventVersion = jumpTo;
+        await setSyncState(SYNC_STATE_EVENT_VERSION, jumpTo);
+        fromVersion = jumpTo;
+      } else {
+        fromVersion = savedCursor;
       }
-      return;
+    } catch {
+      // Probe/compare failed — fall back to the persisted cursor as before.
+      fromVersion = await getEventCursor();
     }
 
-    console.log(`[GEOTAB] ExceptionEvent: received ${events.length} new records`);
+    let totalInserted = 0;
+    let totalUnknownDevice = 0;
+    let totalAlerted = 0;
+    let pages = 0;
 
-    // Cap per-cycle processing to protect the DB from large backlogs
-    let dropped = 0;
-    if (events.length > MAX_EVENTS_PER_POLL) {
-      dropped = events.length - MAX_EVENTS_PER_POLL;
-      // Keep the most recent events (real-time dashboard only cares about recent ones)
-      events = events
-        .slice()
-        .sort((a, b) => new Date(b.activeFrom || b.lastModifiedDateTime || 0) - new Date(a.activeFrom || a.lastModifiedDateTime || 0))
-        .slice(0, MAX_EVENTS_PER_POLL);
-    }
+    // Pump the feed until fully drained — NEVER cap and NEVER leave events behind.
+    while (pages < MAX_FEED_PUMP_PAGES) {
+      pages++;
+      const feed = await geotabGetFeed(credentials, 'ExceptionEvent', fromVersion);
+      if (feed.error) {
+        console.error('[GEOTAB] ExceptionEvent feed error:', feed.error.message);
+        break;
+      }
 
-    let inserted = 0;
-    let skipped = 0;
-    for (const event of events) {
-      try {
-        const geotabDeviceId = event.device?.id || '';
-        const ruleId = event.rule?.id || '';
+      const result = feed.result || {};
+      const events = result.data || [];
+      const toVersion = result.toVersion;
 
-        // Filter: only store events for devices we know about
-        const device = await db.getGeotabDevice(geotabDeviceId);
-        if (!device) {
-          skipped++;
-          continue;
+      if (events.length === 0) {
+        // Feed drained; persist cursor so a restart resumes from here.
+        if (toVersion !== null && toVersion !== undefined) {
+          lastEventVersion = toVersion;
+          await setSyncState(SYNC_STATE_EVENT_VERSION, toVersion);
         }
-        let fleetNumber = device?.fleet_number || null;
-        let licensePlate = device?.license_plate || null;
+        console.log(`[GEOTAB] ExceptionEvent: feed drained (fromVersion=${fromVersion}, page=${pages})`);
+        break;
+      }
 
-        // If fleet_number looks like a Geotab short ID (e.g. "b59"), resolve proper name from vehicle_status
-        if (fleetNumber && /^b?[0-9a-f]+$/i.test(fleetNumber) && fleetNumber.length < 10) {
-          try {
-            const vs = await db.getVehicleStatus(geotabDeviceId);
-            if (vs) {
-              fleetNumber = vs.fleet_number || fleetNumber;
-              licensePlate = vs.license_plate || vs.plate || licensePlate;
-            }
-          } catch (e) { /* non-critical */ }
-        }
+      console.log(`[GEOTAB] ExceptionEvent: page ${pages} received ${events.length} records (fromVersion=${fromVersion}, toVersion=${toVersion})`);
 
-        // Resolve human-readable rule name from cache, DB, or Geotab on demand
-        const resolvedRuleName = await resolveRuleName(credentials, ruleId);
-        const eventName = resolvedRuleName || event.rule?.name || ruleId;
-        const eventCode = ruleId;
-        const severity = getSeverity(eventName);
-        const durationSeconds = db.parseDuration(event.duration);
-        const distance = typeof event.distance === 'number' ? event.distance : null;
+      const outcome = await processGeotabEventBatch(events, { credentials, deviceMap });
+      totalInserted += outcome.inserted;
+      totalUnknownDevice += outcome.unknownDevice;
+      totalAlerted += outcome.alerted;
 
-        const driverName = typeof event.driver === 'object' && event.driver?.name
-          ? event.driver.name
-          : null;
-
-        const diagName = typeof event.diagnostic === 'object' && event.diagnostic?.name
-          ? event.diagnostic.name
-          : null;
-
-        // Extract zone name from Geotab exception events
-        const zoneNameFromEvent = Array.isArray(event.zones) && event.zones.length > 0
-          ? event.zones.map(z => z.name).filter(Boolean).join(', ')
-          : null;
-
-        let evtLat = event.latitude || null;
-        let evtLon = event.longitude || null;
-        let evtSpeed = event.speed || null;
-        let evtAddress = event.address || null;
-
-        if (!evtLat || !evtLon) {
-          const vehiclePos = await db.getVehicleStatus(geotabDeviceId);
-          if (vehiclePos) {
-            evtLat = evtLat || vehiclePos.latitude;
-            evtLon = evtLon || vehiclePos.longitude;
-            evtSpeed = evtSpeed || vehiclePos.speed;
-          }
-        }
-
-        const eventTime = event.activeFrom || event.lastModifiedDateTime || new Date();
-
-        const insertResult = await db.query(
-          `INSERT INTO telematics_events
-           (device_id, vehicle_id, license_plate, fleet_number, plate,
-            event_type, event_code, severity, latitude, longitude, speed,
-            address, driver_name, description, distance, duration_seconds, zone_name, raw_data, event_time)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
-           ON CONFLICT DO NOTHING
-           RETURNING id`,
-          [
-            geotabDeviceId,
-            geotabDeviceId,
-            licensePlate,
-            fleetNumber,
-            fleetNumber,
-            eventName,
-            eventCode,
-            severity,
-            evtLat,
-            evtLon,
-            evtSpeed,
-            evtAddress,
-            driverName,
-            diagName,
-            distance,
-            durationSeconds,
-            zoneNameFromEvent,
-            JSON.stringify(event),
-            eventTime,
-          ]
-        );
-        inserted++;
-
-        // Process automatic deduction (NCR = no path)
-        if (fleetNumber && eventName) {
-          try {
-            await processAlertDeduction(fleetNumber, eventName);
-          } catch (deductErr) {
-            console.error('[Geotab] Deduction error:', deductErr.message);
-          }
-        }
-
-        // Also store as alert in alerts + alert_groups tables (telematics source)
-        // Dynamically match the Geotab event name against alert_definitions.name
-        const { findVehicleCostCenterId } = require('./costCenterLookup');
-        const eventCC = await findVehicleCostCenterId(fleetNumber || geotabDeviceId).catch(() => null);
-        const telematicsNameMap = await getTelematicsNameMap(eventCC ? [eventCC] : []).catch(() => ({}));
-        const matchedDef = matchAlertDefinition(eventName || '', telematicsNameMap);
-
-        // Gate: only push telematics events that match an active alert_definition
-        if (wsBroadcast && insertResult.rows.length > 0 && matchedDef) {
-          const row = insertResult.rows[0];
-          wsBroadcast('new_event', {
-            id: row.id,
-            deviceId: geotabDeviceId,
-            fleetNumber,
-            licensePlate,
-            eventType: eventName,
-            eventCode,
-            severity: matchedDef.severity.toUpperCase(),
-            latitude: evtLat,
-            longitude: evtLon,
-            speed: evtSpeed,
-            distance,
-            durationSeconds,
-            driverName,
-            description: diagName,
-            zoneName: zoneNameFromEvent,
-            eventTime: new Date(eventTime).toISOString(),
-          });
-        }
-
-        try {
-          if (!matchedDef) {
-            continue;
-          }
-
-          const alertId = `tel-${geotabDeviceId}-${Date.now()}-${inserted}`;
-          const deviceName = fleetNumber ? `${fleetNumber}${licensePlate ? ' - ' + licensePlate : ''}` : geotabDeviceId;
-
-          await db.upsertAlert({
-            id: alertId,
-            deviceId: geotabDeviceId,
-            deviceName,
-            alarmType: matchedDef.name,
-            alarmTs: eventTime,
-            lat: evtLat,
-            lon: evtLon,
-            alarmText: `${eventName}${zoneNameFromEvent ? ' in zone ' + zoneNameFromEvent : ''}`,
-            sourceType: 'telematics',
-          });
-
-          await db.upsertAlertGroup({
-            deviceId: geotabDeviceId,
-            deviceName,
-            alarmType: matchedDef.name,
-            alarmText: `${eventName}${zoneNameFromEvent ? ' in zone ' + zoneNameFromEvent : ''}`,
-            alertId,
-            alarmTs: eventTime,
-            lat: evtLat,
-            lon: evtLon,
-            sourceType: 'telematics',
-          });
-          console.log(`[GEOTAB] Telematics alert created: ${alertId} (${matchedDef.name}) for device ${geotabDeviceId}`);
-        } catch (alertErr) {
-          console.error('[GEOTAB] Failed to create telematics alert:', alertErr.message, alertErr.stack);
-        }
-      } catch (err) {
-        // skip individual event errors
+      // Only advance the cursor AFTER the full page is processed successfully,
+      // so a crash never loses events.
+      if (toVersion !== null && toVersion !== undefined && toVersion !== fromVersion) {
+        lastEventVersion = toVersion;
+        await setSyncState(SYNC_STATE_EVENT_VERSION, toVersion);
+        fromVersion = toVersion;
+      } else {
+        // No new version or unchanged version — we're caught up.
+        break;
       }
     }
 
-    if (inserted > 0 || skipped > 0 || dropped > 0) {
-      console.log(`[GEOTAB] Stored ${inserted} telematics events (${skipped} skipped - not fleet${dropped > 0 ? `, ${dropped} dropped - backlog limit` : ''})`);
-    }
+    console.log(`[GEOTAB] Stored ${totalInserted} telematics events (${totalUnknownDevice} unknown devices, ${totalAlerted} alerts matched)`);
   } catch (error) {
     console.error('[GEOTAB] Failed to sync events:', error.message);
+  } finally {
+    eventsSyncInFlight = false;
   }
+}
+
+async function processGeotabEventBatch(events, { credentials, deviceMap }) {
+  let inserted = 0;
+  let unknownDevice = 0;
+  let alerted = 0;
+
+  for (let i = 0; i < events.length; i++) {
+    const event = events[i];
+    try {
+      const geotabDeviceId = event.device?.id || '';
+      const ruleId = event.rule?.id || '';
+
+      // Device lookup from the in-memory map (no per-event DB hit).
+      const device = deviceMap.get(geotabDeviceId) || null;
+      let fleetNumber = device?.fleet_number || null;
+      let licensePlate = device?.license_plate || null;
+      let isUnknownDevice = !device;
+
+      // If fleet_number looks like a Geotab short ID (e.g. "b59"), resolve proper name from vehicle_status
+      if (fleetNumber && /^b?[0-9a-f]+$/i.test(fleetNumber) && fleetNumber.length < 10) {
+        try {
+          const vs = await db.getVehicleStatus(geotabDeviceId);
+          if (vs) {
+            fleetNumber = vs.fleet_number || fleetNumber;
+            licensePlate = vs.license_plate || vs.plate || licensePlate;
+          }
+        } catch (e) { /* non-critical */ }
+      }
+
+      // Resolve human-readable rule name from cache, DB, or Geotab on demand
+      const resolvedRuleName = resolveRuleName(credentials, ruleId);
+      const eventName = resolvedRuleName || event.rule?.name || ruleId;
+      const eventCode = ruleId;
+      const severity = getSeverity(eventName);
+      const durationSeconds = db.parseDuration(event.duration);
+      const distance = typeof event.distance === 'number' ? event.distance : null;
+
+      const driverName = typeof event.driver === 'object' && event.driver?.name
+        ? event.driver.name
+        : null;
+
+      const diagName = typeof event.diagnostic === 'object' && event.diagnostic?.name
+        ? event.diagnostic.name
+        : null;
+
+      // Extract zone name from Geotab exception events
+      const zoneNameFromEvent = Array.isArray(event.zones) && event.zones.length > 0
+        ? event.zones.map(z => z.name).filter(Boolean).join(', ')
+        : null;
+
+      let evtLat = event.latitude || null;
+      let evtLon = event.longitude || null;
+      let evtSpeed = event.speed || null;
+      let evtAddress = event.address || null;
+
+      if (!evtLat || !evtLon) {
+        const vehiclePos = await db.getVehicleStatus(geotabDeviceId);
+        if (vehiclePos) {
+          evtLat = evtLat || vehiclePos.latitude;
+          evtLon = evtLon || vehiclePos.longitude;
+          evtSpeed = evtSpeed || vehiclePos.speed;
+        }
+      }
+
+      const eventTime = event.activeFrom || event.lastModifiedDateTime || new Date();
+
+      // Store telematics events even for unknown devices — device_id is known,
+      // so the event must never be silently dropped.
+      const insertResult = await db.query(
+        `INSERT INTO telematics_events
+         (device_id, vehicle_id, license_plate, fleet_number, plate,
+          event_type, event_code, severity, latitude, longitude, speed,
+          address, driver_name, description, distance, duration_seconds, zone_name, raw_data, event_time)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+         ON CONFLICT (device_id, event_code, event_time) DO NOTHING
+         RETURNING id`,
+        [
+          geotabDeviceId,
+          geotabDeviceId,
+          licensePlate,
+          fleetNumber,
+          fleetNumber,
+          eventName,
+          eventCode,
+          severity,
+          evtLat,
+          evtLon,
+          evtSpeed,
+          evtAddress,
+          driverName,
+          diagName,
+          distance,
+          durationSeconds,
+          zoneNameFromEvent,
+          JSON.stringify(event),
+          eventTime,
+        ]
+      );
+
+      if (insertResult.rows.length === 0) {
+        // Duplicate (unique index on device+event+time) — nothing new to alert on.
+        continue;
+      }
+      inserted++;
+      if (isUnknownDevice) unknownDevice++;
+
+      // Process automatic deduction (NCR = no path) — fire-and-forget so the
+      // FOR UPDATE lock in driver_scoring never blocks the ingest loop.
+      if (fleetNumber && eventName) {
+        processAlertDeduction(fleetNumber, eventName).catch((deductErr) => {
+          console.error('[Geotab] Deduction error:', deductErr.message);
+        });
+      }
+
+      // Dynamically match the Geotab event name against alert_definitions.name
+      const { findVehicleCostCenterId } = require('./costCenterLookup');
+      const eventCC = await findVehicleCostCenterId(fleetNumber || geotabDeviceId).catch(() => null);
+      const telematicsNameMap = await getTelematicsNameMap(eventCC ? [eventCC] : []).catch(() => ({}));
+      const matchedDef = matchAlertDefinition(eventName || '', telematicsNameMap);
+
+      // Gate: only push telematics events that match an active alert_definition
+      if (wsBroadcast && matchedDef && !isUnknownDevice) {
+        const row = insertResult.rows[0];
+        wsBroadcast('new_event', {
+          id: row.id,
+          deviceId: geotabDeviceId,
+          fleetNumber,
+          licensePlate,
+          eventType: eventName,
+          eventCode,
+          severity: String(matchedDef.severity || 'MEDIUM').toUpperCase(),
+          latitude: evtLat,
+          longitude: evtLon,
+          speed: evtSpeed,
+          distance,
+          durationSeconds,
+          driverName,
+          description: diagName,
+          zoneName: zoneNameFromEvent,
+          eventTime: new Date(eventTime).toISOString(),
+        });
+      }
+
+      if (!matchedDef || isUnknownDevice) {
+        continue;
+      }
+
+      const alertId = `tel-${geotabDeviceId}-${Date.now()}-${i}`;
+      const deviceName = fleetNumber ? `${fleetNumber}${licensePlate ? ' - ' + licensePlate : ''}` : geotabDeviceId;
+
+      await db.upsertAlert({
+        id: alertId,
+        deviceId: geotabDeviceId,
+        deviceName,
+        alarmType: matchedDef.name,
+        alarmTs: eventTime,
+        lat: evtLat,
+        lon: evtLon,
+        alarmText: `${eventName}${zoneNameFromEvent ? ' in zone ' + zoneNameFromEvent : ''}`,
+        sourceType: 'telematics',
+      });
+
+      await db.upsertAlertGroup({
+        deviceId: geotabDeviceId,
+        deviceName,
+        alarmType: matchedDef.name,
+        alarmText: `${eventName}${zoneNameFromEvent ? ' in zone ' + zoneNameFromEvent : ''}`,
+        alertId,
+        alarmTs: eventTime,
+        lat: evtLat,
+        lon: evtLon,
+        sourceType: 'telematics',
+      });
+      alerted++;
+      console.log(`[GEOTAB] Telematics alert created: ${alertId} (${matchedDef.name}) for device ${geotabDeviceId}`);
+    } catch (err) {
+      // skip individual event errors so one bad event can't stall the batch
+    }
+  }
+
+  return { inserted, unknownDevice, alerted };
 }
 
 // ── Vehicle status from Skycamx (independent of Geotab) ──
@@ -731,6 +886,7 @@ async function syncGeotabZones() {
     // Refresh cached zones for WS enrichment
     const allZones = await db.getGeotabZones();
     setCachedAllZones(allZones);
+    invalidateZonesCache();
   } catch (error) {
     console.error('[GEOTAB] Failed to sync zones:', error.message);
   }
@@ -896,8 +1052,20 @@ async function syncLogRecords() {
 
 async function checkZoneBreaches(deviceId, lat, lon, speed, fleetNumber, licensePlate) {
   try {
-    const zones = await db.getHighRiskZones();
-    const activeEntries = await db.getActiveZoneEntries(deviceId);
+    let zones = zonesCache.data;
+    if (!zones || Date.now() - zonesCache.ts > ZONES_CACHE_TTL) {
+      zones = await db.getHighRiskZones();
+      zonesCache = { data: zones, ts: Date.now() };
+    }
+
+    const cachedEntry = activeEntriesCache.get(deviceId);
+    let activeEntries;
+    if (cachedEntry && Date.now() - cachedEntry.ts <= ACTIVE_ENTRIES_CACHE_TTL) {
+      activeEntries = cachedEntry.data;
+    } else {
+      activeEntries = await db.getActiveZoneEntries(deviceId);
+      activeEntriesCache.set(deviceId, { data: activeEntries, ts: Date.now() });
+    }
     const activeZoneIds = new Set(activeEntries.map(e => e.zone_id));
 
     for (const zone of zones) {

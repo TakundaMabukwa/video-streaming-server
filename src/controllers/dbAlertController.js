@@ -461,6 +461,19 @@ async function getAlertMedia(req, res) {
       }
     }
 
+    let severityMap = {};
+    if (alert) {
+      try {
+        const { deviceCC } = await batchResolveDeviceCC([alert]);
+        const ccId = deviceCC.get(alert.device_id);
+        const ccIds = ccId ? [ccId] : [];
+        const perCCMaps = await getPerCCSeverityMaps(ccIds);
+        severityMap = (ccId && perCCMaps[ccId]) || perCCMaps[0] || {};
+      } catch (mapErr) {
+        console.error(`[ALERT] severityMap resolution error for ${id}:`, mapErr.message);
+      }
+    }
+
     const transformed = alert ? transformDbAlert(alert, severityMap) : null;
     if (group && transformed) transformed.count = group.count;
 
