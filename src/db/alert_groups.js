@@ -1,25 +1,50 @@
 const { query } = require('./pool');
 
 async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, alertId, alarmTs, lat, lon, sourceType = 'video' }) {
-  const groupKey = `${deviceId}:${alarmType}`.toLowerCase();
+  const baseKey = `${deviceId}:${alarmType}`.toLowerCase();
+
+  // Reuse the current ACTIVE (unresolved) group for this device+type: bump the
+  // counter and refresh the timestamp so the group keeps showing recent time.
+  const active = await query(
+    `SELECT group_key FROM alert_groups
+     WHERE device_id = $1 AND alarm_type = $2 AND source_type = $3 AND resolved = FALSE
+     ORDER BY last_alert_ts DESC NULLS LAST
+     LIMIT 1`,
+    [deviceId, alarmType, sourceType]
+  );
+
+  if (active.rows.length > 0) {
+    const groupKey = active.rows[0].group_key;
+    const result = await query(
+      `UPDATE alert_groups SET
+         count = alert_groups.count + 1,
+         last_alert_id = $1,
+         last_alert_ts = $2,
+         device_name = COALESCE(NULLIF($3, ''), alert_groups.device_name),
+         lat = COALESCE($4, alert_groups.lat),
+         lon = COALESCE($5, alert_groups.lon),
+         alarm_text = COALESCE(NULLIF($6, ''), alert_groups.alarm_text),
+         updated_at = NOW()
+       WHERE group_key = $7
+       RETURNING id, group_key`,
+      [alertId, alarmTs, deviceName, lat, lon, alarmText, groupKey]
+    );
+    return result.rows[0];
+  }
+
+  // No active group -> start a NEW group. If the base key is still taken by a
+  // resolved (closed) group, pick a fresh unique key so this new alert surfaces
+  // in its own group instead of merging into the resolved one.
+  let groupKey = baseKey;
+  const taken = await query('SELECT 1 FROM alert_groups WHERE group_key = $1', [groupKey]);
+  if (taken.rows.length > 0) {
+    groupKey = `${baseKey}:${Date.now().toString(36)}${alertId ? '-' + String(alertId).slice(-6) : ''}`;
+  }
+
   const result = await query(
     `INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon, source_type)
      VALUES ($1, $2, $3, $4, $5, 1, $6, $7, $8, $9, $10)
-     ON CONFLICT (group_key) DO UPDATE SET
-       count = alert_groups.count + 1,
-       last_alert_id = $6,
-       last_alert_ts = $7,
-       device_name = COALESCE(NULLIF($3, ''), alert_groups.device_name),
-       lat = COALESCE($8, alert_groups.lat),
-       lon = COALESCE($9, alert_groups.lon),
-       alarm_text = COALESCE(NULLIF($5, ''), alert_groups.alarm_text),
-       resolved = FALSE,
-       false_alert = FALSE,
-       status = NULL,
-       resolved_by = NULL,
-       resolved_at = NULL,
-       updated_at = NOW()
-     RETURNING id`,
+     RETURNING id, group_key`,
     [groupKey, deviceId, deviceName, alarmType, alarmText, alertId, alarmTs, lat, lon, sourceType]
   );
   return result.rows[0];

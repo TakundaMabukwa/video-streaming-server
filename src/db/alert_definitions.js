@@ -209,7 +209,8 @@ async function getTelematicsNameMap(costCenterIds) {
     try {
       const result = await db.query(
         `SELECT name, signal_code, severity FROM alert_definitions
-         WHERE category = 'telematics' AND is_active = true AND name IS NOT NULL AND name != ''`
+         WHERE category = 'telematics' AND is_active = true AND name IS NOT NULL AND name != ''
+           AND signal_code IS DISTINCT FROM 'exceptionEvent'`
       );
       const map = {};
       for (const row of result.rows) {
@@ -229,24 +230,25 @@ async function getTelematicsNameMap(costCenterIds) {
   if (cached && now - cached.ts < CACHE_TTL_MS) return cached.map;
 
   try {
-    const result = await db.query(
-      `SELECT d.name, d.signal_code, d.severity, o.severity AS override_severity
-       FROM alert_definitions d
-       INNER JOIN alert_definition_overrides o
-         ON o.alert_definition_id = d.id AND o.cost_center_id = ANY($1::int[])
-       WHERE d.category = 'telematics' AND d.is_active = true AND d.name IS NOT NULL AND d.name != ''
-         AND o.is_active IS DISTINCT FROM false`,
-      [costCenterIds]
-    );
-    const map = {};
-    for (const row of result.rows) {
-      map[row.name.toLowerCase()] = {
-        name: row.name,
-        signalCode: row.signal_code,
-        severity: (row.override_severity || row.severity || 'MEDIUM').toLowerCase(),
-      };
-    }
-    ccTelematicsNameCache.set(key, { map, ts: now });
+const result = await db.query(
+        `SELECT d.name, d.signal_code, d.severity, o.severity AS override_severity
+         FROM alert_definitions d
+         INNER JOIN alert_definition_overrides o
+           ON o.alert_definition_id = d.id AND o.cost_center_id = ANY($1::int[])
+         WHERE d.category = 'telematics' AND d.is_active = true AND d.name IS NOT NULL AND d.name != ''
+           AND d.signal_code IS DISTINCT FROM 'exceptionEvent'
+           AND o.is_active IS DISTINCT FROM false`,
+        [costCenterIds]
+      );
+      const map = {};
+      for (const row of result.rows) {
+        map[row.name.toLowerCase()] = {
+          name: row.name,
+          signalCode: row.signal_code,
+          severity: (row.override_severity || row.severity || 'MEDIUM').toLowerCase(),
+        };
+      }
+      ccTelematicsNameCache.set(key, { map, ts: now });
     return map;
   } catch (error) {
     console.error('[alert_definitions] Failed to load CC telematics name map:', error.message);
@@ -268,7 +270,8 @@ async function getTelematicsNameSeverityMap(costCenterIds) {
     try {
       const result = await db.query(
         `SELECT name, signal_code, severity FROM alert_definitions
-         WHERE category = 'telematics' AND is_active = true AND name IS NOT NULL AND name != ''`
+         WHERE category = 'telematics' AND is_active = true AND name IS NOT NULL AND name != ''
+           AND signal_code IS DISTINCT FROM 'exceptionEvent'`
       );
       const map = {};
       for (const row of result.rows) {
@@ -290,22 +293,23 @@ async function getTelematicsNameSeverityMap(costCenterIds) {
   if (cached && now - cached.ts < CACHE_TTL_MS) return cached.map;
 
   try {
-    const result = await db.query(
-      `SELECT d.name, d.signal_code, d.severity, o.severity AS override_severity
-       FROM alert_definitions d
-       INNER JOIN alert_definition_overrides o
-         ON o.alert_definition_id = d.id AND o.cost_center_id = ANY($1::int[])
-       WHERE d.category = 'telematics' AND d.is_active = true AND d.name IS NOT NULL AND d.name != ''
-         AND o.is_active IS DISTINCT FROM false`,
-      [costCenterIds]
-    );
-    const map = {};
-    for (const row of result.rows) {
-      const sev = (row.override_severity || row.severity || 'MEDIUM').toLowerCase();
-      map[row.name.toLowerCase()] = sev;
-      if (row.signal_code) map[row.signal_code.toLowerCase()] = sev;
-    }
-    ccTelematicsNameSevCache.set(key, { map, ts: now });
+const result = await db.query(
+        `SELECT d.name, d.signal_code, d.severity, o.severity AS override_severity
+         FROM alert_definitions d
+         INNER JOIN alert_definition_overrides o
+           ON o.alert_definition_id = d.id AND o.cost_center_id = ANY($1::int[])
+         WHERE d.category = 'telematics' AND d.is_active = true AND d.name IS NOT NULL AND d.name != ''
+           AND d.signal_code IS DISTINCT FROM 'exceptionEvent'
+           AND o.is_active IS DISTINCT FROM false`,
+        [costCenterIds]
+      );
+      const map = {};
+      for (const row of result.rows) {
+        const sev = (row.override_severity || row.severity || 'MEDIUM').toLowerCase();
+        map[row.name.toLowerCase()] = sev;
+        if (row.signal_code) map[row.signal_code.toLowerCase()] = sev;
+      }
+      ccTelematicsNameSevCache.set(key, { map, ts: now });
     return map;
   } catch (error) {
     console.error('[alert_definitions] Failed to load CC telematics name severity map:', error.message);
