@@ -21,12 +21,13 @@ function extractFleetNumber(name) {
 
 function parseDuration(durationStr) {
   if (!durationStr) return null;
-  const parts = durationStr.split(':');
+  const parts = String(durationStr).split(':');
   if (parts.length !== 3) return null;
   const hours = parseFloat(parts[0]) || 0;
   const minutes = parseFloat(parts[1]) || 0;
   const seconds = parseFloat(parts[2]) || 0;
-  return hours * 3600 + minutes * 60 + seconds;
+  const total = hours * 3600 + minutes * 60 + seconds;
+  return Number.isFinite(total) ? Math.round(total) : null;
 }
 
 // ── Geotab Devices ──
