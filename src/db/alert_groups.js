@@ -13,6 +13,11 @@ async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, al
        lat = COALESCE($8, alert_groups.lat),
        lon = COALESCE($9, alert_groups.lon),
        alarm_text = COALESCE(NULLIF($5, ''), alert_groups.alarm_text),
+       resolved = FALSE,
+       false_alert = FALSE,
+       status = NULL,
+       resolved_by = NULL,
+       resolved_at = NULL,
        updated_at = NOW()
      RETURNING id`,
     [groupKey, deviceId, deviceName, alarmType, alarmText, alertId, alarmTs, lat, lon, sourceType]

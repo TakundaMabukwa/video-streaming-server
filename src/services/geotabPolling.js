@@ -773,7 +773,7 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
         continue;
       }
 
-      const alertId = `tel-${geotabDeviceId}-${Date.now()}-${i}`;
+      const alertId = `tel-${geotabDeviceId}-${event.id || `${Date.now()}-${i}`}`;
       const deviceName = fleetNumber ? `${fleetNumber}${licensePlate ? ' - ' + licensePlate : ''}` : geotabDeviceId;
 
       await db.upsertAlert({
