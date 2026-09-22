@@ -198,6 +198,8 @@ async function getPerCCSeverityMaps(ccIds, categories = ['video', 'telematics'])
  * Build a name-based map for telematics: { lowercase_name: { signal_code, severity } }.
  * This allows matching incoming Geotab event names (e.g. "Driver Fatigue") directly
  * against alert_definitions without hardcoding signal code mappings.
+ * Returns { nameMap, signalCodeMap } so raw rule-id event types (e.g.
+ * "RuleHarshBrakingId" or an unresolvable hash) can still exact-match a definition.
  */
 async function getTelematicsNameMap(costCenterIds) {
   const key = cacheKeyFor(costCenterIds);
@@ -213,21 +215,24 @@ async function getTelematicsNameMap(costCenterIds) {
            AND signal_code IS DISTINCT FROM 'exceptionEvent'`
       );
       const map = {};
+      const signalCodeMap = {};
       for (const row of result.rows) {
-        map[row.name.toLowerCase()] = { name: row.name, signalCode: row.signal_code, severity: (row.severity || 'MEDIUM').toLowerCase() };
+        const entry = { name: row.name, signalCode: row.signal_code, severity: (row.severity || 'MEDIUM').toLowerCase() };
+        map[row.name.toLowerCase()] = entry;
+        if (row.signal_code) signalCodeMap[row.signal_code.toLowerCase()] = entry;
       }
-      cachedTelematicsNameMap = map;
+      cachedTelematicsNameMap = { nameMap: map, signalCodeMap };
       telematicsNameCacheTime = now;
       return cachedTelematicsNameMap;
     } catch (error) {
       console.error('[alert_definitions] Failed to load telematics name map:', error.message);
-      return cachedTelematicsNameMap || {};
+      return cachedTelematicsNameMap || { nameMap: {}, signalCodeMap: {} };
     }
   }
 
   const now = Date.now();
   const cached = ccTelematicsNameCache.get(key);
-  if (cached && now - cached.ts < CACHE_TTL_MS) return cached.map;
+  if (cached && now - cached.ts < CACHE_TTL_MS) return cached;
 
   try {
 const result = await db.query(
@@ -241,18 +246,22 @@ const result = await db.query(
         [costCenterIds]
       );
       const map = {};
+      const signalCodeMap = {};
       for (const row of result.rows) {
-        map[row.name.toLowerCase()] = {
+        const entry = {
           name: row.name,
           signalCode: row.signal_code,
           severity: (row.override_severity || row.severity || 'MEDIUM').toLowerCase(),
         };
+        map[row.name.toLowerCase()] = entry;
+        if (row.signal_code) signalCodeMap[row.signal_code.toLowerCase()] = entry;
       }
-      ccTelematicsNameCache.set(key, { map, ts: now });
-    return map;
+      const built = { nameMap: map, signalCodeMap, ts: now };
+      ccTelematicsNameCache.set(key, built);
+      return built;
   } catch (error) {
     console.error('[alert_definitions] Failed to load CC telematics name map:', error.message);
-    return cached ? cached.map : {};
+    return cached || { nameMap: {}, signalCodeMap: {} };
   }
 }
 

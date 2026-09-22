@@ -180,7 +180,7 @@ async function handleFrame(frame) {
   // ── 2. CC-aware status -> alert definition match (name only, no multicode) ──
   if (frame.status) {
     const nameMap = await getTelematicsNameMap(ccId ? [ccId] : []).catch(() => ({}));
-    const matchedDef = matchAlertDefinition(frame.status, nameMap);
+    const matchedDef = matchAlertDefinition(frame.status, nameMap.nameMap || {}, nameMap.signalCodeMap || {});
 
     if (matchedDef) {
       const alertId = `stl-${fleetNumber}-${Date.now()}-${nowSeq}`;

@@ -744,7 +744,7 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
       const { findVehicleCostCenterId } = require('./costCenterLookup');
       const eventCC = await findVehicleCostCenterId(fleetNumber || geotabDeviceId).catch(() => null);
       const telematicsNameMap = await getTelematicsNameMap(eventCC ? [eventCC] : []).catch(() => ({}));
-      const matchedDef = matchAlertDefinition(eventName || '', telematicsNameMap);
+      const matchedDef = matchAlertDefinition(eventName || '', telematicsNameMap.nameMap || {}, telematicsNameMap.signalCodeMap || {});
 
       // Gate: only push telematics events that match an active alert_definition
       if (wsBroadcast && matchedDef && !isUnknownDevice) {
