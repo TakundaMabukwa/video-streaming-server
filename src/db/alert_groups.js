@@ -132,7 +132,9 @@ async function getActiveAlertGroups({ limit = 2000 } = {}) {
 }
 
 async function getAlertGroupById(id) {
-  const result = await query('SELECT * FROM alert_groups WHERE id = $1', [id]);
+  const n = Number(id);
+  if (!Number.isInteger(n) || n < 1 || n > 2147483647) return null;
+  const result = await query('SELECT * FROM alert_groups WHERE id = $1', [n]);
   return result.rows[0] || null;
 }
 

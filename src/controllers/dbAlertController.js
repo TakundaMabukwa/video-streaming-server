@@ -607,7 +607,7 @@ async function resolveAlert(req, res) {
     if (!group && id) {
       group = await db.getAlertGroupByAlertId(id);
     }
-    if (!group && id && /^\d+$/.test(String(id))) {
+    if (!group && id && /^\d+$/.test(String(id)) && String(id).length <= 10) {
       group = await db.getAlertGroupById(Number(id));
     }
     if (!group) {
@@ -837,7 +837,7 @@ async function markFalseAlert(req, res) {
     let group = null;
     if (group_key) group = await db.getAlertGroupByKey(group_key);
     if (!group) group = await db.getAlertGroupByAlertId(id);
-    if (!group && /^\d+$/.test(String(id))) group = await db.getAlertGroupById(Number(id));
+    if (!group && /^\d+$/.test(String(id)) && String(id).length <= 10) group = await db.getAlertGroupById(Number(id));
     if (!group && (device_id || alert?.device_id) && (alarm_type || alert?.alarm_type)) {
       group = await db.getAlertGroupByKey(`${clean(device_id || alert?.device_id)}:${clean(alarm_type || alert?.alarm_type)}`);
     }
