@@ -1042,8 +1042,6 @@ async function resolveAlertsBulk(req, res) {
       return res.json({ success: true, resolved: 0, total: 0, message: 'No alerts to resolve' });
     }
 
-    const placeholders = uniqueIds.map((_, i) => `$${i + 1}`).join(', ');
-
     const n = uniqueIds.length;
     const pLast = uniqueIds.map((_, i) => `$${i + 1}`).join(', ');
     const pPk = uniqueIds.map((_, i) => `$${i + 1 + n}`).join(', ');
@@ -1053,6 +1051,12 @@ async function resolveAlertsBulk(req, res) {
     const pAt = n * 3 + 3;
     const pNotes = n * 3 + 4;
     const idParams = [...uniqueIds, ...uniqueIds, ...uniqueIds];
+    // directUpdate binds [isFalse, now, ...uniqueIds] → ids start at $3
+    const pDirectIds = uniqueIds.map((_, i) => `$${i + 3}`).join(', ');
+    // siblingCount binds [...idParams, ...uniqueIds] → ids start after 3n
+    const pSiblingIds = uniqueIds.map((_, i) => `$${i + 1 + n * 3}`).join(', ');
+    // orphanSiblings binds [...uniqueIds] only → ids start at $1
+    const pPlainIds = uniqueIds.map((_, i) => `$${i + 1}`).join(', ');
 
     // Match groups by last_alert_id OR group primary key OR group_key so board ids always hit.
     const groupUpdate = await db.query(
@@ -1090,7 +1094,7 @@ async function resolveAlertsBulk(req, res) {
 
     const directUpdate = await db.query(
       `UPDATE alerts SET resolved = TRUE, false_alert = $1::boolean, updated_at = $2::timestamptz
-       WHERE id IN (${placeholders}) AND resolved = FALSE`,
+       WHERE id IN (${pDirectIds}) AND resolved = FALSE`,
       [isFalse, now, ...uniqueIds]
     );
 
@@ -1099,7 +1103,7 @@ async function resolveAlertsBulk(req, res) {
     if (groupResult.rows.length === 0 && directUpdate.rowCount > 0) {
       const orphanSiblings = await db.query(
         `SELECT DISTINCT device_id, alarm_type FROM alerts
-         WHERE id IN (${placeholders}) AND device_id IS NOT NULL AND alarm_type IS NOT NULL`,
+         WHERE id IN (${pPlainIds}) AND device_id IS NOT NULL AND alarm_type IS NOT NULL`,
         uniqueIds
       );
       for (const g of orphanSiblings.rows) {
@@ -1115,7 +1119,7 @@ async function resolveAlertsBulk(req, res) {
       `SELECT COUNT(*)::int AS n FROM alert_groups WHERE resolved = FALSE AND (device_id, alarm_type) IN (
          SELECT device_id, alarm_type FROM alert_groups WHERE last_alert_id IN (${pLast}) OR id::text IN (${pPk}) OR group_key IN (${pKey})
          UNION
-         SELECT device_id, alarm_type FROM alerts WHERE id IN (${placeholders}) AND device_id IS NOT NULL AND alarm_type IS NOT NULL
+         SELECT device_id, alarm_type FROM alerts WHERE id IN (${pSiblingIds}) AND device_id IS NOT NULL AND alarm_type IS NOT NULL
        )`,
       [...idParams, ...uniqueIds]
     );
