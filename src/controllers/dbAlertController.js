@@ -860,7 +860,7 @@ async function markFalseAlert(req, res) {
       );
       resolvedGroups = upd.rowCount || 0;
       await db.query(
-        `UPDATE alerts SET resolved = TRUE, false_alert = TRUE, updated_at = $2::timestamptz
+        `UPDATE alerts SET resolved = TRUE, false_alert = $1::boolean, updated_at = $2::timestamptz
          WHERE device_id = $3 AND alarm_type = $4 AND resolved = FALSE`,
         [true, now, targetDeviceId, targetAlarmType]
       );
