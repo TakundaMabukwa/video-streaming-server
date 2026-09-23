@@ -384,14 +384,26 @@ async function syncAlerts(deviceIds, startTime, endTime) {
       if (wsBroadcast) {
         for (const r of newRecords) {
           try {
+            const alarmTsIso = r.alarmTs ? new Date(r.alarmTs).toISOString() : new Date().toISOString();
             wsBroadcast('new-alert', {
               alert: {
                 id: r.id,
+                device_id: r.deviceId,
                 deviceId: r.deviceId,
+                vehicleId: r.deviceId,
+                device_name: r.deviceName,
                 deviceName: r.deviceName,
-                alarmType: r.alarmType,
-                alarmTs: r.alarmTs ? new Date(r.alarmTs).toISOString() : null,
+                alert_type: r.alarmType,
+                alarm_type: r.alarmType,
+                type: r.alarmType,
+                title: r.alarmType,
                 alarmText: r.alarmText,
+                timestamp: alarmTsIso,
+                alarmTs: alarmTsIso,
+                last_occurrence: alarmTsIso,
+                source_type: 'video',
+                status: 'new',
+                resolved: false,
                 lat: r.lat,
                 lon: r.lon,
               },

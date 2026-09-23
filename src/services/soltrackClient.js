@@ -201,7 +201,7 @@ async function handleFrame(frame) {
           sourceType: 'telematics',
         });
 
-        await db.upsertAlertGroup({
+        const groupRow = await db.upsertAlertGroup({
           deviceId: fleetNumber,
           deviceName,
           alarmType: matchedDef.name,
@@ -228,6 +228,37 @@ async function handleFrame(frame) {
         );
 
         if (wsBroadcast) {
+          try {
+            wsBroadcast('new-alert', {
+              alert: {
+                id: alertId,
+                device_id: fleetNumber,
+                deviceId: fleetNumber,
+                vehicleId: fleetNumber,
+                device_name: deviceName,
+                deviceName,
+                alert_type: matchedDef.name,
+                alarm_type: matchedDef.name,
+                type: matchedDef.name,
+                title: matchedDef.name,
+                alarmText,
+                timestamp: new Date(eventTime).toISOString(),
+                alarmTs: new Date(eventTime).toISOString(),
+                last_occurrence: new Date(eventTime).toISOString(),
+                source_type: 'telematics',
+                severity: String(severity).toLowerCase(),
+                priority: String(severity).toLowerCase(),
+                status: 'new',
+                resolved: false,
+                count: Number(groupRow?.count || 1) || 1,
+                group_key: groupRow?.group_key || `${fleetNumber}:${matchedDef.name}`.toLowerCase(),
+                lat: frame.lat,
+                lon: frame.lon,
+                fleet_number: fleetNumber,
+                vehicle_registration: plate,
+              },
+            });
+          } catch (_) { /* never block ingest on WS */ }
           try {
             wsBroadcast('new_event', {
               id: alertId,

@@ -157,11 +157,13 @@ async function start() {
     syncService.setWsBroadcast(broadcast);
     server = app.listen(config.port, async () => {
       console.log(`Server running on port ${config.port} in ${config.nodeEnv} mode`);
-      try {
-        await syncService.startAutoSync(30000);
-      } catch (err) {
-        console.error(`[SYNC] Auto-sync failed to start: ${err.message}`);
-      }
+    // Video alarms every 15s — each cycle is ~6s, so this keeps wall-clock
+    // delay for a new Metax/Skycamx alert near one interval (not 30s+runtime).
+    try {
+      await syncService.startAutoSync(15000);
+    } catch (err) {
+      console.error(`[SYNC] Auto-sync failed to start: ${err.message}`);
+    }
     });
     server.setTimeout(30000);
   } catch (err) {
