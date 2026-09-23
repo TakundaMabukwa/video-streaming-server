@@ -1,5 +1,9 @@
 const { query } = require('./pool');
 
+// After Resolve/False, keep the same vehicle+type closed for this long so the
+// next poll cannot instantly mint a fresh active card.
+const RESOLVE_COOLDOWN_MS = 10 * 60 * 1000;
+
 async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, alertId, alarmTs, lat, lon, sourceType = 'video' }) {
   const baseKey = `${deviceId}:${alarmType}`.toLowerCase();
 
@@ -32,6 +36,39 @@ async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, al
     return result.rows[0];
   }
 
+  // No active group. If this vehicle+type was resolved very recently, absorb the
+  // new event into that closed group (stay resolved) instead of reopening/creating.
+  const recentResolved = await query(
+    `SELECT group_key, resolved_at FROM alert_groups
+     WHERE device_id = $1 AND alarm_type = $2 AND source_type = $3 AND resolved = TRUE
+     ORDER BY resolved_at DESC NULLS LAST, updated_at DESC NULLS LAST
+     LIMIT 1`,
+    [deviceId, alarmType, sourceType]
+  );
+  if (recentResolved.rows.length > 0) {
+    const resolvedAt = recentResolved.rows[0].resolved_at
+      ? new Date(recentResolved.rows[0].resolved_at).getTime()
+      : 0;
+    if (resolvedAt && Date.now() - resolvedAt < RESOLVE_COOLDOWN_MS) {
+      const groupKey = recentResolved.rows[0].group_key;
+      const result = await query(
+        `UPDATE alert_groups SET
+           count = alert_groups.count + 1,
+           last_alert_id = $1,
+           last_alert_ts = $2,
+           device_name = COALESCE(NULLIF($3, ''), alert_groups.device_name),
+           lat = COALESCE($4, alert_groups.lat),
+           lon = COALESCE($5, alert_groups.lon),
+           alarm_text = COALESCE(NULLIF($6, ''), alert_groups.alarm_text),
+           updated_at = NOW()
+         WHERE group_key = $7 AND resolved = TRUE
+         RETURNING id, group_key, resolved`,
+        [alertId, alarmTs, deviceName, lat, lon, alarmText, groupKey]
+      );
+      if (result.rows[0]) return result.rows[0];
+    }
+  }
+
   // No active group -> start a NEW group. If the base key is still taken by a
   // resolved (closed) group, pick a fresh unique key so this new alert surfaces
   // in its own group instead of merging into the resolved one.
@@ -45,7 +82,7 @@ async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, al
     `INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon, source_type)
      VALUES ($1, $2, $3, $4, $5, 1, $6, $7, $8, $9, $10)
      RETURNING id, group_key`,
-    [groupKey, deviceId, deviceName, alarmType, alarmText, alertId, alarmTs, lat, lon, sourceType]
+    [groupKey, deviceId, deviceName, alarmType, alarmText, alertId, alarmTs || null, lat, lon, sourceType]
   );
   return result.rows[0];
 }
@@ -62,6 +99,8 @@ async function batchUpsertAlertGroups(groups) {
     );
     return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, 1, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9})`;
   }).join(',');
+  // On conflict only bump ACTIVE groups. Resolved groups stay closed (Resolve sticks);
+  // a later active twin can still be created via the non-conflict path below.
   const result = await query(
     `INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon)
      VALUES ${placeholders}
@@ -74,6 +113,7 @@ async function batchUpsertAlertGroups(groups) {
        lon = COALESCE(EXCLUDED.lon, alert_groups.lon),
        alarm_text = COALESCE(NULLIF(EXCLUDED.alarm_text, ''), alert_groups.alarm_text),
        updated_at = NOW()
+     WHERE alert_groups.resolved = FALSE
      RETURNING id, group_key`,
     params
   );

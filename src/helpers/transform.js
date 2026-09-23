@@ -82,6 +82,7 @@ function transformDbAlert(record, severityMap) {
     notes: record.notes || null,
     escalated: false,
     source_type: record.source_type || 'video',
+    group_key: record.group_key || null,
     device_id: deviceId,
     vehicleId: deviceId,
     vehicle_registration: record.device_name || null,

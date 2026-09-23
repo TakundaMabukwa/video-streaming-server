@@ -584,58 +584,96 @@ async function resolveAlert(req, res) {
       ncr_classification,
       close_reason,
       reported_by,
-      resolveScope = 'this_alert',
+      resolveScope = 'all_group',
+      group_key: groupKeyFromBody,
+      device_id: deviceIdFromBody,
+      alarm_type: alarmTypeFromBody,
       incident: incidentData = {},
     } = req.body || {};
 
     const isFalse = closureType === 'false_alert';
     const now = new Date().toISOString();
+    const clean = (v) => String(v == null ? '' : v).trim();
 
-    // Load the alert (needed for incident capture / deduction)
+    // Alert row is optional: group cards can carry last_alert_id or group id.
     const alertResult = await db.query('SELECT * FROM alerts WHERE id = $1', [id]);
-    if (alertResult.rows.length === 0) {
+    const alert = alertResult.rows[0] || null;
+
+    // Resolve the group robustly: explicit key → last_alert_id → group PK → device+type.
+    let group = null;
+    if (groupKeyFromBody) {
+      group = await db.getAlertGroupByKey(groupKeyFromBody);
+    }
+    if (!group && id) {
+      group = await db.getAlertGroupByAlertId(id);
+    }
+    if (!group && id && /^\d+$/.test(String(id))) {
+      group = await db.getAlertGroupById(Number(id));
+    }
+    if (!group) {
+      const deviceId = clean(deviceIdFromBody || alert?.device_id).toLowerCase();
+      const alarmType = clean(alarmTypeFromBody || alert?.alarm_type).toLowerCase();
+      if (deviceId && alarmType) {
+        group = await db.getAlertGroupByKey(`${deviceId}:${alarmType}`);
+      }
+    }
+
+    const resolvedGroupKey = group ? group.group_key : null;
+    const targetDeviceId = clean(group?.device_id || deviceIdFromBody || alert?.device_id);
+    const targetAlarmType = clean(group?.alarm_type || alarmTypeFromBody || alert?.alarm_type);
+    const useAllGroup = resolveScope !== 'this_alert';
+
+    // Kill every active group for this vehicle+type so the board card cannot linger.
+    let affectedGroups = [];
+    if (targetDeviceId && targetAlarmType && useAllGroup) {
+      const allForType = await db.query(
+        `SELECT id, group_key, count, last_alert_id, device_id, alarm_type FROM alert_groups
+         WHERE device_id = $1 AND alarm_type = $2 AND resolved = FALSE
+         FOR UPDATE`,
+        [targetDeviceId, targetAlarmType]
+      );
+      affectedGroups = allForType.rows;
+    } else if (group) {
+      affectedGroups = [group];
+    }
+
+    if (affectedGroups.length === 0 && !alert) {
       return res.status(404).json({ success: false, message: `Alert ${id} not found` });
     }
-    const alert = alertResult.rows[0];
 
-    // Resolve the alert group if it exists (telematics alerts may not match last_alert_id)
-    const group = await db.getAlertGroupByAlertId(id)
-      || await db.getAlertGroupByKey(`${alert.device_id}:${alert.alarm_type}`.toLowerCase());
-    const resolvedGroupKey = group ? group.group_key : null;
+    for (const g of affectedGroups) {
+      await db.resolveAlertGroup(g.group_key, {
+        resolved: true,
+        false_alert: isFalse,
+        resolved_by: userId || null,
+        resolved_at: now,
+        notes: notes || null,
+      });
+    }
 
-    let count = 1;
-    if (resolveScope === 'all_group' && group) {
-      // Set-based resolve of the whole group + all its child alerts (fast, one shot)
-      await db.query(
-        `UPDATE alert_groups SET resolved = TRUE, false_alert = $1::boolean, resolved_by = $2, resolved_at = $3::timestamptz, notes = COALESCE($4, notes), updated_at = NOW()
-         WHERE group_key = $5 AND resolved = FALSE`,
-        [isFalse, userId || null, now, notes || null, group.group_key]
-      );
+    if (alert) {
+      const updates = { resolved: true, false_alert: isFalse };
+      if (notes) updates.notes = notes;
+      await db.updateAlertStatus(alert.id, updates);
+    }
+
+    // Clear every open child alert for this vehicle+type (and the direct id).
+    if (targetDeviceId && targetAlarmType) {
       await db.query(
         `UPDATE alerts SET resolved = TRUE, false_alert = $1::boolean, updated_at = $2::timestamptz
          WHERE device_id = $3 AND alarm_type = $4 AND resolved = FALSE`,
-        [isFalse, now, group.device_id, group.alarm_type]
+        [isFalse, now, targetDeviceId, targetAlarmType]
       );
+    }
+    if (alert) {
       await db.query(
         `UPDATE alerts SET resolved = TRUE, false_alert = $1::boolean, updated_at = $2::timestamptz
          WHERE id = $3 AND resolved = FALSE`,
-        [isFalse, now, id]
+        [isFalse, now, alert.id]
       );
-      count = group.count || 1;
-    } else {
-      const updates = { resolved: true, false_alert: isFalse };
-      if (notes) updates.notes = notes;
-      await db.updateAlertStatus(id, updates);
-      if (group) {
-        await db.resolveAlertGroup(group.group_key, {
-          resolved: true,
-          false_alert: isFalse,
-          resolved_by: userId || null,
-          resolved_at: now,
-          notes: notes || null,
-        });
-      }
     }
+
+    let count = affectedGroups.reduce((sum, g) => sum + (Number(g.count) || 1), 0) || 1;
 
     // Documents: store on Supabase, keep the link for the incident register
     const docs = [];
@@ -651,15 +689,17 @@ async function resolveAlert(req, res) {
           });
         }
       }
-      if (docs.length > 0) {
-        await db.addAlertDocument(id, docs);
+      if (docs.length > 0 && alert) {
+        await db.addAlertDocument(alert.id, docs);
       }
     }
 
     // Capture / update the incident register row for NCR closures
-    const isNcr = String(alert.alarm_type || '').startsWith('NCR:')
+    const isNcr = !!alert && (
+      String(alert.alarm_type || '').startsWith('NCR:')
       || closureType === 'ncr'
-      || !!(incidentData.infringement || ncr_classification || close_reason || action_taken);
+      || !!(incidentData.infringement || ncr_classification || close_reason || action_taken)
+    );
 
     let incident = null;
     let deduction = { deducted: false };
@@ -740,8 +780,9 @@ async function resolveAlert(req, res) {
       incident: incident || null,
       deduction,
       count,
-      message: group
-        ? `Alert group ${group.group_key} resolved (${count} alerts)${resolveScope === 'all_group' ? ' + all children' : ''}`
+      group_key: resolvedGroupKey,
+      message: affectedGroups.length > 0
+        ? `Resolved ${affectedGroups.length} active group(s) for this vehicle+type (${count} alerts)`
         : `Alert ${id} resolved successfully`,
     });
 
@@ -754,30 +795,24 @@ async function resolveAlert(req, res) {
         false_alert: isFalse,
         closureType,
         resolved_by: userId || null,
+        group_key: resolvedGroupKey,
+        device_id: targetDeviceId || null,
+        alert_type: targetAlarmType || null,
       };
       wsBroadcast('alert-status-changed', { alert: broadcastPayload });
-      if (resolveScope === 'all_group' && group) {
-        try {
-          const childResult = await db.query(
-            `SELECT last_alert_id FROM alert_groups WHERE device_id = $1 AND alarm_type = $2 AND resolved = FALSE`,
-            [group.device_id, group.alarm_type]
-          );
-          for (const row of childResult.rows) {
-            if (String(row.last_alert_id) !== String(id)) {
-              wsBroadcast('alert-status-changed', {
-                alert: {
-                  id: row.last_alert_id,
-                  alert_id: row.last_alert_id,
-                  status: 'resolved',
-                  resolved: true,
-                  false_alert: isFalse,
-                  resolved_by: userId || null,
-                },
-              });
-            }
-          }
-        } catch (broadcastErr) {
-          console.error('[ResolveAlert] Broadcast children error:', broadcastErr.message);
+      for (const g of affectedGroups) {
+        if (String(g.last_alert_id) && String(g.last_alert_id) !== String(id)) {
+          wsBroadcast('alert-status-changed', {
+            alert: {
+              id: g.last_alert_id,
+              alert_id: g.last_alert_id,
+              status: 'resolved',
+              resolved: true,
+              false_alert: isFalse,
+              resolved_by: userId || null,
+              group_key: g.group_key,
+            },
+          });
         }
       }
     }
@@ -793,18 +828,71 @@ async function escalateAlert(req, res) {
 async function markFalseAlert(req, res) {
   try {
     const { id } = req.params;
-    const { userId, notes } = req.body || {};
+    const { userId, notes, group_key, device_id, alarm_type } = req.body || {};
+    const clean = (v) => String(v == null ? '' : v).trim();
 
-    const alert = await db.updateAlertStatus(id, { resolved: true, false_alert: true });
+    const alertRow = await db.query('SELECT * FROM alerts WHERE id = $1', [id]);
+    const alert = alertRow.rows[0] || null;
 
-    if (!alert) {
+    let group = null;
+    if (group_key) group = await db.getAlertGroupByKey(group_key);
+    if (!group) group = await db.getAlertGroupByAlertId(id);
+    if (!group && /^\d+$/.test(String(id))) group = await db.getAlertGroupById(Number(id));
+    if (!group && (device_id || alert?.device_id) && (alarm_type || alert?.alarm_type)) {
+      group = await db.getAlertGroupByKey(`${clean(device_id || alert?.device_id)}:${clean(alarm_type || alert?.alarm_type)}`);
+    }
+
+    const targetDeviceId = clean(group?.device_id || device_id || alert?.device_id);
+    const targetAlarmType = clean(group?.alarm_type || alarm_type || alert?.alarm_type);
+    const now = new Date().toISOString();
+
+    if (!alert && !group && !(targetDeviceId && targetAlarmType)) {
       return res.status(404).json({ success: false, message: `Alert ${id} not found` });
     }
 
-    // Also mark the group as false alert
-    const group = await db.getAlertGroupByAlertId(id);
-    if (group) {
-      await db.resolveAlertGroup(group.group_key, { resolved: true, false_alert: true, resolved_by: userId || null, resolved_at: new Date().toISOString(), notes: notes || null });
+    // Kill every active sibling group for this vehicle+type so the board card is gone.
+    let resolvedGroups = 0;
+    if (targetDeviceId && targetAlarmType) {
+      const upd = await db.query(
+        `UPDATE alert_groups SET resolved = TRUE, false_alert = TRUE, resolved_by = $1, resolved_at = $2::timestamptz, notes = COALESCE($3, notes), updated_at = NOW()
+         WHERE device_id = $4 AND alarm_type = $5 AND resolved = FALSE`,
+        [userId || null, now, notes || null, targetDeviceId, targetAlarmType]
+      );
+      resolvedGroups = upd.rowCount || 0;
+      await db.query(
+        `UPDATE alerts SET resolved = TRUE, false_alert = TRUE, updated_at = $2::timestamptz
+         WHERE device_id = $3 AND alarm_type = $4 AND resolved = FALSE`,
+        [true, now, targetDeviceId, targetAlarmType]
+      );
+    }
+
+    if (alert) {
+      await db.updateAlertStatus(alert.id, { resolved: true, false_alert: true, notes: notes || undefined });
+    }
+
+    if (wsBroadcast) {
+      const payloadBase = {
+        status: 'resolved',
+        resolved: true,
+        false_alert: true,
+        resolved_by: userId || null,
+        device_id: targetDeviceId || null,
+        alert_type: targetAlarmType || null,
+      };
+      wsBroadcast('alert-status-changed', { alert: { ...payloadBase, id, alert_id: id } });
+      if (targetDeviceId && targetAlarmType) {
+        const siblings = await db.query(
+          `SELECT last_alert_id FROM alert_groups WHERE device_id = $1 AND alarm_type = $2 AND resolved = TRUE ORDER BY updated_at DESC LIMIT 50`,
+          [targetDeviceId, targetAlarmType]
+        );
+        for (const row of siblings.rows) {
+          if (row.last_alert_id && String(row.last_alert_id) !== String(id)) {
+            wsBroadcast('alert-status-changed', {
+              alert: { ...payloadBase, id: row.last_alert_id, alert_id: row.last_alert_id },
+            });
+          }
+        }
+      }
     }
 
     res.json({
@@ -813,46 +901,12 @@ async function markFalseAlert(req, res) {
       action: 'mark-false',
       resolved: true,
       false_alert: true,
-      count: group ? group.count : 1,
-      message: group ? `Alert group ${group.group_key} marked as false (${group.count} alerts)` : `Alert ${id} marked as false alarm`,
+      groups: resolvedGroups,
+      count: resolvedGroups || (group ? group.count : 1),
+      message: resolvedGroups > 0
+        ? `Marked false; ${resolvedGroups} active group(s) closed for this vehicle+type`
+        : `Alert ${id} marked as false alarm`,
     });
-
-    if (wsBroadcast) {
-      wsBroadcast('alert-status-changed', {
-        alert: {
-          id,
-          alert_id: id,
-          status: 'resolved',
-          resolved: true,
-          false_alert: true,
-          resolved_by: userId || null,
-        },
-      });
-      if (group) {
-        try {
-          const childResult = await db.query(
-            `SELECT last_alert_id FROM alert_groups WHERE device_id = $1 AND alarm_type = $2 AND resolved = FALSE`,
-            [group.device_id, group.alarm_type]
-          );
-          for (const row of childResult.rows) {
-            if (String(row.last_alert_id) !== String(id)) {
-              wsBroadcast('alert-status-changed', {
-                alert: {
-                  id: row.last_alert_id,
-                  alert_id: row.last_alert_id,
-                  status: 'resolved',
-                  resolved: true,
-                  false_alert: true,
-                  resolved_by: userId || null,
-                },
-              });
-            }
-          }
-        } catch (broadcastErr) {
-          console.error('[MarkFalse] Broadcast children error:', broadcastErr.message);
-        }
-      }
-    }
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -983,7 +1037,6 @@ async function resolveAlertsBulk(req, res) {
     const isFalse = closureType === 'false_alert';
     const now = new Date().toISOString();
 
-    // Deduplicate IDs
     const uniqueIds = [...new Set(alertIds.map(String).filter(Boolean))];
     if (uniqueIds.length === 0) {
       return res.json({ success: true, resolved: 0, total: 0, message: 'No alerts to resolve' });
@@ -991,21 +1044,43 @@ async function resolveAlertsBulk(req, res) {
 
     const placeholders = uniqueIds.map((_, i) => `$${i + 1}`).join(', ');
 
-    // 1. Resolve alert_groups by last_alert_id
-    await db.query(
-      `UPDATE alert_groups SET resolved = TRUE, false_alert = $${uniqueIds.length + 1}::boolean, resolved_by = $${uniqueIds.length + 2}, resolved_at = $${uniqueIds.length + 3}::timestamptz, notes = COALESCE($${uniqueIds.length + 4}, notes)
-       WHERE last_alert_id IN (${placeholders}) AND resolved = FALSE`,
-      [...uniqueIds, isFalse, userId || null, now, notes || null]
+    const n = uniqueIds.length;
+    const pLast = uniqueIds.map((_, i) => `$${i + 1}`).join(', ');
+    const pPk = uniqueIds.map((_, i) => `$${i + 1 + n}`).join(', ');
+    const pKey = uniqueIds.map((_, i) => `$${i + 1 + n * 2}`).join(', ');
+    const pFalse = n * 3 + 1;
+    const pBy = n * 3 + 2;
+    const pAt = n * 3 + 3;
+    const pNotes = n * 3 + 4;
+    const idParams = [...uniqueIds, ...uniqueIds, ...uniqueIds];
+
+    // Match groups by last_alert_id OR group primary key OR group_key so board ids always hit.
+    const groupUpdate = await db.query(
+      `UPDATE alert_groups SET resolved = TRUE, false_alert = $${pFalse}::boolean, resolved_by = $${pBy}, resolved_at = $${pAt}::timestamptz, notes = COALESCE($${pNotes}, notes), updated_at = NOW()
+       WHERE resolved = FALSE AND (
+         last_alert_id IN (${pLast})
+         OR id::text IN (${pPk})
+         OR group_key IN (${pKey})
+       )`,
+      [...idParams, isFalse, userId || null, now, notes || null]
     );
 
-    // 2. Find all affected groups
+    // Every vehicle+type touched by those groups — clear ALL sibling active groups too.
     const groupResult = await db.query(
-      `SELECT DISTINCT device_id, alarm_type FROM alert_groups WHERE last_alert_id IN (${placeholders})`,
-      uniqueIds
+      `SELECT DISTINCT device_id, alarm_type FROM alert_groups
+       WHERE last_alert_id IN (${pLast})
+          OR id::text IN (${pPk})
+          OR group_key IN (${pKey})`,
+      idParams
     );
 
-    // 3. Resolve all child alerts for each affected group
     for (const g of groupResult.rows) {
+      if (!g.device_id || !g.alarm_type) continue;
+      await db.query(
+        `UPDATE alert_groups SET resolved = TRUE, false_alert = $1::boolean, resolved_by = $2, resolved_at = $3::timestamptz, notes = COALESCE($4, notes), updated_at = NOW()
+         WHERE device_id = $5 AND alarm_type = $6 AND resolved = FALSE`,
+        [isFalse, userId || null, now, notes || null, g.device_id, g.alarm_type]
+      );
       await db.query(
         `UPDATE alerts SET resolved = TRUE, false_alert = $1::boolean, updated_at = $2::timestamptz
          WHERE device_id = $3 AND alarm_type = $4 AND resolved = FALSE`,
@@ -1013,20 +1088,54 @@ async function resolveAlertsBulk(req, res) {
       );
     }
 
-    // 4. Also resolve any alerts whose IDs were directly passed
-    const directPlaceholders = uniqueIds.map((_, i) => `$${i + 3}`).join(', ');
-    await db.query(
+    const directUpdate = await db.query(
       `UPDATE alerts SET resolved = TRUE, false_alert = $1::boolean, updated_at = $2::timestamptz
-       WHERE id IN (${directPlaceholders}) AND resolved = FALSE`,
+       WHERE id IN (${placeholders}) AND resolved = FALSE`,
       [isFalse, now, ...uniqueIds]
+    );
+
+    // If groups never matched but direct alert rows did, still clear sibling groups
+    // for the same vehicle+type so the board cannot keep an active card.
+    if (groupResult.rows.length === 0 && directUpdate.rowCount > 0) {
+      const orphanSiblings = await db.query(
+        `SELECT DISTINCT device_id, alarm_type FROM alerts
+         WHERE id IN (${placeholders}) AND device_id IS NOT NULL AND alarm_type IS NOT NULL`,
+        uniqueIds
+      );
+      for (const g of orphanSiblings.rows) {
+        await db.query(
+          `UPDATE alert_groups SET resolved = TRUE, false_alert = $1::boolean, resolved_by = $2, resolved_at = $3::timestamptz, notes = COALESCE($4, notes), updated_at = NOW()
+           WHERE device_id = $5 AND alarm_type = $6 AND resolved = FALSE`,
+          [isFalse, userId || null, now, notes || null, g.device_id, g.alarm_type]
+        );
+      }
+    }
+
+    const siblingCount = await db.query(
+      `SELECT COUNT(*)::int AS n FROM alert_groups WHERE resolved = FALSE AND (device_id, alarm_type) IN (
+         SELECT device_id, alarm_type FROM alert_groups WHERE last_alert_id IN (${pLast}) OR id::text IN (${pPk}) OR group_key IN (${pKey})
+         UNION
+         SELECT device_id, alarm_type FROM alerts WHERE id IN (${placeholders}) AND device_id IS NOT NULL AND alarm_type IS NOT NULL
+       )`,
+      [...idParams, ...uniqueIds]
+    );
+    const stillActive = siblingCount.rows[0]?.n || 0;
+    const resolvedCount = Math.max(
+      groupResult.rows.length,
+      groupUpdate.rowCount || 0,
+      directUpdate.rowCount || 0,
+      0
     );
 
     res.json({
       success: true,
-      resolved: uniqueIds.length,
+      resolved: resolvedCount,
       groups: groupResult.rows.length,
       total: alertIds.length,
-      message: `${uniqueIds.length} groups resolved (${groupResult.rows.length} alert types)`,
+      stillActive,
+      message: resolvedCount > 0
+        ? `${resolvedCount} group(s) resolved; ${stillActive} sibling group(s) still open for same vehicle+type`
+        : `Matched ${uniqueIds.length} id(s); no active groups updated`,
     });
 
     if (wsBroadcast) {
@@ -1041,6 +1150,26 @@ async function resolveAlertsBulk(req, res) {
             resolved_by: userId || null,
           },
         });
+      }
+      for (const g of groupResult.rows) {
+        const sibling = await db.query(
+          `SELECT last_alert_id FROM alert_groups WHERE device_id = $1 AND alarm_type = $2 AND resolved = TRUE ORDER BY updated_at DESC LIMIT 50`,
+          [g.device_id, g.alarm_type]
+        );
+        for (const row of sibling.rows) {
+          if (row.last_alert_id && !uniqueIds.includes(String(row.last_alert_id))) {
+            wsBroadcast('alert-status-changed', {
+              alert: {
+                id: row.last_alert_id,
+                alert_id: row.last_alert_id,
+                status: 'resolved',
+                resolved: true,
+                false_alert: isFalse,
+                resolved_by: userId || null,
+              },
+            });
+          }
+        }
       }
     }
   } catch (error) {
