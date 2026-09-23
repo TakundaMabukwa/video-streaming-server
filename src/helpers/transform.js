@@ -24,6 +24,16 @@ function toTitle(str) {
     .trim() || 'Alert';
 }
 
+// "EX69 - LDR067MP" / "RH34 (REMCO) - JFR719FS" → fleet prefix before " - "
+function fleetFromDeviceName(name) {
+  const s = String(name || '').trim();
+  if (!s) return null;
+  const parts = s.split(' - ').map((p) => p.trim()).filter(Boolean);
+  if (parts.length === 0) return null;
+  const fleet = parts.find((p) => /^[A-Za-z]{2,}[\w()\- ]*$/.test(p)) || parts[0];
+  return fleet || null;
+}
+
 /**
  * Transform a raw alert_groups record into a frontend-friendly alert object.
  * @param {object} record - raw DB row from alert_groups
@@ -86,6 +96,7 @@ function transformDbAlert(record, severityMap) {
     device_id: deviceId,
     vehicleId: deviceId,
     vehicle_registration: record.device_name || null,
+    fleet_number: fleetFromDeviceName(record.device_name) || record.fleet_number || null,
     driver_name: null,
     timestamp: ts ? new Date(ts).toISOString() : new Date().toISOString(),
     created_at: record.created_at ? new Date(record.created_at).toISOString() : null,

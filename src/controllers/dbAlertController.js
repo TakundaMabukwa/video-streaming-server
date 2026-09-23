@@ -525,12 +525,61 @@ async function getAlertMedia(req, res) {
 
 // transformDbAlert and getAlertCoordinates moved to helpers/transform.js
 
+async function resolveHistoryDeviceIds(deviceId, fleetNumber) {
+  const ids = new Set();
+  if (deviceId) ids.add(deviceId);
+
+  let fleet = String(fleetNumber || '').trim() || null;
+  if (!fleet && deviceId) {
+    fleet = await resolveFleetNumber({ deviceId }).catch(() => null);
+  }
+  if (!fleet && deviceId) {
+    const named = await db.query(
+      `SELECT device_name FROM alerts WHERE device_id = $1 ORDER BY alarm_ts DESC NULLS LAST LIMIT 1`,
+      [deviceId]
+    ).catch(() => ({ rows: [] }));
+    const deviceName = named.rows[0]?.device_name || '';
+    fleet = await resolveFleetNumber({ vehicleRegistration: deviceName, deviceId }).catch(() => null);
+  }
+  if (!fleet) return { deviceIds: [...ids], fleet: null };
+
+  try {
+    const g = await db.query(
+      `SELECT id FROM geotab_devices WHERE upper(trim(fleet_number)) = upper($1)`,
+      [fleet]
+    );
+    g.rows.forEach((r) => r.id && ids.add(r.id));
+  } catch (_) { /* optional table */ }
+
+  try {
+    const vs = await db.query(
+      `SELECT device_id FROM vehicle_status WHERE upper(trim(fleet_number)) = upper($1)`,
+      [fleet]
+    );
+    vs.rows.forEach((r) => r.device_id && ids.add(r.device_id));
+  } catch (_) { /* optional table */ }
+
+  try {
+    const byName = await db.query(
+      `SELECT DISTINCT device_id FROM alerts
+       WHERE split_part(coalesce(device_name, ''), ' - ', 1) ILIKE $1
+          OR split_part(coalesce(device_name, ''), ' - ', 2) ILIKE $1
+       LIMIT 500`,
+      [fleet]
+    );
+    byName.rows.forEach((r) => r.device_id && ids.add(r.device_id));
+  } catch (_) { /* ignore */ }
+
+  return { deviceIds: [...ids], fleet };
+}
+
 async function getAlertHistory(req, res) {
   try {
     const days = Math.min(Math.max(parseInt(req.query.days) || 30, 1), 365);
     const limit = Math.min(Math.max(parseInt(req.query.limit) || 200, 1), 2000);
     const deviceId = String(req.query.device_id || req.query.vehicleId || '').trim();
-    const includeResolved = req.query.include_resolved === 'true';
+    const fleetNumber = String(req.query.fleet_number || req.query.fleetNumber || '').trim();
+    const includeResolved = ['true', '1', 'yes'].includes(String(req.query.include_resolved || '').toLowerCase());
 
     const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
     const params = [cutoff];
@@ -538,14 +587,31 @@ async function getAlertHistory(req, res) {
     if (!includeResolved) {
       where += ' AND (resolved IS NOT TRUE) AND (false_alert IS NOT TRUE)';
     }
-    if (deviceId) {
-      params.push(deviceId);
+
+    const { deviceIds, fleet } = await resolveHistoryDeviceIds(deviceId, fleetNumber);
+    if (deviceIds.length === 1) {
+      params.push(deviceIds[0]);
       where += ` AND device_id = $${params.length}`;
+    } else if (deviceIds.length > 1) {
+      params.push(deviceIds);
+      where += ` AND device_id = ANY($${params.length}::text[])`;
+    } else if (fleet) {
+      // No concrete device ids — match vehicle by fleet code in device_name
+      // (covers cross-source: video camera id vs Geotab short id).
+      params.push(fleet);
+      const n = params.length;
+      where += ` AND (
+        split_part(coalesce(device_name, ''), ' - ', 1) ILIKE $${n}
+        OR split_part(coalesce(device_name, ''), ' - ', 2) ILIKE $${n}
+        OR upper(coalesce(device_name, '')) LIKE upper('%' || $${n} || '%')
+      )`;
     }
+
     params.push(limit);
 
     const result = await db.query(
-      `SELECT id, device_id, alarm_type, alarm_ts, source_type, status, resolved, false_alert, notes, created_at, updated_at
+      `SELECT id, device_id, device_name, alarm_type, alarm_ts, alarm_ts_end, source_type, status,
+              resolved, false_alert, notes, lat, lon, alarm_text, created_at, updated_at
        FROM alerts
        WHERE ${where}
        ORDER BY alarm_ts DESC
@@ -561,6 +627,9 @@ async function getAlertHistory(req, res) {
       count: result.rows.length,
       days,
       device_id: deviceId || null,
+      fleet_number: fleet || fleetNumber || null,
+      device_ids: deviceIds,
+      include_resolved: includeResolved,
     });
   } catch (error) {
     console.error('[Alerts] History error:', error.message);
