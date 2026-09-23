@@ -304,6 +304,7 @@ router.get('/vehicle-alerts', async (req, res) => {
 
 // All unresolved alert groups for a specific device (used by resolve modal)
 // Returns grouped alerts (same type grouped together with count)
+// Matches video camera id AND Geotab sibling ids for the same fleet.
 router.get('/vehicle-alerts/:deviceId', async (req, res) => {
   try {
     const { deviceId } = req.params;
@@ -313,20 +314,72 @@ router.get('/vehicle-alerts/:deviceId', async (req, res) => {
     const params = [];
     let idx = 1;
 
-    if (deviceId && deviceId !== 'none') {
-      where += ` AND (ag.device_id = $${idx} OR ag.device_name ILIKE $${idx + 1})`;
-      params.push(deviceId, `%${deviceId}%`);
-      idx += 2;
-    }
-    if (fleet) {
-      where += ` AND ag.device_name ILIKE $${idx}`;
-      params.push(`%${fleet}%`);
-      idx++;
+    const idSet = new Set();
+    if (deviceId && deviceId !== 'none') idSet.add(String(deviceId).trim());
+    const fleetName = String(fleet || '').trim();
+
+    // Resolve fleet from explicit query or from device_name / cost-center lookup
+    let fleetKey = fleetName;
+    if (!fleetKey && deviceId && deviceId !== 'none') {
+      try {
+        const named = await db.query(
+          `SELECT device_name FROM alert_groups WHERE device_id = $1 ORDER BY last_alert_ts DESC NULLS LAST LIMIT 1`,
+          [deviceId]
+        );
+        const deviceName = named.rows[0]?.device_name || '';
+        const { resolveFleetNumber } = require('../services/costCenterLookup');
+        fleetKey = await resolveFleetNumber({ vehicleRegistration: deviceName, deviceId }) || null;
+        if (!fleetKey && deviceName) fleetKey = String(deviceName).split(' - ')[0].trim() || null;
+      } catch (_) { fleetKey = null; }
     }
 
-    if (params.length === 0) {
+    if (fleetKey) {
+      try {
+        const g = await db.query(
+          `SELECT id FROM geotab_devices WHERE upper(trim(fleet_number)) = upper($1)`,
+          [fleetKey]
+        );
+        g.rows.forEach((r) => r.id && idSet.add(String(r.id)));
+      } catch (_) { /* optional */ }
+      try {
+        const vs = await db.query(
+          `SELECT device_id FROM vehicle_status WHERE upper(trim(fleet_number)) = upper($1)`,
+          [fleetKey]
+        );
+        vs.rows.forEach((r) => r.device_id && idSet.add(String(r.device_id)));
+      } catch (_) { /* optional */ }
+      try {
+        const byName = await db.query(
+          `SELECT DISTINCT device_id FROM alert_groups
+           WHERE split_part(coalesce(device_name, ''), ' - ', 1) ILIKE $1
+              OR split_part(coalesce(device_name, ''), ' - ', 2) ILIKE $1
+           LIMIT 500`,
+          [fleetKey]
+        );
+        byName.rows.forEach((r) => r.device_id && idSet.add(String(r.device_id)));
+      } catch (_) { /* ignore */ }
+    }
+
+    const idList = [...idSet];
+    if (idList.length === 0 && !fleetKey) {
       return res.json({ success: true, alerts: [], count: 0 });
     }
+
+    const matchClauses = [];
+    if (idList.length > 0) {
+      params.push(idList);
+      matchClauses.push(`ag.device_id = ANY($${idx}::text[])`);
+      idx++;
+    }
+    if (fleetKey) {
+      params.push(fleetKey);
+      params.push(`%${fleetKey}%`);
+      matchClauses.push(`split_part(coalesce(ag.device_name, ''), ' - ', 1) ILIKE $${idx}`);
+      matchClauses.push(`split_part(coalesce(ag.device_name, ''), ' - ', 2) ILIKE $${idx}`);
+      matchClauses.push(`ag.device_name ILIKE $${idx + 1}`);
+      idx += 2;
+    }
+    where += ` AND (${matchClauses.join(' OR ')})`;
 
     const result = await db.query(
       `SELECT ag.*, a.lat, a.lon
@@ -337,7 +390,7 @@ router.get('/vehicle-alerts/:deviceId', async (req, res) => {
       params
     );
 
-    res.json({ success: true, alerts: result.rows, count: result.rows.length });
+    res.json({ success: true, alerts: result.rows, count: result.rows.length, device_ids: idList, fleet: fleetKey || null });
   } catch (error) {
     console.error('[vehicle-alerts] Error:', error.message, error.stack);
     res.status(500).json({ success: false, message: error.message });
