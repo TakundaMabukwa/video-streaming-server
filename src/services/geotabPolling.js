@@ -808,38 +808,46 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
           const groupCount = Number(groupRow?.count || 1) || 1;
           const baseSeverity = String(matchedDef.severity || 'medium').toLowerCase();
           const escalatedSeverity = escalateSeverity(baseSeverity, groupCount);
-          wsBroadcast('new-alert', {
-            alert: {
-              id: alertId,
-              device_id: geotabDeviceId,
-              deviceId: geotabDeviceId,
-              vehicleId: geotabDeviceId,
-              device_name: deviceName,
-              deviceName,
-              alert_type: matchedDef.name,
-              alarm_type: matchedDef.name,
-              type: matchedDef.name,
-              title: matchedDef.name,
-              alarmText,
-              timestamp: new Date(eventTime).toISOString(),
-              alarmTs: new Date(eventTime).toISOString(),
-              last_occurrence: new Date(eventTime).toISOString(),
-              source_type: 'telematics',
-              severity: escalatedSeverity,
-              priority: escalatedSeverity,
-              base_severity: baseSeverity,
-              escalated: escalatedSeverity !== baseSeverity,
-              status: 'new',
-              resolved: false,
-              count: groupCount,
-              group_key: groupRow?.group_key || `${geotabDeviceId}:${matchedDef.name}`.toLowerCase(),
-              lat: evtLat,
-              lon: evtLon,
-            },
-          });
+          // Resolve targets alert_groups.id only — never the tel-/stl- event key.
+          const groupId = groupRow?.id != null ? String(groupRow.id) : '';
+          if (groupId) {
+            wsBroadcast('new-alert', {
+              alert: {
+                id: groupId,
+                alert_id: groupId,
+                last_alert_id: alertId,
+                alarmId: alertId,
+                alarm_id: alertId,
+                device_id: geotabDeviceId,
+                deviceId: geotabDeviceId,
+                vehicleId: geotabDeviceId,
+                device_name: deviceName,
+                deviceName,
+                alert_type: matchedDef.name,
+                alarm_type: matchedDef.name,
+                type: matchedDef.name,
+                title: matchedDef.name,
+                alarmText,
+                timestamp: new Date(eventTime).toISOString(),
+                alarmTs: new Date(eventTime).toISOString(),
+                last_occurrence: new Date(eventTime).toISOString(),
+                source_type: 'telematics',
+                severity: escalatedSeverity,
+                priority: escalatedSeverity,
+                base_severity: baseSeverity,
+                escalated: escalatedSeverity !== baseSeverity,
+                status: 'new',
+                resolved: false,
+                count: groupCount,
+                group_key: groupRow?.group_key || `${geotabDeviceId}:${matchedDef.name}`.toLowerCase(),
+                lat: evtLat,
+                lon: evtLon,
+              },
+            });
+          }
         } catch (_) { /* never block ingest on WS */ }
       }
-      console.log(`[GEOTAB] Telematics alert created: ${alertId} (${matchedDef.name}) for device ${geotabDeviceId}`);
+      console.log(`[GEOTAB] Telematics alert created: ${alertId} group=${groupRow?.id} (${matchedDef.name}) for device ${geotabDeviceId}`);
     } catch (err) {
       // skip individual event errors so one bad event can't stall the batch
     }

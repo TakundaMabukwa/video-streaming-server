@@ -418,6 +418,7 @@ async function syncAlerts(deviceIds, startTime, endTime) {
               escalated,
               count,
               escalatedFlag: escalated !== base,
+              groupId: row.id != null ? String(row.id) : '',
             };
           }
         } catch (_) { /* group upsert failure must not block WS */ }
@@ -431,9 +432,16 @@ async function syncAlerts(deviceIds, startTime, endTime) {
             const gsev = groupSeverityByKey[gkey];
             const base = gsev?.base || resolveBaseSeverity(r.alarmType, severityMap);
             const escalated = gsev?.escalated || escalateSeverity(base, gsev?.count || 1);
+            // Resolve targets alert_groups.id only — Mettax alarm id stays on last_alert_id.
+            const groupId = gsev?.groupId || '';
+            if (!groupId) continue;
             wsBroadcast('new-alert', {
               alert: {
-                id: r.id,
+                id: groupId,
+                alert_id: groupId,
+                last_alert_id: r.id,
+                alarmId: r.id,
+                alarm_id: r.id,
                 device_id: r.deviceId,
                 deviceId: r.deviceId,
                 vehicleId: r.deviceId,

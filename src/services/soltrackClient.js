@@ -233,9 +233,16 @@ async function handleFrame(frame) {
             const groupCount = Number(groupRow?.count || 1) || 1;
             const baseSeverity = String(severity || 'medium').toLowerCase();
             const escalatedSeverity = escalateSeverity(baseSeverity, groupCount);
+            // Resolve targets alert_groups.id only — never the stl- event key.
+            const groupId = groupRow?.id != null ? String(groupRow.id) : '';
+            if (groupId) {
             wsBroadcast('new-alert', {
               alert: {
-                id: alertId,
+                id: groupId,
+                alert_id: groupId,
+                last_alert_id: alertId,
+                alarmId: alertId,
+                alarm_id: alertId,
                 device_id: fleetNumber,
                 deviceId: fleetNumber,
                 vehicleId: fleetNumber,
@@ -264,6 +271,7 @@ async function handleFrame(frame) {
                 vehicle_registration: plate,
               },
             });
+            }
           } catch (_) { /* never block ingest on WS */ }
           try {
             wsBroadcast('new_event', {
