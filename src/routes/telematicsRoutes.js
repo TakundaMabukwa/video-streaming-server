@@ -1,6 +1,8 @@
 const express = require('express');
 const db = require('../db');
 const { processAlertDeduction } = require('../services/driverScoringService');
+const { transformDbAlert } = require('../helpers/transform');
+const { batchResolveDeviceCC, buildStrictAlertFilter } = require('../controllers/dbAlertController');
 
 const router = express.Router();
 
@@ -397,7 +399,23 @@ router.get('/vehicle-alerts/:deviceId', async (req, res) => {
       params
     );
 
-    res.json({ success: true, alerts: result.rows, count: result.rows.length, device_ids: idList, fleet: fleetKey || null });
+    const groups = result.rows;
+    let alerts = groups;
+    try {
+      const { deviceCC } = await batchResolveDeviceCC(groups);
+      const { severityFor } = await buildStrictAlertFilter(deviceCC);
+      alerts = groups.map((row) => {
+        const t = transformDbAlert(row, severityFor(row));
+        t.lat = row.lat;
+        t.lon = row.lon;
+        if (!t.alarm_text && row.alarm_text) t.alarm_text = row.alarm_text;
+        return t;
+      });
+    } catch (transformError) {
+      console.error('[vehicle-alerts] transform failed:', transformError.message);
+    }
+
+    res.json({ success: true, alerts, count: alerts.length, device_ids: idList, fleet: fleetKey || null });
   } catch (error) {
     console.error('[vehicle-alerts] Error:', error.message, error.stack);
     res.status(500).json({ success: false, message: error.message });

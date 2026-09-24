@@ -28,8 +28,14 @@ router.post('/:id/capture', async (req, res) => {
     const { id } = req.params;
     if (!id) return res.status(400).json({ success: false, message: 'Alert ID required' });
 
-    let group = await db.getAlertGroupByAlertId(id);
-    const alertId = group ? group.last_alert_id : id;
+    let group = null;
+    let alertId = id;
+    const asGroupPk = Number(id);
+    if (Number.isInteger(asGroupPk) && asGroupPk >= 1 && String(asGroupPk) === String(String(id).trim())) {
+      group = await db.getAlertGroupById(asGroupPk);
+    }
+    if (!group) group = await db.getAlertGroupByAlertId(id);
+    if (group) alertId = group.last_alert_id;
     const alert = await db.getAlertWithMedia(alertId);
     if (!alert) return res.status(404).json({ success: false, message: 'Alert not found' });
 

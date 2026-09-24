@@ -330,14 +330,23 @@ async function getAlertById(req, res) {
   }
 }
 
+async function resolveMediaAlertId(id) {
+  const asGroupPk = Number(id);
+  if (Number.isInteger(asGroupPk) && asGroupPk >= 1 && String(asGroupPk) === String(String(id).trim())) {
+    const group = await db.getAlertGroupById(asGroupPk);
+    if (group) return { group, alertId: group.last_alert_id };
+  }
+  const byLastAlert = await db.getAlertGroupByAlertId(id);
+  if (byLastAlert) return { group: byLastAlert, alertId: byLastAlert.last_alert_id };
+  return { group: null, alertId: id };
+}
+
 async function getAlertScreenshots(req, res) {
   try {
     const { id } = req.params;
     if (!id) return sendError(res, 'Alert ID required', 400);
 
-    // Try group lookup by last_alert_id
-    let group = await db.getAlertGroupByAlertId(id);
-    const alertId = group ? group.last_alert_id : id;
+    const { group, alertId } = await resolveMediaAlertId(id);
 
     let alert = await db.getAlertWithMedia(alertId);
     if (!alert) {
@@ -365,9 +374,7 @@ async function getAlertMedia(req, res) {
     const ensureMedia = req.query.ensureMedia === 'true';
     if (!id) return sendError(res, 'Alert ID required', 400);
 
-    // Try group lookup, fall back to individual alert
-    let group = await db.getAlertGroupByAlertId(id);
-    const alertId = group ? group.last_alert_id : id;
+    const { group, alertId } = await resolveMediaAlertId(id);
 
     let alert = await db.getAlertWithMedia(alertId);
     const media = alert?.media || [];
@@ -380,9 +387,9 @@ async function getAlertMedia(req, res) {
       let rawAlert = null;
       if (group) {
         // Use group info to construct a minimal alert record for API call
-        rawAlert = await db.query('SELECT * FROM alerts WHERE id = $1', [alertId]);
-        if (rawAlert.rows.length > 0) {
-          rawAlert = rawAlert.rows[0];
+        const byLast = await db.query('SELECT * FROM alerts WHERE id = $1', [alertId]);
+        if (byLast.rows.length > 0) {
+          rawAlert = byLast.rows[0];
         } else {
           // Alert not in alerts table but group exists - construct from group
           rawAlert = {
@@ -394,13 +401,11 @@ async function getAlertMedia(req, res) {
           };
         }
       } else {
-        rawAlert = await db.query('SELECT * FROM alerts WHERE id = $1', [id]);
-        if (rawAlert.rows.length > 0) {
-          rawAlert = rawAlert.rows[0];
-        }
+        const byPk = await db.query('SELECT * FROM alerts WHERE id = $1', [id]);
+        rawAlert = byPk.rows.length > 0 ? byPk.rows[0] : null;
       }
 
-      if (rawAlert) {
+      if (rawAlert && (rawAlert.id || rawAlert.alert_id)) {
         console.log(`[ALERT] Calling skycamx /alarm/file/id for alarmId=${rawAlert.id}, device=${rawAlert.deviceId}`);
         const newMedia = await syncService.fetchMediaOnDemand(rawAlert);
         if (newMedia.length > 0) {
@@ -1085,4 +1090,6 @@ module.exports = {
   followUpAlert,
   clearFollowUp,
   setWsBroadcast,
+  batchResolveDeviceCC,
+  buildStrictAlertFilter,
 };

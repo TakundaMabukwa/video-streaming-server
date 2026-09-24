@@ -102,6 +102,8 @@ function transformDbAlert(record, severityMap) {
 
   return {
     id,
+    last_alert_id: record.last_alert_id || null,
+    alarmId: record.last_alert_id || null,
     alert_type: alarmType,
     type: alarmType,
     priority: effectiveSeverity,
@@ -112,7 +114,8 @@ function transformDbAlert(record, severityMap) {
     follow_up: !!record.follow_up,
     follow_up_at: record.follow_up_at ? new Date(record.follow_up_at).toISOString() : null,
     status: record.resolved ? 'resolved' : (record.status || 'new'),
-    title: toTitle(alarmType),
+    title: toTitle(alarmType || record.alarm_text),
+    alarm_text: record.alarm_text || '',
     resolved: !!record.resolved,
     false_alert: !!record.false_alert,
     resolved_at: record.resolved_at ? new Date(record.resolved_at).toISOString() : null,
