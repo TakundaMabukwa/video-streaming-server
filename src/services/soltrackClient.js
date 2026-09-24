@@ -3,6 +3,7 @@ const db = require('../db');
 const { getTelematicsNameMap } = require('../db/alert_definitions');
 const { matchAlertDefinition } = require('../helpers/alertMatching');
 const { checkZoneBreaches } = require('./geotabPolling');
+const { escalateSeverity } = require('../helpers/transform');
 
 let ws = null;
 let reconnectTimer = null;
@@ -229,6 +230,9 @@ async function handleFrame(frame) {
 
         if (wsBroadcast) {
           try {
+            const groupCount = Number(groupRow?.count || 1) || 1;
+            const baseSeverity = String(severity || 'medium').toLowerCase();
+            const escalatedSeverity = escalateSeverity(baseSeverity, groupCount);
             wsBroadcast('new-alert', {
               alert: {
                 id: alertId,
@@ -246,11 +250,13 @@ async function handleFrame(frame) {
                 alarmTs: new Date(eventTime).toISOString(),
                 last_occurrence: new Date(eventTime).toISOString(),
                 source_type: 'telematics',
-                severity: String(severity).toLowerCase(),
-                priority: String(severity).toLowerCase(),
+                severity: escalatedSeverity,
+                priority: escalatedSeverity,
+                base_severity: baseSeverity,
+                escalated: escalatedSeverity !== baseSeverity,
                 status: 'new',
                 resolved: false,
-                count: Number(groupRow?.count || 1) || 1,
+                count: groupCount,
                 group_key: groupRow?.group_key || `${fleetNumber}:${matchedDef.name}`.toLowerCase(),
                 lat: frame.lat,
                 lon: frame.lon,

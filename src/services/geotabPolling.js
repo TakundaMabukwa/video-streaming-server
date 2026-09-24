@@ -4,6 +4,7 @@ const { fetchVehiclesFromSupabase } = require('../helpers/supabaseClient');
 const { getTelematicsNameMap } = require('../db/alert_definitions');
 const { matchAlertDefinition } = require('../helpers/alertMatching');
 const { processAlertDeduction } = require('./driverScoringService');
+const { escalateSeverity } = require('../helpers/transform');
 
 const GEOTAB_URL = 'https://my.geotab.com/apiv1';
 
@@ -804,6 +805,9 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
       if (wsBroadcast) {
         try {
           const alarmText = `${eventName}${zoneNameFromEvent ? ' in zone ' + zoneNameFromEvent : ''}`;
+          const groupCount = Number(groupRow?.count || 1) || 1;
+          const baseSeverity = String(matchedDef.severity || 'medium').toLowerCase();
+          const escalatedSeverity = escalateSeverity(baseSeverity, groupCount);
           wsBroadcast('new-alert', {
             alert: {
               id: alertId,
@@ -821,11 +825,13 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
               alarmTs: new Date(eventTime).toISOString(),
               last_occurrence: new Date(eventTime).toISOString(),
               source_type: 'telematics',
-              severity: String(matchedDef.severity || 'medium').toLowerCase(),
-              priority: String(matchedDef.severity || 'medium').toLowerCase(),
+              severity: escalatedSeverity,
+              priority: escalatedSeverity,
+              base_severity: baseSeverity,
+              escalated: escalatedSeverity !== baseSeverity,
               status: 'new',
               resolved: false,
-              count: Number(groupRow?.count || 1) || 1,
+              count: groupCount,
               group_key: groupRow?.group_key || `${geotabDeviceId}:${matchedDef.name}`.toLowerCase(),
               lat: evtLat,
               lon: evtLon,

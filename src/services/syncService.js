@@ -2,6 +2,7 @@ const apiClient = require('../helpers/apiClient');
 const db = require('../db');
 const { getVideoSeverityMap } = require('../db/alert_definitions');
 const { resolveFleetNumber, findVehicleCostCenterId } = require('./costCenterLookup');
+const { resolveBaseSeverity, escalateSeverity } = require('../helpers/transform');
 
 let syncState = {
   isRunning: false,
@@ -381,37 +382,7 @@ async function syncAlerts(deviceIds, startTime, endTime) {
 
       // Push new video alerts over WS as fast as possible so the frontend
       // receives them without waiting for its own polling cycle.
-      if (wsBroadcast) {
-        for (const r of newRecords) {
-          try {
-            const alarmTsIso = r.alarmTs ? new Date(r.alarmTs).toISOString() : new Date().toISOString();
-            wsBroadcast('new-alert', {
-              alert: {
-                id: r.id,
-                device_id: r.deviceId,
-                deviceId: r.deviceId,
-                vehicleId: r.deviceId,
-                device_name: r.deviceName,
-                deviceName: r.deviceName,
-                alert_type: r.alarmType,
-                alarm_type: r.alarmType,
-                type: r.alarmType,
-                title: r.alarmType,
-                alarmText: r.alarmText,
-                timestamp: alarmTsIso,
-                alarmTs: alarmTsIso,
-                last_occurrence: alarmTsIso,
-                source_type: 'video',
-                status: 'new',
-                resolved: false,
-                lat: r.lat,
-                lon: r.lon,
-              },
-            });
-          } catch (_) { /* skip */ }
-        }
-      }
-
+      // Groups are upserted first so severity can be escalated by event count.
       const groupMap = {};
       for (const r of newRecords) {
         const key = `${r.deviceId}:${r.alarmType}`.toLowerCase();
@@ -429,8 +400,68 @@ async function syncAlerts(deviceIds, startTime, endTime) {
         lat: r.lat,
         lon: r.lon,
       }));
+      let severityMap = null;
+      try {
+        severityMap = await getVideoSeverityMap([]);
+      } catch (_) { /* fall back to PRIORITY_MAP */ }
+      const groupSeverityByKey = {};
       if (groupEntries.length > 0) {
-        await db.batchUpsertAlertGroups(groupEntries);
+        try {
+          const groupRows = await db.batchUpsertAlertGroups(groupEntries);
+          for (const row of groupRows || []) {
+            if (!row?.group_key) continue;
+            const count = Number(row.count) || 1;
+            const base = resolveBaseSeverity(row.alarm_type, severityMap);
+            const escalated = escalateSeverity(base, count);
+            groupSeverityByKey[row.group_key] = {
+              base,
+              escalated,
+              count,
+              escalatedFlag: escalated !== base,
+            };
+          }
+        } catch (_) { /* group upsert failure must not block WS */ }
+      }
+
+      if (wsBroadcast) {
+        for (const r of newRecords) {
+          try {
+            const alarmTsIso = r.alarmTs ? new Date(r.alarmTs).toISOString() : new Date().toISOString();
+            const gkey = `${r.deviceId}:${r.alarmType}`.toLowerCase();
+            const gsev = groupSeverityByKey[gkey];
+            const base = gsev?.base || resolveBaseSeverity(r.alarmType, severityMap);
+            const escalated = gsev?.escalated || escalateSeverity(base, gsev?.count || 1);
+            wsBroadcast('new-alert', {
+              alert: {
+                id: r.id,
+                device_id: r.deviceId,
+                deviceId: r.deviceId,
+                vehicleId: r.deviceId,
+                device_name: r.deviceName,
+                deviceName: r.deviceName,
+                alert_type: r.alarmType,
+                alarm_type: r.alarmType,
+                type: r.alarmType,
+                title: r.alarmType,
+                alarmText: r.alarmText,
+                timestamp: alarmTsIso,
+                alarmTs: alarmTsIso,
+                last_occurrence: alarmTsIso,
+                source_type: 'video',
+                severity: escalated,
+                priority: escalated,
+                base_severity: base,
+                escalated: gsev?.escalatedFlag || escalated !== base,
+                status: 'new',
+                resolved: false,
+                count: gsev?.count || 1,
+                group_key: gkey,
+                lat: r.lat,
+                lon: r.lon,
+              },
+            });
+          } catch (_) { /* skip */ }
+        }
       }
 
       allNewRecords.push(...newRecords);

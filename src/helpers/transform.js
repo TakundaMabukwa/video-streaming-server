@@ -17,6 +17,27 @@ const PRIORITY_MAP = {
   sos: 'critical',
 };
 
+const SEVERITY_LADDER = ['low', 'medium', 'high', 'critical'];
+const ESCALATE_EVERY_N_EVENTS = 3;
+
+function resolveBaseSeverity(alarmType, severityMap) {
+  const alarmKey = String(alarmType || '').toLowerCase();
+  if (severityMap && severityMap[alarmKey]) return severityMap[alarmKey];
+  if (PRIORITY_MAP[alarmType]) return PRIORITY_MAP[alarmType];
+  return 'medium';
+}
+
+// Every N events, climb one level from the base severity (capped at critical).
+// count 1-2 → base, 3 → +1, 4-5 → +1, 6 → +2, 9 → +3, …
+function escalateSeverity(baseSeverity, count) {
+  const base = String(baseSeverity || 'medium').toLowerCase();
+  let idx = SEVERITY_LADDER.indexOf(base);
+  if (idx < 0) idx = 2;
+  const events = Math.max(1, Number(count) || 1);
+  const steps = Math.floor(events / ESCALATE_EVERY_N_EVENTS);
+  return SEVERITY_LADDER[Math.min(SEVERITY_LADDER.length - 1, idx + steps)];
+}
+
 function toTitle(str) {
   return (str || '')
     .replace(/([A-Z])/g, ' $1')
@@ -43,8 +64,14 @@ function fleetFromDeviceName(name) {
  */
 function transformDbAlert(record, severityMap) {
   const alarmType = record.alarm_type || '';
-  const alarmKey = alarmType.toLowerCase();
-  const priority = (severityMap && severityMap[alarmKey]) || PRIORITY_MAP[alarmType] || 'medium';
+  const count = Number(record.count) || 1;
+  const basePriority = resolveBaseSeverity(alarmType, severityMap);
+  const priority = escalateSeverity(basePriority, count);
+  const escalationSteps = Math.min(
+    SEVERITY_LADDER.length - 1,
+    Math.max(0, SEVERITY_LADDER.indexOf(String(basePriority).toLowerCase())) +
+      Math.floor(count / ESCALATE_EVERY_N_EVENTS)
+  ) - Math.max(0, SEVERITY_LADDER.indexOf(String(basePriority).toLowerCase()));
   const documents = Array.isArray(record.documents) ? record.documents : [];
   const ts = record.last_alert_ts || record.alarm_ts;
   const id = record.last_alert_id || record.id;
@@ -78,6 +105,8 @@ function transformDbAlert(record, severityMap) {
     type: alarmType,
     priority: effectiveSeverity,
     severity: effectiveSeverity,
+    base_severity: basePriority,
+    escalation_steps: escalationSteps,
     original_severity: record.follow_up ? priority : null,
     follow_up: !!record.follow_up,
     follow_up_at: record.follow_up_at ? new Date(record.follow_up_at).toISOString() : null,
@@ -87,10 +116,10 @@ function transformDbAlert(record, severityMap) {
     false_alert: !!record.false_alert,
     resolved_at: record.resolved_at ? new Date(record.resolved_at).toISOString() : null,
     resolved_by: record.resolved_by || null,
-    count: record.count || 1,
+    count,
     documents,
     notes: record.notes || null,
-    escalated: false,
+    escalated: escalationSteps > 0,
     source_type: record.source_type || 'video',
     group_key: record.group_key || null,
     device_id: deviceId,
@@ -129,4 +158,11 @@ function getAlertCoordinates(alert) {
   return null;
 }
 
-module.exports = { transformDbAlert, getAlertCoordinates };
+module.exports = {
+  transformDbAlert,
+  getAlertCoordinates,
+  resolveBaseSeverity,
+  escalateSeverity,
+  SEVERITY_LADDER,
+  ESCALATE_EVERY_N_EVENTS,
+};

@@ -30,7 +30,7 @@ async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, al
          alarm_text = COALESCE(NULLIF($6, ''), alert_groups.alarm_text),
          updated_at = NOW()
        WHERE group_key = $7
-       RETURNING id, group_key`,
+       RETURNING id, group_key, count, alarm_type`,
       [alertId, alarmTs, deviceName, lat, lon, alarmText, groupKey]
     );
     return result.rows[0];
@@ -62,7 +62,7 @@ async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, al
            alarm_text = COALESCE(NULLIF($6, ''), alert_groups.alarm_text),
            updated_at = NOW()
          WHERE group_key = $7 AND resolved = TRUE
-         RETURNING id, group_key, resolved`,
+         RETURNING id, group_key, resolved, count, alarm_type`,
         [alertId, alarmTs, deviceName, lat, lon, alarmText, groupKey]
       );
       if (result.rows[0]) return result.rows[0];
@@ -81,7 +81,7 @@ async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, al
   const result = await query(
     `INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon, source_type)
      VALUES ($1, $2, $3, $4, $5, 1, $6, $7, $8, $9, $10)
-     RETURNING id, group_key`,
+     RETURNING id, group_key, count, alarm_type`,
     [groupKey, deviceId, deviceName, alarmType, alarmText, alertId, alarmTs || null, lat, lon, sourceType]
   );
   return result.rows[0];
@@ -113,8 +113,8 @@ async function batchUpsertAlertGroups(groups) {
        lon = COALESCE(EXCLUDED.lon, alert_groups.lon),
        alarm_text = COALESCE(NULLIF(EXCLUDED.alarm_text, ''), alert_groups.alarm_text),
        updated_at = NOW()
-     WHERE alert_groups.resolved = FALSE
-     RETURNING id, group_key`,
+       WHERE alert_groups.resolved = FALSE
+       RETURNING id, group_key, count, alarm_type`,
     params
   );
   return result.rows;
