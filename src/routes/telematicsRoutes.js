@@ -330,6 +330,13 @@ router.get('/vehicle-alerts/:deviceId', async (req, res) => {
         const { resolveFleetNumber } = require('../services/costCenterLookup');
         fleetKey = await resolveFleetNumber({ vehicleRegistration: deviceName, deviceId }) || null;
         if (!fleetKey && deviceName) fleetKey = String(deviceName).split(' - ')[0].trim() || null;
+        // Device id itself is often the fleet code (PD126, EX67) when device_name is empty.
+        if (!fleetKey) {
+          fleetKey = await resolveFleetNumber({ fleetNumber: deviceId }).catch(() => null) || null;
+          if (!fleetKey && /^[A-Za-z]{2,}[\d-]*$/.test(String(deviceId).trim())) {
+            fleetKey = String(deviceId).trim();
+          }
+        }
       } catch (_) { fleetKey = null; }
     }
 

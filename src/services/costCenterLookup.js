@@ -137,6 +137,9 @@ async function resolveFleetNumber({ deviceId, vehicleRegistration, fleetNumber }
     value = null;
   }
 
+  // Device codes like PD126 are often the fleet number itself — never lose that on lookup failure.
+  if (!value && looksLikeFleetCode(dev)) value = dev;
+
   fleetCache.set(key, { value: value == null ? null : value, ts: Date.now() });
   return value == null ? null : value;
 }
