@@ -74,7 +74,8 @@ function transformDbAlert(record, severityMap) {
   ) - Math.max(0, SEVERITY_LADDER.indexOf(String(basePriority).toLowerCase()));
   const documents = Array.isArray(record.documents) ? record.documents : [];
   const ts = record.last_alert_ts || record.alarm_ts;
-  const id = record.last_alert_id || record.id;
+  // Always expose alert_groups PK as id — resolve targets this only.
+  const id = record.id != null ? String(record.id) : '';
   const deviceId = record.device_id;
 
   // Follow-up: if follow_up is active and within 15 minutes, override severity to low

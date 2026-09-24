@@ -199,6 +199,80 @@ async function getResolvedAlertGroupsWithMedia({ limit = 2000 } = {}) {
   }));
 }
 
+async function resolveAlertGroupById(id, updates) {
+  const n = Number(id);
+  if (!Number.isInteger(n) || n < 1) return null;
+  const sets = [];
+  const params = [];
+  let idx = 1;
+
+  if (updates.resolved !== undefined) {
+    sets.push(`resolved = $${idx++}`);
+    params.push(updates.resolved);
+  }
+  if (updates.false_alert !== undefined) {
+    sets.push(`false_alert = $${idx++}`);
+    params.push(updates.false_alert);
+  }
+  if (updates.resolved_by !== undefined) {
+    sets.push(`resolved_by = $${idx++}`);
+    params.push(updates.resolved_by);
+  }
+  if (updates.resolved_at !== undefined) {
+    sets.push(`resolved_at = $${idx++}`);
+    params.push(updates.resolved_at);
+  }
+  if (updates.notes !== undefined && updates.notes !== null && String(updates.notes).trim() !== '') {
+    sets.push(`notes = $${idx++}`);
+    params.push(updates.notes);
+  }
+  if (updates.status !== undefined) {
+    sets.push(`status = $${idx++}`);
+    params.push(updates.status);
+  }
+  if (updates.documents !== undefined) {
+    sets.push(`documents = $${idx++}`);
+    params.push(updates.documents);
+  }
+  if (updates.follow_up !== undefined) {
+    sets.push(`follow_up = $${idx++}`);
+    params.push(updates.follow_up);
+  }
+  if (updates.follow_up_at !== undefined) {
+    sets.push(`follow_up_at = $${idx++}`);
+    params.push(updates.follow_up_at);
+  }
+  if (updates.original_severity !== undefined) {
+    sets.push(`original_severity = $${idx++}`);
+    params.push(updates.original_severity);
+  }
+  if (sets.length === 0) return null;
+  sets.push(`updated_at = NOW()`);
+  params.push(n);
+  const result = await query(
+    `UPDATE alert_groups SET ${sets.join(', ')} WHERE id = $${idx} RETURNING *`,
+    params
+  );
+  return result.rows[0] || null;
+}
+
+async function appendAlertGroupDocument(id, document) {
+  const n = Number(id);
+  if (!Number.isInteger(n) || n < 1) return null;
+  const result = await query(
+    `UPDATE alert_groups
+     SET documents = CASE
+       WHEN jsonb_array_length(documents) < 100 THEN documents || $1::jsonb
+       ELSE documents
+     END,
+     updated_at = NOW()
+     WHERE id = $2
+     RETURNING *`,
+    [JSON.stringify(document), n]
+  );
+  return result.rows[0] || null;
+}
+
 async function resolveAlertGroup(groupKey, updates) {
   const sets = [];
   const params = [];
@@ -276,5 +350,7 @@ module.exports = {
   getResolvedAlertGroupsWithMedia,
   getResolvedAlertGroupCount,
   resolveAlertGroup,
+  resolveAlertGroupById,
+  appendAlertGroupDocument,
   getAlertGroupStats,
 };

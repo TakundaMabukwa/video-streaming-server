@@ -66,9 +66,12 @@ CREATE INDEX IF NOT EXISTS idx_alert_groups_device ON alert_groups(device_id);
 CREATE INDEX IF NOT EXISTS idx_alert_groups_type ON alert_groups(alarm_type);
 CREATE INDEX IF NOT EXISTS idx_alert_groups_ts ON alert_groups(last_alert_ts DESC);
 CREATE INDEX IF NOT EXISTS idx_alert_groups_key ON alert_groups(group_key);
+CREATE INDEX IF NOT EXISTS idx_alert_groups_device_open ON alert_groups(device_id, resolved, false_alert, last_alert_ts DESC);
 `;
 
 const MIGRATIONS_SQL = `
+  CREATE INDEX IF NOT EXISTS idx_alert_groups_device_open ON alert_groups(device_id, resolved, false_alert, last_alert_ts DESC);
+
   ALTER TABLE alerts ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'new';
   ALTER TABLE alerts ADD COLUMN IF NOT EXISTS resolved BOOLEAN DEFAULT FALSE;
   ALTER TABLE alerts ADD COLUMN IF NOT EXISTS false_alert BOOLEAN DEFAULT FALSE;
