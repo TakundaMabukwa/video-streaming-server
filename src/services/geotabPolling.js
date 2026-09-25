@@ -427,12 +427,16 @@ async function syncDeviceStatus() {
 
       // Real online state from DeviceStatusInfo (previously discarded):
       // isDeviceCommunicating + how long it has been in that state.
+      // currentStateDuration is a .NET TimeSpan string like "HH:MM:SS" or
+      // "d.hh:mm:ss" (can also be a number of milliseconds).
       try {
         const communicating = d.isDeviceCommunicating === true;
         let onlineSince = null;
-        if (communicating && typeof d.currentStateDuration === 'number' && d.currentStateDuration >= 0) {
-          const since = Date.now() - d.currentStateDuration;
-          onlineSince = new Date(Math.min(since, Date.now())).toISOString();
+        if (communicating) {
+          const durMs = parseGeotabDurationMs(d.currentStateDuration);
+          if (durMs !== null && durMs >= 0) {
+            onlineSince = new Date(Date.now() - durMs).toISOString();
+          }
         }
         await db.query(
           'UPDATE vehicle_status SET is_online = $2, online_since = $3 WHERE device_id = $1',
@@ -454,6 +458,27 @@ async function syncDeviceStatus() {
 }
 
 // ── Sync: Ignition / engine status (real Geotab StatusData) ──
+// Parse a .NET TimeSpan string ("HH:MM:SS", "d.hh:mm:ss", optionally negative
+// or fractional seconds) or a plain millisecond number into milliseconds.
+function parseGeotabDurationMs(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value !== 'string' || !value) return null;
+  let s = value.trim();
+  let negative = false;
+  if (s.startsWith('-')) { negative = true; s = s.slice(1); }
+  let days = 0;
+  const dot = s.indexOf('.');
+  if (dot >= 0) {
+    days = parseInt(s.slice(0, dot), 10) || 0;
+    s = s.slice(dot + 1);
+  }
+  const parts = s.split(':').map((p) => parseInt(p, 10) || 0);
+  while (parts.length < 3) parts.unshift(0);
+  const [h, m, sec] = parts.slice(-3);
+  const ms = ((days * 24 + h) * 3600 + m * 60 + sec) * 1000;
+  return negative ? -ms : ms;
+}
+
 // Two fleet-wide StatusData calls (~200-700ms each) return the latest Ignition
 // switch status and Engine speed for every device that reported in the window.
 // Devices without a fresh sample keep their last known value; status_seen marks
