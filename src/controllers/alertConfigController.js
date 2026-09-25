@@ -30,6 +30,7 @@ async function listAlertDefinitions(req, res) {
          FROM alert_definitions d
          LEFT JOIN alert_definition_overrides o
            ON o.alert_definition_id = d.id AND o.cost_center_id = $${params.length + 1}
+           AND o.is_active IS DISTINCT FROM false
          ${whereClause}
          ORDER BY d.name`,
         [...params, ccId]
@@ -123,11 +124,13 @@ async function upsertDefinitionOverride(req, res) {
 
     const fields = ['alert_definition_id', 'cost_center_id'];
     const values = [Number(definition_id), Number(cost_center_id)];
-    let idx = 3;
 
     if (severity !== undefined) { fields.push(`severity`); values.push(String(severity).toUpperCase()); }
     if (description !== undefined) { fields.push(`description`); values.push(description); }
-    if (is_active !== undefined) { fields.push(`is_active`); values.push(is_active); }
+    // Always carry is_active (default TRUE): saving an override re-adds it,
+    // which also reactivates a previously soft-removed (is_active=FALSE) row.
+    fields.push(`is_active`);
+    values.push(is_active === undefined ? true : is_active);
 
     const result = await db.query(
       `INSERT INTO alert_definition_overrides (${fields.join(', ')})
@@ -155,11 +158,13 @@ async function bulkUpsertDefinitionOverrides(req, res) {
     for (const ccId of cost_center_ids) {
       const fields = ['alert_definition_id', 'cost_center_id'];
       const values = [Number(definition_id), Number(ccId)];
-      let idx = 3;
 
       if (severity !== undefined) { fields.push(`severity`); values.push(String(severity).toUpperCase()); }
       if (description !== undefined) { fields.push(`description`); values.push(description); }
-      if (is_active !== undefined) { fields.push(`is_active`); values.push(is_active); }
+      // Always carry is_active (default TRUE): saving re-adds / reactivates
+      // a soft-removed (is_active=FALSE) row.
+      fields.push(`is_active`);
+      values.push(is_active === undefined ? true : is_active);
 
       const result = await db.query(
         `INSERT INTO alert_definition_overrides (${fields.join(', ')})
@@ -182,8 +187,10 @@ async function bulkUpsertDefinitionOverrides(req, res) {
 async function deleteDefinitionOverride(req, res) {
   try {
     const { definition_id, cc_id } = req.params;
+    // Soft-remove: keep the row with is_active = FALSE so the boot-time
+    // STRICT CC backfill (ON CONFLICT DO NOTHING) does not resurrect it.
     await db.query(
-      'DELETE FROM alert_definition_overrides WHERE alert_definition_id = $1 AND cost_center_id = $2',
+      'UPDATE alert_definition_overrides SET is_active = FALSE, updated_at = NOW() WHERE alert_definition_id = $1 AND cost_center_id = $2',
       [Number(definition_id), Number(cc_id)]
     );
     sendSuccess(res, { definition_id: Number(definition_id), cost_center_id: Number(cc_id) }, 'Override deleted');
@@ -228,7 +235,7 @@ async function listDefinitionApplicableCcs(req, res) {
   try {
     const { id } = req.params;
     const result = await db.query(
-      'SELECT DISTINCT cost_center_id FROM alert_definition_overrides WHERE alert_definition_id = $1',
+      'SELECT DISTINCT cost_center_id FROM alert_definition_overrides WHERE alert_definition_id = $1 AND is_active IS DISTINCT FROM false',
       [Number(id)]
     );
     sendSuccess(res, { definition_id: Number(id), cost_center_ids: result.rows.map(r => r.cost_center_id) }, 'Applicable cost centers retrieved');
@@ -241,7 +248,9 @@ async function listDefinitionApplicableCcs(req, res) {
 // Used by the settings display to show which cost centers each alert type applies to.
 async function listAllDefinitionApplicableCcs(req, res) {
   try {
-    const result = await db.query('SELECT alert_definition_id, cost_center_id FROM alert_definition_overrides');
+    const result = await db.query(
+      'SELECT alert_definition_id, cost_center_id FROM alert_definition_overrides WHERE is_active IS DISTINCT FROM false'
+    );
     const map = {};
     for (const r of result.rows) {
       if (!map[r.alert_definition_id]) map[r.alert_definition_id] = [];
@@ -262,7 +271,7 @@ async function deleteAllDefinitionOverrides(req, res) {
     const { definition_id } = req.params;
     const purged = await purgeDefinitionAlertRows(definition_id);
     const result = await db.query(
-      'DELETE FROM alert_definition_overrides WHERE alert_definition_id = $1',
+      'UPDATE alert_definition_overrides SET is_active = FALSE, updated_at = NOW() WHERE alert_definition_id = $1',
       [Number(definition_id)]
     );
     sendSuccess(

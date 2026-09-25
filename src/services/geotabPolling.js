@@ -425,6 +425,21 @@ async function syncDeviceStatus() {
         lastLogTime: d.dateTime || null,
       });
 
+      // Real online state from DeviceStatusInfo (previously discarded):
+      // isDeviceCommunicating + how long it has been in that state.
+      try {
+        const communicating = d.isDeviceCommunicating === true;
+        let onlineSince = null;
+        if (communicating && typeof d.currentStateDuration === 'number' && d.currentStateDuration >= 0) {
+          const since = Date.now() - d.currentStateDuration;
+          onlineSince = new Date(Math.min(since, Date.now())).toISOString();
+        }
+        await db.query(
+          'UPDATE vehicle_status SET is_online = $2, online_since = $3 WHERE device_id = $1',
+          [deviceId, communicating, onlineSince]
+        );
+      } catch (_) { /* online state must never block position sync */ }
+
       // Check zone breaches
       if (d.latitude && d.longitude) {
         await checkZoneBreaches(deviceId, d.latitude, d.longitude, d.speed, geotabDevice.fleet_number, geotabDevice.license_plate);
@@ -435,6 +450,74 @@ async function syncDeviceStatus() {
     if (updated > 0) console.log(`[GEOTAB] DeviceStatusInfo: updated ${updated} vehicle positions`);
   } catch (error) {
     console.error('[GEOTAB] Failed to sync device status:', error.message);
+  }
+}
+
+// ── Sync: Ignition / engine status (real Geotab StatusData) ──
+// Two fleet-wide StatusData calls (~200-700ms each) return the latest Ignition
+// switch status and Engine speed for every device that reported in the window.
+// Devices without a fresh sample keep their last known value; status_seen marks
+// the last real sample so consumers (RTMS) can decide when to fall back to the
+// legacy speed heuristic.
+async function syncIgnitionStatus() {
+  const database = process.env.GEOTAB_DATABASE;
+  const username = process.env.GEOTAB_USERNAME;
+  const password = process.env.GEOTAB_PASSWORD;
+  if (!database || !username || !password) return;
+
+  try {
+    const credentials = await geotabAuthenticate(database, username, password);
+    const fromDate = new Date(Date.now() - 3 * 60 * 1000).toISOString();
+    const diags = [
+      { id: 'DiagnosticIgnitionId', kind: 'ignition' },
+      { id: 'DiagnosticEngineSpeedId', kind: 'rpm' },
+    ];
+    const latest = {}; // deviceId -> { ignition?: {val, ts}, rpm?: {val, ts} }
+
+    for (const diag of diags) {
+      const res = await geotabFetch({
+        method: 'Get',
+        params: {
+          typeName: 'StatusData',
+          search: { diagnosticSearch: { type: 'Diagnostic', id: diag.id }, fromDate },
+          credentials,
+          resultsLimit: 5000,
+        },
+        id: 20,
+        jsonrpc: '2.0',
+      });
+      if (res.error) {
+        console.error(`[GEOTAB] Ignition status error (${diag.id}):`, res.error.message);
+        continue;
+      }
+      for (const row of res.result || []) {
+        const dev = row.device?.id;
+        if (!dev) continue;
+        const val = Number(row.data?.value ?? row.data);
+        if (Number.isNaN(val)) continue;
+        if (!latest[dev]) latest[dev] = {};
+        const prev = latest[dev][diag.kind];
+        if (!prev || String(row.dateTime) > String(prev.ts)) latest[dev][diag.kind] = { val, ts: row.dateTime };
+      }
+    }
+
+    let updated = 0;
+    for (const [dev, info] of Object.entries(latest)) {
+      const ignition = info.ignition ? info.ignition.val === 1 : null;
+      const engineOn = info.rpm ? info.rpm.val > 0 : null;
+      const result = await db.query(
+        `UPDATE vehicle_status SET
+           ignition_on = COALESCE($2, ignition_on),
+           engine_on = COALESCE($3, engine_on),
+           status_seen = NOW()
+         WHERE device_id = $1`,
+        [dev, ignition, engineOn]
+      ).catch(() => null);
+      if (result && result.rowCount > 0) updated++;
+    }
+    if (updated > 0) console.log(`[GEOTAB] Ignition/engine status: ${updated} devices updated`);
+  } catch (error) {
+    console.error('[GEOTAB] Ignition status sync failed:', error.message);
   }
 }
 
@@ -745,7 +828,7 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
       const { findVehicleCostCenterId } = require('./costCenterLookup');
       const eventCC = await findVehicleCostCenterId(fleetNumber || geotabDeviceId).catch(() => null);
       const telematicsNameMap = await getTelematicsNameMap(eventCC ? [eventCC] : []).catch(() => ({}));
-      const matchedDef = matchAlertDefinition(eventName || '', telematicsNameMap.nameMap || {}, telematicsNameMap.signalCodeMap || {});
+      const matchedDef = matchAlertDefinition(eventName || '', telematicsNameMap.nameMap || {}, telematicsNameMap.signalCodeMap || {}, eventCode || '');
 
       // Gate: only push telematics events that match an active alert_definition
       if (wsBroadcast && matchedDef && !isUnknownDevice) {
@@ -1098,6 +1181,119 @@ async function syncLogRecords() {
 
 // ── Zone Breach Detection ──
 
+// Geotab rule id for "Entering High Risk Area" — used to detect whether the
+// Geotab exception feed already covered a zone entry we detected ourselves.
+const GEOTAB_ENTERING_HIGH_RISK_CODE = 'aCmnsH92P1kqGBTWyRmdacA';
+const ZONE_ENTRY_DEDUP_WINDOW_MS = 2 * 60 * 1000;
+
+// Fallback alert creation for zone entries detected by our own polygon check.
+// Only fires when Geotab did NOT already send the same zone-entry event within
+// ±2 min of the detected entry; if Geotab's event arrives later it merges into
+// this same group (same device + alarm_type + source) — one card either way.
+async function createZoneEntryAlert({ deviceId, fleetNumber, licensePlate, lat, lon, speed, zone, entryTime }) {
+  try {
+    const isNoGo = !!zone.is_no_go;
+    const defName = isNoGo ? 'No-Go Zone Entry' : 'Entering High Risk Area';
+
+    if (!isNoGo) {
+      const entryMs = new Date(entryTime).getTime();
+      const dup = await db.query(
+        `SELECT 1 FROM telematics_events
+         WHERE device_id = $1 AND event_code = $2
+           AND event_time >= $3::timestamptz
+           AND event_time <= $4::timestamptz
+         LIMIT 1`,
+        [deviceId, GEOTAB_ENTERING_HIGH_RISK_CODE,
+         new Date(entryMs - ZONE_ENTRY_DEDUP_WINDOW_MS).toISOString(),
+         new Date(entryMs + ZONE_ENTRY_DEDUP_WINDOW_MS).toISOString()]
+      );
+      if (dup.rows.length > 0) return null; // Geotab already covered it
+    }
+
+    const { findVehicleCostCenterId } = require('./costCenterLookup');
+    const eventCC = await findVehicleCostCenterId(fleetNumber || deviceId).catch(() => null);
+    const nameMap = await getTelematicsNameMap(eventCC ? [eventCC] : []).catch(() => ({}));
+    const matchedDef = (nameMap.nameMap || {})[defName.toLowerCase()];
+    if (!matchedDef) return null; // not in this device's CC set — would be filtered from display anyway
+
+    const alertId = `zone-${deviceId}-${zone.id}-${Date.now()}`;
+    const deviceName = fleetNumber ? `${fleetNumber}${licensePlate ? ' - ' + licensePlate : ''}` : deviceId;
+    const alarmText = `${defName} in zone ${zone.name}`;
+
+    await db.upsertAlert({
+      id: alertId,
+      deviceId,
+      deviceName,
+      alarmType: matchedDef.name,
+      alarmTs: entryTime,
+      lat,
+      lon,
+      alarmText,
+      sourceType: 'telematics',
+    });
+
+    const groupRow = await db.upsertAlertGroup({
+      deviceId,
+      deviceName,
+      alarmType: matchedDef.name,
+      alarmText,
+      alertId,
+      alarmTs: entryTime,
+      lat,
+      lon,
+      sourceType: 'telematics',
+    });
+    if (!groupRow || groupRow.id == null) return null;
+
+    if (wsBroadcast) {
+      try {
+        const groupCount = Number(groupRow.count || 1) || 1;
+        const baseSeverity = String(matchedDef.severity || 'medium').toLowerCase();
+        const escalatedSeverity = escalateSeverity(baseSeverity, groupCount);
+        const groupId = String(groupRow.id);
+        wsBroadcast('new-alert', {
+          alert: {
+            id: groupId,
+            alert_id: groupId,
+            last_alert_id: alertId,
+            alarmId: alertId,
+            alarm_id: alertId,
+            device_id: deviceId,
+            deviceId,
+            vehicleId: deviceId,
+            device_name: deviceName,
+            deviceName,
+            alert_type: matchedDef.name,
+            alarm_type: matchedDef.name,
+            type: matchedDef.name,
+            title: matchedDef.name,
+            alarmText,
+            timestamp: new Date(entryTime).toISOString(),
+            alarmTs: new Date(entryTime).toISOString(),
+            last_occurrence: new Date(entryTime).toISOString(),
+            source_type: 'telematics',
+            severity: escalatedSeverity,
+            priority: escalatedSeverity,
+            base_severity: baseSeverity,
+            escalated: escalatedSeverity !== baseSeverity,
+            status: 'new',
+            resolved: false,
+            count: groupCount,
+            group_key: groupRow.group_key || `${deviceId}:${matchedDef.name}`.toLowerCase(),
+            lat,
+            lon,
+          },
+        });
+      } catch (_) { /* never block zone check on WS */ }
+    }
+    console.log(`[GEOTAB] Zone alert created: ${alertId} group=${groupRow.id} (${matchedDef.name}) for ${fleetNumber || deviceId} in ${zone.name}`);
+    return groupRow;
+  } catch (error) {
+    console.error('[GEOTAB] Zone entry alert failed:', error.message);
+    return null;
+  }
+}
+
 async function checkZoneBreaches(deviceId, lat, lon, speed, fleetNumber, licensePlate) {
   try {
     let zones = zonesCache.data;
@@ -1160,6 +1356,19 @@ async function checkZoneBreaches(deviceId, lat, lon, speed, fleetNumber, license
             entryTime: new Date().toISOString(),
           });
         }
+
+        // Fallback alert card — only when Geotab didn't already send the same
+        // zone-entry event within ±2 min (then Geotab's alert is the one stored).
+        await createZoneEntryAlert({
+          deviceId,
+          fleetNumber,
+          licensePlate,
+          lat,
+          lon,
+          speed,
+          zone,
+          entryTime: new Date().toISOString(),
+        });
       } else if (!isInside && wasInside) {
         // Vehicle exited zone — mark as inactive
         const existing = activeEntries.find(e => e.zone_id === zone.id);
@@ -1193,11 +1402,21 @@ async function fetchAndStoreVehicleStatus() {
         const fleetNumber = geotabDevice?.fleet_number || null;
         const licensePlate = geotabDevice?.license_plate || null;
 
-        // Get current speed from vehicle_status (set by syncDeviceStatus from Geotab)
-        const prevResult = await db.query('SELECT engine_on, speed FROM vehicle_status WHERE device_id = $1', [record.id]);
-        const wasEngineOn = prevResult.rows.length > 0 ? (prevResult.rows[0].engine_on || false) : false;
-        const currentSpeed = prevResult.rows.length > 0 ? (prevResult.rows[0].speed || 0) : 0;
-        const isEngineOn = currentSpeed >= 5;
+        // Real Geotab ignition/RPM (syncIgnitionStatus) when the last StatusData
+        // sample is fresh (<=5 min); otherwise fall back to the legacy
+        // speed >= 5 heuristic. Also guards against clobbering fresh real values.
+        const prevResult = await db.query(
+          'SELECT engine_on, ignition_on, speed, status_seen FROM vehicle_status WHERE device_id = $1',
+          [record.id]
+        );
+        const prevRow = prevResult.rows[0] || {};
+        const wasEngineOn = prevRow.engine_on || false;
+        const currentSpeed = prevRow.speed || 0;
+        const statusFresh =
+          prevRow.status_seen &&
+          Date.now() - new Date(prevRow.status_seen).getTime() <= 5 * 60 * 1000;
+        const isEngineOn = statusFresh ? !!prevRow.engine_on : currentSpeed >= 5;
+        const isIgnitionOn = statusFresh ? !!prevRow.ignition_on : currentSpeed >= 5;
 
         await db.query(
           `INSERT INTO vehicle_status (device_id, plate, license_plate, fleet_number, engine_on, ignition_on, last_update)
@@ -1207,7 +1426,7 @@ async function fetchAndStoreVehicleStatus() {
              license_plate = COALESCE(EXCLUDED.license_plate, vehicle_status.license_plate),
              fleet_number = COALESCE(EXCLUDED.fleet_number, vehicle_status.fleet_number),
              engine_on = $5, ignition_on = $6, last_update = NOW()`,
-          [record.id, record.deviceName || null, licensePlate, fleetNumber, isEngineOn, isEngineOn]
+          [record.id, record.deviceName || null, licensePlate, fleetNumber, isEngineOn, isIgnitionOn]
         );
 
         // RTMS: Log engine on/off transitions
@@ -1273,6 +1492,7 @@ function startPolling(intervalMs = 60000, eventIntervalMs = 15000) {
     fetchAndStoreVehicleStatus();
     syncLogRecords();
     syncDeviceStatus();
+    syncIgnitionStatus();
 
     pollingInterval = setInterval(async () => {
       await syncGeotabGroups();
@@ -1282,6 +1502,7 @@ function startPolling(intervalMs = 60000, eventIntervalMs = 15000) {
       await syncGeotabZones();
       await syncLogRecords();
       await syncDeviceStatus();
+      await syncIgnitionStatus();
       await fetchAndStoreVehicleStatus();
     }, intervalMs);
 

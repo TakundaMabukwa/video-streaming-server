@@ -462,8 +462,13 @@ const MIGRATIONS_SQL = `
   ALTER TABLE alert_groups ADD COLUMN IF NOT EXISTS follow_up_at TIMESTAMPTZ;
   ALTER TABLE alert_groups ADD COLUMN IF NOT EXISTS original_severity TEXT;
 
-  -- Seed telematics alert_definitions (Geotab exception events)
-  INSERT INTO alert_definitions (name, category, signal_code, severity, description, is_active) VALUES
+  -- Seed telematics alert_definitions (Geotab exception events).
+  -- Guarded by name+category: never re-inserts a definition that already exists
+  -- (its signal_code may have been corrected since — a code-based conflict alone
+  -- would resurrect a duplicate with a stale placeholder code on every boot).
+  INSERT INTO alert_definitions (name, category, signal_code, severity, description, is_active)
+  SELECT v.name, v.category, v.signal_code, v.severity, v.description, v.is_active
+  FROM (VALUES
   ('Speeding', 'telematics', 'speeding', 'HIGH', 'Vehicle exceeding speed limit (Geotab)', true),
   ('Harsh Braking', 'telematics', 'harshBraking', 'MEDIUM', 'Sudden deceleration detected', true),
   ('Harsh Cornering', 'telematics', 'harshCornering', 'MEDIUM', 'Aggressive turn detected', true),
@@ -477,6 +482,11 @@ const MIGRATIONS_SQL = `
   ('Tow Detected', 'telematics', 'tow', 'HIGH', 'Vehicle being towed', true),
   ('Device Removed', 'telematics', 'deviceRemoved', 'CRITICAL', 'Tracking device tampered/removed', true),
   ('Exception Event', 'telematics', 'exceptionEvent', 'MEDIUM', 'General Geotab exception event', true)
+  ) AS v(name, category, signal_code, severity, description, is_active)
+  WHERE NOT EXISTS (
+    SELECT 1 FROM alert_definitions ad
+    WHERE ad.name = v.name AND ad.category = v.category
+  )
   ON CONFLICT (signal_code) DO NOTHING;
 
   -- Add missing columns to vehicle_status
@@ -497,6 +507,12 @@ const MIGRATIONS_SQL = `
   ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION;
   ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION;
   ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS last_log_time TIMESTAMPTZ;
+  -- Real Geotab device state (syncDeviceStatus + syncIgnitionStatus):
+  -- is_device_communicating / online-since come from DeviceStatusInfo;
+  -- status_seen marks the last real StatusData sample (ignition/engine RPM).
+  ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS is_online BOOLEAN;
+  ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS online_since TIMESTAMPTZ;
+  ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS status_seen TIMESTAMPTZ;
 
   -- Geotab zones
   CREATE TABLE IF NOT EXISTS geotab_zones (
@@ -809,6 +825,9 @@ const MIGRATIONS_SQL = `
   -- cost center's set unless explicitly removed. Inserts missing overrides,
   -- copying the base severity/description. Idempotent (ON CONFLICT DO NOTHING),
   -- never overwrites existing per-CC customizations.
+  -- REMOVALS ARE SOFT (is_active = FALSE, see alertConfigController): removed
+  -- rows still exist, so ON CONFLICT skips them and deletions persist across
+  -- restarts. Readers must filter o.is_active IS DISTINCT FROM false.
   INSERT INTO alert_definition_overrides (alert_definition_id, cost_center_id, severity, description, is_active)
   SELECT d.id, cc.id, d.severity, d.description, NULL
   FROM alert_definitions d

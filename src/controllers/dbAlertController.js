@@ -602,12 +602,24 @@ async function getAlertHistory(req, res) {
       params
     );
 
+    // Strict filter parity with the active-alerts list: history rows whose
+    // alarm_type is no longer in the device's cost-center set (or active
+    // global for CC-less devices) are hidden.
+    let rows = result.rows;
+    try {
+      const { deviceCC } = await batchResolveDeviceCC(rows);
+      const { passes } = await buildStrictAlertFilter(deviceCC);
+      rows = rows.filter((g) => passes(g));
+    } catch (filterError) {
+      console.error('[Alerts] History filter failed:', filterError.message);
+    }
+
     res.json({
       success: true,
-      alerts: result.rows,
-      history: result.rows,
-      data: result.rows,
-      count: result.rows.length,
+      alerts: rows,
+      history: rows,
+      data: rows,
+      count: rows.length,
       days,
       device_id: deviceId || null,
       fleet_number: fleet || fleetNumber || null,

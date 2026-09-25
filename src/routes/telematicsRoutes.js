@@ -403,8 +403,11 @@ router.get('/vehicle-alerts/:deviceId', async (req, res) => {
     let alerts = groups;
     try {
       const { deviceCC } = await batchResolveDeviceCC(groups);
-      const { severityFor } = await buildStrictAlertFilter(deviceCC);
-      alerts = groups.map((row) => {
+      const { passes, severityFor } = await buildStrictAlertFilter(deviceCC);
+      // Strict filter: same rules as the active-alerts list — only definitions
+      // in the device's cost-center set (or active global for CC-less devices).
+      const visible = groups.filter((g) => passes(g));
+      alerts = visible.map((row) => {
         const t = transformDbAlert(row, severityFor(row));
         t.lat = row.lat;
         t.lon = row.lon;
