@@ -882,23 +882,22 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
         continue;
       }
 
-      // Zone-entry cross-path dedup: if our polygon fallback already created a
-      // zone-entry alert for this same physical entry (+/-2 min), don't mint a
-      // second card — one alert per entry, whichever path fired first.
+      // Zone monitoring rule: if the same zone alert already exists for this
+      // vehicle in alert_groups within the last 2 minutes, skip entirely —
+      // no alert insert, no group insert, no count increment. Otherwise
+      // insert it (definition matched by its exact signal code) into
+      // alert_groups for the vehicle.
       if (eventCode === GEOTAB_ENTERING_HIGH_RISK_CODE) {
         try {
-          const evMs = new Date(eventTime).getTime();
-          const zoneDup = await db.query(
+          const zoneRecent = await db.query(
             `SELECT 1 FROM alert_groups
              WHERE device_id = $1 AND source_type = 'telematics'
                AND alarm_type IN ('Entering High Risk Area', 'No-Go Zone Entry')
-               AND last_alert_ts >= $2::timestamptz AND last_alert_ts <= $3::timestamptz
+               AND last_alert_ts >= NOW() - interval '2 minutes'
              LIMIT 1`,
-            [geotabDeviceId,
-             new Date(evMs - ZONE_ENTRY_DEDUP_WINDOW_MS).toISOString(),
-             new Date(evMs + ZONE_ENTRY_DEDUP_WINDOW_MS).toISOString()]
+            [geotabDeviceId]
           );
-          if (zoneDup.rows.length > 0) continue; // our fallback card stands
+          if (zoneRecent.rows.length > 0) continue; // seen in last 2 min — skip
         } catch (_) { /* if in doubt, let the Geotab alert through */ }
       }
 
@@ -1229,31 +1228,28 @@ async function syncLogRecords() {
 // Geotab rule id for "Entering High Risk Area" — used to detect whether the
 // Geotab exception feed already covered a zone entry we detected ourselves.
 const GEOTAB_ENTERING_HIGH_RISK_CODE = 'aCmnsH92P1kqGBTWyRmdacA';
-const ZONE_ENTRY_DEDUP_WINDOW_MS = 2 * 60 * 1000;
 
 // Fallback alert creation for zone entries detected by our own polygon check.
-// Only fires when Geotab did NOT already send the same zone-entry event within
-// ±2 min of the detected entry (checked for high-risk AND no-go — Geotab's
-// "Entering High Risk Area" rule also fires on no-go zones). If Geotab's event
-// arrives after us, processGeotabEventBatch suppresses its card for the same
-// window — one alert per physical entry, whichever path fired first.
+// Zone monitoring rule (both paths): if the same zone alert exists for this
+// vehicle in alert_groups within the last 2 minutes, insert nothing — no
+// alert row, no group row, no count increment. Otherwise insert it into
+// alert_groups for the vehicle. Geotab's ingest path (processGeotabEventBatch)
+// applies the identical check, so one physical entry yields one alert,
+// whichever path fires first.
 async function createZoneEntryAlert({ deviceId, fleetNumber, licensePlate, lat, lon, speed, zone, entryTime }) {
   try {
     const isNoGo = !!zone.is_no_go;
     const defName = isNoGo ? 'No-Go Zone Entry' : 'Entering High Risk Area';
 
-    const entryMs = new Date(entryTime).getTime();
     const dup = await db.query(
-      `SELECT 1 FROM telematics_events
-       WHERE device_id = $1 AND event_code = $2
-         AND event_time >= $3::timestamptz
-         AND event_time <= $4::timestamptz
+      `SELECT 1 FROM alert_groups
+       WHERE device_id = $1 AND source_type = 'telematics'
+         AND alarm_type IN ('Entering High Risk Area', 'No-Go Zone Entry')
+         AND last_alert_ts >= NOW() - interval '2 minutes'
        LIMIT 1`,
-      [deviceId, GEOTAB_ENTERING_HIGH_RISK_CODE,
-       new Date(entryMs - ZONE_ENTRY_DEDUP_WINDOW_MS).toISOString(),
-       new Date(entryMs + ZONE_ENTRY_DEDUP_WINDOW_MS).toISOString()]
+      [deviceId]
     );
-    if (dup.rows.length > 0) return null; // Geotab already covered it
+    if (dup.rows.length > 0) return null; // same alert already in DB last 2 min
 
     const { findVehicleCostCenterId } = require('./costCenterLookup');
     const eventCC = await findVehicleCostCenterId(fleetNumber || deviceId).catch(() => null);
