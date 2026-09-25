@@ -291,10 +291,10 @@ router.get('/events-today/:deviceId', async (req, res) => {
 router.get('/vehicle-alerts', async (req, res) => {
   try {
     const result = await db.query(
-      `SELECT device_id, COUNT(*) as alert_count,
-              MAX(alarm_ts) as latest_alert_ts,
+      `SELECT device_id, SUM(count) as alert_count,
+              MAX(last_alert_ts) as latest_alert_ts,
               ARRAY_AGG(DISTINCT alarm_type) as alert_types
-       FROM alerts
+       FROM alert_groups
        WHERE resolved = FALSE AND false_alert = FALSE
        GROUP BY device_id`
     );
@@ -391,7 +391,7 @@ router.get('/vehicle-alerts/:deviceId', async (req, res) => {
     where += ` AND (${matchClauses.join(' OR ')})`;
 
     const result = await db.query(
-      `SELECT ag.*, a.lat, a.lon
+      `SELECT ag.*, COALESCE(a.lat, ag.lat) AS lat, COALESCE(a.lon, ag.lon) AS lon
        FROM alert_groups ag
        LEFT JOIN alerts a ON a.id = ag.last_alert_id
        ${where}
@@ -435,11 +435,11 @@ router.get('/vehicle-status-all-enriched', async (req, res) => {
               a.latest_alert_ts,
               a.alert_types
        FROM vehicle_status vs
-       LEFT JOIN (
-         SELECT device_id, COUNT(*) as alert_count,
-                MAX(alarm_ts) as latest_alert_ts,
-                ARRAY_AGG(DISTINCT alarm_type) as alert_types
-         FROM alerts
+        LEFT JOIN (
+         SELECT device_id, SUM(count) as alert_count,
+                 MAX(last_alert_ts) as latest_alert_ts,
+                 ARRAY_AGG(DISTINCT alarm_type) as alert_types
+         FROM alert_groups
          WHERE resolved = FALSE AND false_alert = FALSE
          GROUP BY device_id
        ) a ON vs.device_id = a.device_id

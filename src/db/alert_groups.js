@@ -144,7 +144,7 @@ async function getActiveAlertGroupsAll({ limit = 2000 } = {}) {
 
 async function getResolvedAlertGroupsWithMedia({ limit = 2000 } = {}) {
   const result = await query(
-    `SELECT g.*, a.documents,
+    `SELECT g.*, COALESCE(a.documents, g.documents) AS documents,
             jsonb_agg(DISTINCT jsonb_build_object(
               'id', m.id, 'file_url', m.file_url, 'file_type', m.file_type,
               'file_size', m.file_size, 'created_at', m.created_at

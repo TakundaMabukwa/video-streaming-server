@@ -518,7 +518,7 @@ async function resolveHistoryDeviceIds(deviceId, fleetNumber) {
   }
   if (!fleet && deviceId) {
     const named = await db.query(
-      `SELECT device_name FROM alerts WHERE device_id = $1 ORDER BY alarm_ts DESC NULLS LAST LIMIT 1`,
+      `SELECT device_name FROM alert_groups WHERE device_id = $1 ORDER BY last_alert_ts DESC NULLS LAST LIMIT 1`,
       [deviceId]
     ).catch(() => ({ rows: [] }));
     const deviceName = named.rows[0]?.device_name || '';
@@ -544,7 +544,7 @@ async function resolveHistoryDeviceIds(deviceId, fleetNumber) {
 
   try {
     const byName = await db.query(
-      `SELECT DISTINCT device_id FROM alerts
+      `SELECT DISTINCT device_id FROM alert_groups
        WHERE split_part(coalesce(device_name, ''), ' - ', 1) ILIKE $1
           OR split_part(coalesce(device_name, ''), ' - ', 2) ILIKE $1
        LIMIT 500`,
@@ -571,13 +571,21 @@ async function getAlertHistory(req, res) {
       where += ' AND (resolved IS NOT TRUE) AND (false_alert IS NOT TRUE)';
     }
 
+    // Same filters for the telematics branch, applied inside telematics_events
+    // (bare columns — single-table scope) so both branches can use their time
+    // indexes and stop early on LIMIT.
+    const telNameExpr = `COALESCE(NULLIF(fleet_number, ''), device_id) || COALESCE(CASE WHEN NULLIF(license_plate, '') IS NOT NULL THEN ' - ' || license_plate END, '')`;
+    let telWhere = 'event_time >= $1';
+
     const { deviceIds, fleet } = await resolveHistoryDeviceIds(deviceId, fleetNumber);
     if (deviceIds.length === 1) {
       params.push(deviceIds[0]);
       where += ` AND device_id = $${params.length}`;
+      telWhere += ` AND device_id = $${params.length}`;
     } else if (deviceIds.length > 1) {
       params.push(deviceIds);
       where += ` AND device_id = ANY($${params.length}::text[])`;
+      telWhere += ` AND device_id = ANY($${params.length}::text[])`;
     } else if (fleet) {
       // No concrete device ids — match vehicle by fleet code in device_name
       // (covers cross-source: video camera id vs Geotab short id).
@@ -588,17 +596,88 @@ async function getAlertHistory(req, res) {
         OR split_part(coalesce(device_name, ''), ' - ', 2) ILIKE $${n}
         OR upper(coalesce(device_name, '')) LIKE upper('%' || $${n} || '%')
       )`;
+      telWhere += ` AND (
+        split_part(${telNameExpr}, ' - ', 1) ILIKE $${n}
+        OR split_part(${telNameExpr}, ' - ', 2) ILIKE $${n}
+        OR upper(${telNameExpr}) LIKE upper('%' || $${n} || '%')
+      )`;
     }
 
-    params.push(limit);
-
+    // History is two-source: video/Mettax rows live in `alerts`; telematics
+    // rows are read from `telematics_events` (matched to a definition by exact
+    // name, then exact signal_code — same order as matchAlertDefinition).
+    // Events already stored in `alerts` (pre-cutover) are excluded so nothing
+    // appears twice. Per-event state mirrors the old `alerts` rows (which
+    // resolve never updated): resolved=false, status='new'.
+    // Each branch takes its own top-`limit` (correct: union of top-N per
+    // source = top-N overall) — keeps both branches on index scans.
+    // `limit`/50000 are parseInt'd ints — safe to inline.
     const result = await db.query(
       `SELECT id, device_id, device_name, alarm_type, alarm_ts, alarm_ts_end, source_type, status,
               resolved, false_alert, notes, lat, lon, alarm_text, created_at, updated_at
-       FROM alerts
-       WHERE ${where}
+       FROM (
+         (SELECT id, device_id, device_name, alarm_type, alarm_ts, alarm_ts_end, source_type, status,
+                 resolved, false_alert, notes, lat, lon, alarm_text, created_at, updated_at
+          FROM alerts
+          WHERE ${where}
+          ORDER BY alarm_ts DESC
+          LIMIT ${limit})
+
+         UNION ALL
+
+         (SELECT COALESCE('tel-' || m.device_id || '-' || (m.raw_data ->> 'id'), 'tel-' || m.device_id || '-e' || m.id) AS id,
+                 m.device_id,
+                 m.device_name,
+                 m.alarm_type,
+                 m.event_time AS alarm_ts,
+                 NULL::timestamptz AS alarm_ts_end,
+                 'telematics' AS source_type,
+                 'new' AS status,
+                 FALSE AS resolved,
+                 FALSE AS false_alert,
+                 NULL::text AS notes,
+                 m.latitude AS lat,
+                 m.longitude AS lon,
+                 m.event_type || COALESCE(' in zone ' || NULLIF(m.zone_name, ''), '') AS alarm_text,
+                 m.created_at,
+                 NULL::timestamptz AS updated_at
+          FROM (
+            SELECT p.*, COALESCE(dn.name, dc.name) AS alarm_type
+            FROM (
+              SELECT e.*, ${telNameExpr} AS device_name
+              FROM telematics_events e
+              WHERE ${telWhere}
+              ORDER BY e.event_time DESC
+              LIMIT 50000
+            ) p
+            LEFT JOIN (
+              SELECT lower(name) AS lname, min(name) AS name
+              FROM alert_definitions
+              WHERE category = 'telematics' AND is_active AND name IS NOT NULL AND name <> ''
+                AND signal_code IS DISTINCT FROM 'exceptionEvent'
+              GROUP BY 1
+            ) dn ON dn.lname = lower(p.event_type)
+            LEFT JOIN (
+              SELECT lower(signal_code) AS lcode, min(name) AS name
+              FROM alert_definitions
+              WHERE category = 'telematics' AND is_active AND name IS NOT NULL AND name <> ''
+                AND signal_code IS DISTINCT FROM 'exceptionEvent'
+              GROUP BY 1
+            ) dc ON dc.lcode = lower(p.event_code)
+          ) m
+          WHERE m.alarm_type IS NOT NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM alerts a
+              WHERE a.source_type = 'telematics'
+                AND a.device_id = m.device_id
+                AND a.alarm_ts = m.event_time
+                AND a.alarm_type = m.alarm_type
+            )
+          ORDER BY m.event_time DESC
+          LIMIT ${limit})
+       ) h
        ORDER BY alarm_ts DESC
-       LIMIT $${params.length}`,
+       LIMIT ${limit}`,
       params
     );
 

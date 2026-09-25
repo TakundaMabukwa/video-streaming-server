@@ -904,18 +904,8 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
       const alertId = `tel-${geotabDeviceId}-${event.id || `${Date.now()}-${i}`}`;
       const deviceName = fleetNumber ? `${fleetNumber}${licensePlate ? ' - ' + licensePlate : ''}` : geotabDeviceId;
 
-      await db.upsertAlert({
-        id: alertId,
-        deviceId: geotabDeviceId,
-        deviceName,
-        alarmType: matchedDef.name,
-        alarmTs: eventTime,
-        lat: evtLat,
-        lon: evtLon,
-        alarmText: `${eventName}${zoneNameFromEvent ? ' in zone ' + zoneNameFromEvent : ''}`,
-        sourceType: 'telematics',
-      });
-
+      // No per-event row in `alerts` — alert_groups is the store, and the
+      // per-event archive is telematics_events (history reads it directly).
       const groupRow = await db.upsertAlertGroup({
         deviceId: geotabDeviceId,
         deviceName,
@@ -1278,18 +1268,7 @@ async function createZoneEntryAlert({ deviceId, fleetNumber, licensePlate, lat, 
     const deviceName = fleetNumber ? `${fleetNumber}${licensePlate ? ' - ' + licensePlate : ''}` : deviceId;
     const alarmText = `${defName} in zone ${zone.name}`;
 
-    await db.upsertAlert({
-      id: alertId,
-      deviceId,
-      deviceName,
-      alarmType: matchedDef.name,
-      alarmTs: entryTime,
-      lat,
-      lon,
-      alarmText,
-      sourceType: 'telematics',
-    });
-
+    // No per-event row in `alerts` — alert_groups is the store.
     const groupRow = await db.upsertAlertGroup({
       deviceId,
       deviceName,
@@ -1302,6 +1281,24 @@ async function createZoneEntryAlert({ deviceId, fleetNumber, licensePlate, lat, 
       sourceType: 'telematics',
     });
     if (!groupRow || groupRow.id == null) return null;
+
+    // Archive the polygon-fallback entry in telematics_events — history reads
+    // that table as the telematics source now (no `alerts` row is written).
+    // Distinct event_code so it is never mistaken for a Geotab-fired event in
+    // the "Geotab already stored" dedup check above.
+    await db.query(
+      `INSERT INTO telematics_events (device_id, vehicle_id, license_plate, fleet_number, plate,
+        event_type, event_code, severity, latitude, longitude, speed, description, zone_name, raw_data, event_time)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+       ON CONFLICT DO NOTHING`,
+      [
+        deviceId, deviceId, licensePlate || null, fleetNumber || null, licensePlate || null,
+        defName, 'polygonZoneEntry', String(matchedDef.severity || 'MEDIUM').toUpperCase(),
+        lat, lon, speed || null, `Zone entry (polygon)`, zone.name,
+        JSON.stringify({ source: 'polygon', zone_id: zone.id, is_no_go: !!isNoGo }),
+        entryTime || new Date().toISOString(),
+      ]
+    ).catch((e) => console.error('[GEOTAB] Zone event archive failed:', e.message));
 
     if (wsBroadcast) {
       try {

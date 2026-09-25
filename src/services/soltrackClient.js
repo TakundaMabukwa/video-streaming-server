@@ -190,18 +190,8 @@ async function handleFrame(frame) {
       const severity = String(matchedDef.severity || 'MEDIUM').toUpperCase();
 
       try {
-        await db.upsertAlert({
-          id: alertId,
-          deviceId: fleetNumber,
-          deviceName,
-          alarmType: matchedDef.name,
-          alarmTs: eventTime,
-          lat: frame.lat,
-          lon: frame.lon,
-          alarmText,
-          sourceType: 'telematics',
-        });
-
+        // No per-event row in `alerts` — alert_groups is the store, and the
+        // event archive is telematics_events (written below).
         const groupRow = await db.upsertAlertGroup({
           deviceId: fleetNumber,
           deviceName,
