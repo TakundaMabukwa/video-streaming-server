@@ -147,32 +147,7 @@ async function processAlertDeduction(fleet_number, alert_type) {
         // Reset count after NCR
         alertEntry.count = 0;
 
-        // Auto-close the original telematics alerts that triggered this NCR.
-        // The original alerts use the Geotab device_id, not the fleet_number,
-        // so we resolve it from geotab_devices.
-        try {
-          const devResult = await client.query(
-            `SELECT id FROM geotab_devices WHERE UPPER(fleet_number) = UPPER($1) LIMIT 1`,
-            [fleet_number]
-          );
-          if (devResult.rows.length > 0) {
-            const origDeviceId = devResult.rows[0].id;
-            const origGroupKey = `${origDeviceId}:${alert_type}`.toLowerCase();
-            await client.query(
-              `UPDATE alert_groups SET resolved = TRUE, resolved_by = 'SYSTEM', resolved_at = NOW(), notes = COALESCE(notes || ' | ', '') || 'Auto-closed: NCR threshold reached', updated_at = NOW()
-               WHERE group_key = $1 AND resolved = FALSE`,
-              [origGroupKey]
-            );
-            await client.query(
-              `UPDATE alerts SET resolved = TRUE, updated_at = NOW()
-               WHERE device_id = $1 AND alarm_type = $2 AND resolved = FALSE`,
-              [origDeviceId, alert_type]
-            );
-            console.log(`[DriverScoring] Auto-closed original alerts for fleet=${fleet_number} device=${origDeviceId} type=${alert_type}`);
-          }
-        } catch (closeErr) {
-          console.error('[DriverScoring] Failed to auto-close original alerts:', closeErr.message);
-        }
+        // Never auto-resolve the original alerts — only a human closes them.
 
         // Capture incident register row for the auto-NCR
         try {
