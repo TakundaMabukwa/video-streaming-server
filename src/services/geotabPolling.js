@@ -1252,7 +1252,10 @@ async function createZoneEntryAlert({ deviceId, fleetNumber, licensePlate, lat, 
        LIMIT 1`,
       [GEOTAB_ENTERING_HIGH_RISK_CODE, deviceId, fleetNumber || licensePlate || '', entryTime || new Date().toISOString()]
     ).catch(() => ({ rows: [] }));
-    if (geotabStored.rows.length > 0) return null; // Geotab owns this alert
+    if (geotabStored.rows.length > 0) {
+      console.log(`[GEOTAB] Zone alert skipped: Geotab already stored same event for ${fleetNumber || deviceId} in ${zone.name}`);
+      return null; // Geotab owns this alert
+    }
 
     // 2) Same zone alert already in alert_groups for this vehicle last 2 min?
     const dup = await db.query(
