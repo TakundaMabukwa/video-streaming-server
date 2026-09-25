@@ -882,6 +882,26 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
         continue;
       }
 
+      // Zone-entry cross-path dedup: if our polygon fallback already created a
+      // zone-entry alert for this same physical entry (+/-2 min), don't mint a
+      // second card — one alert per entry, whichever path fired first.
+      if (eventCode === GEOTAB_ENTERING_HIGH_RISK_CODE) {
+        try {
+          const evMs = new Date(eventTime).getTime();
+          const zoneDup = await db.query(
+            `SELECT 1 FROM alert_groups
+             WHERE device_id = $1 AND source_type = 'telematics'
+               AND alarm_type IN ('Entering High Risk Area', 'No-Go Zone Entry')
+               AND last_alert_ts >= $2::timestamptz AND last_alert_ts <= $3::timestamptz
+             LIMIT 1`,
+            [geotabDeviceId,
+             new Date(evMs - ZONE_ENTRY_DEDUP_WINDOW_MS).toISOString(),
+             new Date(evMs + ZONE_ENTRY_DEDUP_WINDOW_MS).toISOString()]
+          );
+          if (zoneDup.rows.length > 0) continue; // our fallback card stands
+        } catch (_) { /* if in doubt, let the Geotab alert through */ }
+      }
+
       const alertId = `tel-${geotabDeviceId}-${event.id || `${Date.now()}-${i}`}`;
       const deviceName = fleetNumber ? `${fleetNumber}${licensePlate ? ' - ' + licensePlate : ''}` : geotabDeviceId;
 
@@ -1213,27 +1233,27 @@ const ZONE_ENTRY_DEDUP_WINDOW_MS = 2 * 60 * 1000;
 
 // Fallback alert creation for zone entries detected by our own polygon check.
 // Only fires when Geotab did NOT already send the same zone-entry event within
-// ±2 min of the detected entry; if Geotab's event arrives later it merges into
-// this same group (same device + alarm_type + source) — one card either way.
+// ±2 min of the detected entry (checked for high-risk AND no-go — Geotab's
+// "Entering High Risk Area" rule also fires on no-go zones). If Geotab's event
+// arrives after us, processGeotabEventBatch suppresses its card for the same
+// window — one alert per physical entry, whichever path fired first.
 async function createZoneEntryAlert({ deviceId, fleetNumber, licensePlate, lat, lon, speed, zone, entryTime }) {
   try {
     const isNoGo = !!zone.is_no_go;
     const defName = isNoGo ? 'No-Go Zone Entry' : 'Entering High Risk Area';
 
-    if (!isNoGo) {
-      const entryMs = new Date(entryTime).getTime();
-      const dup = await db.query(
-        `SELECT 1 FROM telematics_events
-         WHERE device_id = $1 AND event_code = $2
-           AND event_time >= $3::timestamptz
-           AND event_time <= $4::timestamptz
-         LIMIT 1`,
-        [deviceId, GEOTAB_ENTERING_HIGH_RISK_CODE,
-         new Date(entryMs - ZONE_ENTRY_DEDUP_WINDOW_MS).toISOString(),
-         new Date(entryMs + ZONE_ENTRY_DEDUP_WINDOW_MS).toISOString()]
-      );
-      if (dup.rows.length > 0) return null; // Geotab already covered it
-    }
+    const entryMs = new Date(entryTime).getTime();
+    const dup = await db.query(
+      `SELECT 1 FROM telematics_events
+       WHERE device_id = $1 AND event_code = $2
+         AND event_time >= $3::timestamptz
+         AND event_time <= $4::timestamptz
+       LIMIT 1`,
+      [deviceId, GEOTAB_ENTERING_HIGH_RISK_CODE,
+       new Date(entryMs - ZONE_ENTRY_DEDUP_WINDOW_MS).toISOString(),
+       new Date(entryMs + ZONE_ENTRY_DEDUP_WINDOW_MS).toISOString()]
+    );
+    if (dup.rows.length > 0) return null; // Geotab already covered it
 
     const { findVehicleCostCenterId } = require('./costCenterLookup');
     const eventCC = await findVehicleCostCenterId(fleetNumber || deviceId).catch(() => null);
