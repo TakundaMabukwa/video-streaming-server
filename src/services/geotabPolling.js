@@ -1230,17 +1230,31 @@ async function syncLogRecords() {
 const GEOTAB_ENTERING_HIGH_RISK_CODE = 'aCmnsH92P1kqGBTWyRmdacA';
 
 // Fallback alert creation for zone entries detected by our own polygon check.
-// Zone monitoring rule (both paths): if the same zone alert exists for this
-// vehicle in alert_groups within the last 2 minutes, insert nothing — no
-// alert row, no group row, no count increment. Otherwise insert it into
-// alert_groups for the vehicle. Geotab's ingest path (processGeotabEventBatch)
-// applies the identical check, so one physical entry yields one alert,
-// whichever path fires first.
+// Zone monitoring rule: before inserting into alert_groups, check whether
+// Geotab itself has already fired AND stored the same zone-entry event for
+// this vehicle (telematics_events, the Geotab zone rule code, ±2 min). If
+// Geotab stored it → skip entirely (Geotab's ingest path owns that alert).
+// Also skip if alert_groups already holds this vehicle's zone alert from the
+// last 2 minutes (our own re-entry / Geotab ingest got there first). Only
+// when neither exists do we insert into alert_groups for the vehicle.
 async function createZoneEntryAlert({ deviceId, fleetNumber, licensePlate, lat, lon, speed, zone, entryTime }) {
   try {
     const isNoGo = !!zone.is_no_go;
     const defName = isNoGo ? 'No-Go Zone Entry' : 'Entering High Risk Area';
 
+    // 1) Has Geotab already fired & stored this same zone event? → do not create.
+    const geotabStored = await db.query(
+      `SELECT 1 FROM telematics_events
+       WHERE event_code = $1
+         AND (device_id = $2 OR fleet_number = $2 OR fleet_number = $3 OR license_plate = $3)
+         AND event_time >= $4::timestamptz - interval '2 minutes'
+         AND event_time <= $4::timestamptz + interval '2 minutes'
+       LIMIT 1`,
+      [GEOTAB_ENTERING_HIGH_RISK_CODE, deviceId, fleetNumber || licensePlate || '', entryTime || new Date().toISOString()]
+    ).catch(() => ({ rows: [] }));
+    if (geotabStored.rows.length > 0) return null; // Geotab owns this alert
+
+    // 2) Same zone alert already in alert_groups for this vehicle last 2 min?
     const dup = await db.query(
       `SELECT 1 FROM alert_groups
        WHERE device_id = $1 AND source_type = 'telematics'
