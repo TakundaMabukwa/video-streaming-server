@@ -18,8 +18,16 @@ async function listAlertDefinitions(req, res) {
     const whereClause = conds.length ? 'WHERE ' + conds.join(' AND ') : '';
 
     if (cost_center_id) {
-      // Return base definitions with CC override merged via LEFT JOIN
+      // Return base definitions with CC override merged via LEFT JOIN.
+      // in_set=true  (default) -> only defs actually IN this CC's set, so a
+      //                 deleted (soft-removed) def disappears from the list.
+      // in_set=false         -> only defs NOT in the set ("Override from Global").
       const ccId = Number(cost_center_id);
+      const inSet = String(req.query.in_set ?? 'true') !== 'false';
+      const setFilter = inSet ? 'o.id IS NOT NULL' : 'o.id IS NULL';
+      const finalWhere = whereClause
+        ? `${whereClause} AND ${setFilter}`
+        : `WHERE ${setFilter}`;
       const result = await db.query(
         `SELECT d.*,
                 o.severity   AS override_severity,
@@ -31,7 +39,7 @@ async function listAlertDefinitions(req, res) {
          LEFT JOIN alert_definition_overrides o
            ON o.alert_definition_id = d.id AND o.cost_center_id = $${params.length + 1}
            AND o.is_active IS DISTINCT FROM false
-         ${whereClause}
+         ${finalWhere}
          ORDER BY d.name`,
         [...params, ccId]
       );
@@ -294,6 +302,10 @@ async function listAlertGroupConfigs(req, res) {
     let groups;
     if (cost_center_id) {
       const ccId = Number(cost_center_id);
+      // in_set=true (default) -> only groups actually IN this CC's set, so a
+      // deleted override makes the group disappear instead of popping back.
+      // in_set=false -> only groups NOT in the set ("Override from Global").
+      const inSet = String(req.query.in_set ?? 'true') !== 'false';
       groups = await db.query(
         `SELECT g.*,
                 o.severity   AS override_severity,
@@ -304,6 +316,8 @@ async function listAlertGroupConfigs(req, res) {
          FROM alert_group_configs g
          LEFT JOIN alert_group_config_overrides o
            ON o.group_config_id = g.id AND o.cost_center_id = $1
+           AND o.is_active IS DISTINCT FROM false
+         WHERE ${inSet ? 'o.id IS NOT NULL' : 'o.id IS NULL'}
          ORDER BY g.name`,
         [ccId]
       );
