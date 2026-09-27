@@ -1,6 +1,10 @@
 const { query } = require('./pool');
+const { isRegisteredVehicle } = require('../services/fleetRegistryGuard');
 
 async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, alertId, alarmTs, lat, lon, sourceType = 'video' }) {
+  // Only vehicles in fleet_vehicles may raise alerts.
+  if (!(await isRegisteredVehicle({ deviceId, deviceName }))) return null;
+
   const baseKey = `${deviceId}:${alarmType}`.toLowerCase();
 
   // Reuse the current ACTIVE (unresolved) group for this device+type: bump the
@@ -54,8 +58,14 @@ async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, al
 
 async function batchUpsertAlertGroups(groups) {
   if (!groups || groups.length === 0) return [];
+  // Only vehicles in fleet_vehicles may raise alerts.
+  const allowed = [];
+  for (const g of groups) {
+    if (await isRegisteredVehicle({ deviceId: g.deviceId, deviceName: g.deviceName })) allowed.push(g);
+  }
+  if (allowed.length === 0) return [];
   const params = [];
-  const placeholders = groups.map((g, i) => {
+  const placeholders = allowed.map((g, i) => {
     const base = i * 9;
     params.push(
       `${g.deviceId}:${g.alarmType}`.toLowerCase(),

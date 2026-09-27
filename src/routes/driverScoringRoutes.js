@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { query, getClient } = require('../db');
 const { findVehicleCostCenterId } = require('../services/costCenterLookup');
+const { isRegisteredVehicle } = require('../services/fleetRegistryGuard');
 
 // GET /api/driver-scoring - Get all driver scores
 router.get('/', async (req, res) => {
@@ -196,6 +197,10 @@ router.post('/increment', async (req, res) => {
       // Check if NCR threshold reached
       const ncrThreshold = criteria.ncr_threshold || 3;
       if (alertEntry.count >= ncrThreshold) {
+        const registered = await isRegisteredVehicle({ deviceId: fleet_number, deviceName: fleet_number }).catch(() => true);
+        if (!registered) {
+          console.log(`[FLEET-GUARD] NCR skipped: "${fleet_number}" is not in fleet_vehicles`);
+        } else {
         // Create NCR alert in alerts table
         try {
           const ncrId = `ncr-${fleet_number}-${alert_type}-${Date.now()}`;
@@ -240,6 +245,7 @@ router.post('/increment', async (req, res) => {
           }
         } catch (ncrErr) {
           console.error('[DriverScoring] Failed to create NCR alert:', ncrErr.message);
+        }
         }
       }
 

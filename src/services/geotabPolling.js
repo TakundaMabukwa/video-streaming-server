@@ -917,6 +917,7 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
         lon: evtLon,
         sourceType: 'telematics',
       });
+      if (!groupRow) continue; // vehicle not in fleet_vehicles — no alert
       alerted++;
 
       if (wsBroadcast) {
