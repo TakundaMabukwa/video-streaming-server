@@ -6,21 +6,20 @@ const { query } = require('../db/pool');
 
 const CACHE_TTL_MS = 60 * 1000;
 const LOOKUP_CACHE = new Map();
+let registryCache = { tokens: null, expiresAt: 0 };
 
+// "VT11 - PD124 - JGW947FS", "VT11/PD124", "VT11-PD124" → [VT11, PD124, ...]
 function matchTokens(value) {
   const seen = new Set();
   const tokens = [];
   const push = (raw) => {
     const token = String(raw || '').trim().toUpperCase();
     if (token.length < 2 || seen.has(token)) return;
+    if (!/^[A-Z0-9]+$/.test(token)) return; // codes and plates are alphanumeric
     seen.add(token);
     tokens.push(token);
   };
-  for (const slashPart of String(value || '').split(/\s*\/\s*/)) {
-    for (const dashPart of slashPart.split(/\s+-\s+/)) {
-      for (const piece of dashPart.split(/\s+/)) push(piece);
-    }
-  }
+  for (const slashPart of String(value || '').split(/[/\s-]+/)) push(slashPart);
   return tokens;
 }
 
@@ -38,9 +37,20 @@ function vehicleTokens({ deviceId, deviceName } = {}) {
   return tokens;
 }
 
-// Returns true when at least one token matches fleet_vehicles.fleet_number or
-// fleet_vehicles.registration_number. Fails open: a registry lookup error must
-// never drop a real alert.
+async function loadRegistryTokens() {
+  if (registryCache.tokens && registryCache.expiresAt > Date.now()) return registryCache.tokens;
+  const result = await query('SELECT fleet_number, registration_number FROM fleet_vehicles');
+  const tokens = new Set();
+  for (const row of result.rows) {
+    for (const token of matchTokens(row.fleet_number)) tokens.add(token);
+    for (const token of matchTokens(row.registration_number)) tokens.add(token);
+  }
+  registryCache = { tokens, expiresAt: Date.now() + CACHE_TTL_MS };
+  return tokens;
+}
+
+// True when a token matches fleet_vehicles.fleet_number or registration_number.
+// Fails open: a registry lookup error must never drop a real alert.
 async function isRegisteredVehicle({ deviceId, deviceName } = {}) {
   const tokens = vehicleTokens({ deviceId, deviceName });
   if (tokens.length === 0) return false;
@@ -49,28 +59,19 @@ async function isRegisteredVehicle({ deviceId, deviceName } = {}) {
   const cached = LOOKUP_CACHE.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) return cached.value;
 
-  let value;
+  let registry;
   try {
-    const result = await query(
-      `SELECT 1 FROM fleet_vehicles
-        WHERE upper(trim(fleet_number)) = ANY($1::text[])
-           OR upper(trim(registration_number)) = ANY($1::text[])
-        LIMIT 1`,
-      [tokens]
-    );
-    value = result.rows.length > 0;
-    if (!value) {
-      const empty = await query('SELECT 1 FROM fleet_vehicles LIMIT 1').catch(() => null);
-      if (empty && empty.rows.length === 0) {
-        console.warn('[FLEET-GUARD] fleet_vehicles is empty — allowing alerts until the registry is populated');
-        return true;
-      }
-    }
+    registry = await loadRegistryTokens();
   } catch (error) {
     console.error('[FLEET-GUARD] fleet_vehicles lookup failed, allowing alert:', error.message);
     return true;
   }
+  if (registry.size === 0) {
+    console.warn('[FLEET-GUARD] fleet_vehicles is empty — allowing alerts until the registry is populated');
+    return true;
+  }
 
+  const value = tokens.some((token) => registry.has(token));
   LOOKUP_CACHE.set(cacheKey, { value, expiresAt: Date.now() + CACHE_TTL_MS });
   if (!value) {
     console.log(`[FLEET-GUARD] blocked: "${String(deviceName || deviceId)}" is not in fleet_vehicles`);
