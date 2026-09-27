@@ -24,12 +24,13 @@ function matchTokens(value) {
 }
 
 function vehicleTokens({ deviceId, deviceName } = {}) {
-  const id = String(deviceId || '').trim().toUpperCase();
   const tokens = [];
   const seen = new Set();
+  // deviceId is included: the NCR path passes only fleet_number as both id and
+  // name ("230"), and a device id can never collide with fleet_vehicles unless
+  // it really is that vehicle's fleet_number.
   for (const token of [...matchTokens(deviceName), ...matchTokens(deviceId)]) {
     if (seen.has(token)) continue;
-    if (token === id) continue; // a bare device id is not a fleet code
     if (/^\d{10,}$/.test(token)) continue; // camera / IMEI numbers
     seen.add(token);
     tokens.push(token);
