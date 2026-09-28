@@ -13,6 +13,9 @@ let telematicsNameCacheTime = 0;
 let cachedTelematicsNameSeverityMap = null;
 let telematicsNameSevCacheTime = 0;
 
+let cachedVideoNameMap = null;
+let videoNameCacheTime = 0;
+
 const ccCache = new Map();
 const ccTelematicsCache = new Map();
 const ccTelematicsNameCache = new Map();
@@ -26,13 +29,15 @@ function cacheKeyFor(ids) {
 /**
  * Build signal_code → severity map from CC-scoped rows.
  * Keys are lowercased for case-insensitive lookup.
+ * `name` is ALSO keyed so lookups keep working after video alerts are stored
+ * under their alert_definitions name instead of the raw signal code.
  */
 function buildMap(rows) {
   const map = {};
   for (const row of rows) {
-    if (row.signal_code) {
-      map[String(row.signal_code).toLowerCase()] = (row.override_severity || row.severity || 'MEDIUM').toLowerCase();
-    }
+    const severity = (row.override_severity || row.severity || 'MEDIUM').toLowerCase();
+    if (row.signal_code) map[String(row.signal_code).toLowerCase()] = severity;
+    if (row.name) map[String(row.name).toLowerCase()] = severity;
   }
   return map;
 }
@@ -54,7 +59,7 @@ async function getVideoSeverityMap(costCenterIds) {
 
     try {
       const result = await db.query(
-        `SELECT signal_code, severity FROM alert_definitions
+        `SELECT signal_code, name, severity FROM alert_definitions
          WHERE category = 'video' AND is_active = true`
       );
       cachedMap = buildMap(result.rows);
@@ -73,6 +78,7 @@ async function getVideoSeverityMap(costCenterIds) {
   try {
     const result = await db.query(
       `SELECT d.signal_code,
+              d.name,
               d.severity,
               o.severity AS override_severity
        FROM alert_definitions d
@@ -100,7 +106,7 @@ async function getTelematicsSeverityMap(costCenterIds) {
 
     try {
       const result = await db.query(
-        `SELECT signal_code, severity FROM alert_definitions
+        `SELECT signal_code, name, severity FROM alert_definitions
          WHERE category = 'telematics' AND is_active = true`
       );
       cachedTelematicsMap = buildMap(result.rows);
@@ -119,6 +125,7 @@ async function getTelematicsSeverityMap(costCenterIds) {
   try {
     const result = await db.query(
       `SELECT d.signal_code,
+              d.name,
               d.severity,
               o.severity AS override_severity
        FROM alert_definitions d
@@ -159,7 +166,7 @@ async function getPerCCSeverityMaps(ccIds, categories = ['video', 'telematics'])
 
   try {
     const result = await db.query(
-      `SELECT d.signal_code, d.severity, o.severity AS override_severity, o.cost_center_id
+      `SELECT d.signal_code, d.name, d.severity, o.severity AS override_severity, o.cost_center_id
        FROM alert_definitions d
        INNER JOIN alert_definition_overrides o
          ON o.alert_definition_id = d.id AND o.cost_center_id = ANY($1::int[])
@@ -169,10 +176,12 @@ async function getPerCCSeverityMaps(ccIds, categories = ['video', 'telematics'])
     );
 
     for (const row of result.rows) {
-      if (!row.signal_code) continue;
+      if (!row.signal_code && !row.name) continue;
       const ccKey = row.cost_center_id || 0;
+      const severity = (row.override_severity || row.severity || 'MEDIUM').toLowerCase();
       if (!perCC[ccKey]) perCC[ccKey] = {};
-      perCC[ccKey][String(row.signal_code).toLowerCase()] = (row.override_severity || row.severity || 'MEDIUM').toLowerCase();
+      if (row.signal_code) perCC[ccKey][String(row.signal_code).toLowerCase()] = severity;
+      if (row.name) perCC[ccKey][String(row.name).toLowerCase()] = severity;
     }
 
     for (const ccId of ccIds) {
@@ -326,9 +335,41 @@ const result = await db.query(
   }
 }
 
+/**
+ * Global signal_code → alert_definitions.name map for the VIDEO category.
+ * Video alerts arrive from the camera API keyed by signal code; ingest stores
+ * the definition name instead so alert_groups/alerts line up with Alert Config.
+ * Names are intrinsic to the definition (not per-CC), so one global map is enough.
+ */
+async function getVideoNameMap() {
+  const now = Date.now();
+  if (cachedVideoNameMap && now - videoNameCacheTime < CACHE_TTL_MS) return cachedVideoNameMap;
+
+  try {
+    const result = await db.query(
+      `SELECT signal_code, name FROM alert_definitions
+       WHERE category = 'video' AND is_active = true
+         AND signal_code IS NOT NULL AND signal_code <> ''
+         AND name IS NOT NULL AND name <> ''`
+    );
+    const map = {};
+    for (const row of result.rows) {
+      map[String(row.signal_code).toLowerCase()] = row.name;
+    }
+    cachedVideoNameMap = map;
+    videoNameCacheTime = now;
+    return map;
+  } catch (error) {
+    console.error('[alert_definitions] Failed to load video name map:', error.message);
+    return cachedVideoNameMap || {};
+  }
+}
+
 function invalidateCache() {
   cachedMap = null;
   cacheTime = 0;
+  cachedVideoNameMap = null;
+  videoNameCacheTime = 0;
   cachedTelematicsMap = null;
   telematicsCacheTime = 0;
   cachedTelematicsNameMap = null;
@@ -341,4 +382,4 @@ function invalidateCache() {
   ccTelematicsNameSevCache.clear();
 }
 
-module.exports = { getVideoSeverityMap, getTelematicsSeverityMap, getTelematicsNameMap, getTelematicsNameSeverityMap, getPerCCSeverityMaps, invalidateCache };
+module.exports = { getVideoSeverityMap, getTelematicsSeverityMap, getTelematicsNameMap, getTelematicsNameSeverityMap, getPerCCSeverityMaps, getVideoNameMap, invalidateCache };

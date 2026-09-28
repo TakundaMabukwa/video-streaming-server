@@ -1,6 +1,6 @@
 const apiClient = require('../helpers/apiClient');
 const db = require('../db');
-const { getVideoSeverityMap } = require('../db/alert_definitions');
+const { getVideoSeverityMap, getVideoNameMap } = require('../db/alert_definitions');
 const { resolveFleetNumber, findVehicleCostCenterId } = require('./costCenterLookup');
 const { resolveBaseSeverity, escalateSeverity } = require('../helpers/transform');
 
@@ -325,6 +325,26 @@ async function gateVideoRecordsByCostCenter(records) {
   return kept;
 }
 
+/**
+ * Rewrite video `alarmType` from the camera signal code (e.g. "occlusion") to
+ * its alert_definitions name (e.g. "Camera Occlusion"). Runs AFTER the CC gate,
+ * which needs the raw code to decide.
+ */
+async function normalizeVideoAlarmTypes(records) {
+  if (!records || records.length === 0) return records;
+  let nameMap;
+  try {
+    nameMap = await getVideoNameMap();
+  } catch (_) {
+    return records; // no map → keep raw codes rather than drop alerts
+  }
+  for (const r of records) {
+    const name = nameMap[String(r.alarmType || '').toLowerCase()];
+    if (name) r.alarmType = name;
+  }
+  return records;
+}
+
 async function syncAlerts(deviceIds, startTime, endTime) {
   let pageIndex = 1;
   let hasMore = true;
@@ -361,6 +381,10 @@ async function syncAlerts(deviceIds, startTime, endTime) {
       } catch (gateErr) {
         console.error('[SYNC] CC gate error (storing unfiltered):', gateErr.message);
       }
+      // Store the alert_definitions NAME, not the raw camera signal code, so
+      // alerts/alert_groups match what Alert Config lists (and what the
+      // telematics path already stores). Unknown codes pass through unchanged.
+      newRecords = await normalizeVideoAlarmTypes(newRecords);
     }
 
     if (newRecords.length > 0) {
