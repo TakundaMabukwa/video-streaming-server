@@ -83,27 +83,47 @@ const MIGRATIONS_SQL = `
   CREATE INDEX IF NOT EXISTS idx_alert_media_alert_file ON alert_media(alert_id, file_url);
 
   -- Backfill alert_groups from existing alerts (one-time)
+  -- Only backfills alarm types that STILL EXIST as active alert_definitions;
+  -- a definition deleted in Alert Config must never be resurrected here on a
+  -- later boot (the legacy alerts archive still holds its old rows).
   INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon, status, resolved, false_alert, notes, documents, created_at, updated_at)
   SELECT
-    LOWER(CONCAT(device_id, ':', alarm_type)) AS group_key,
-    device_id,
-    device_name,
-    alarm_type,
-    alarm_text,
+    LOWER(CONCAT(a.device_id, ':', a.alarm_type)) AS group_key,
+    a.device_id,
+    a.device_name,
+    a.alarm_type,
+    a.alarm_text,
     COUNT(*) AS count,
-    (array_agg(id ORDER BY alarm_ts DESC NULLS LAST))[1] AS last_alert_id,
-    MAX(alarm_ts) AS last_alert_ts,
-    (array_agg(lat ORDER BY alarm_ts DESC NULLS LAST))[1] AS lat,
-    (array_agg(lon ORDER BY alarm_ts DESC NULLS LAST))[1] AS lon,
+    (array_agg(a.id ORDER BY a.alarm_ts DESC NULLS LAST))[1] AS last_alert_id,
+    MAX(a.alarm_ts) AS last_alert_ts,
+    (array_agg(a.lat ORDER BY a.alarm_ts DESC NULLS LAST))[1] AS lat,
+    (array_agg(a.lon ORDER BY a.alarm_ts DESC NULLS LAST))[1] AS lon,
     'new' AS status,
-    bool_or(resolved) AS resolved,
-    bool_or(false_alert) AS false_alert,
+    bool_or(a.resolved) AS resolved,
+    bool_or(a.false_alert) AS false_alert,
     NULL AS notes,
     '[]'::jsonb AS documents,
     NOW() AS created_at,
     NOW() AS updated_at
-  FROM alerts
-  GROUP BY device_id, device_name, alarm_type, alarm_text
+  FROM alerts a
+  JOIN alert_definitions d ON lower(d.name) = lower(a.alarm_type) AND d.is_active = true
+    AND (
+      -- genuinely global: no per-CC override rows at all
+      NOT EXISTS (
+        SELECT 1 FROM alert_definition_overrides o
+        JOIN cost_centers cc ON cc.id = o.cost_center_id
+        WHERE o.alert_definition_id = d.id AND cc.is_active IS DISTINCT FROM false
+      )
+      OR
+      -- in-set for at least one active cost center
+      EXISTS (
+        SELECT 1 FROM alert_definition_overrides o
+        JOIN cost_centers cc ON cc.id = o.cost_center_id
+        WHERE o.alert_definition_id = d.id AND cc.is_active IS DISTINCT FROM false
+          AND o.is_active IS DISTINCT FROM false
+      )
+    )
+  GROUP BY a.device_id, a.device_name, a.alarm_type, a.alarm_text
   ON CONFLICT (group_key) DO NOTHING;
 
   -- Add resolved_at / resolved_by columns to alert_groups
