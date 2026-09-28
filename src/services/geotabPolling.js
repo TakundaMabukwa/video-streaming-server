@@ -1203,11 +1203,6 @@ async function syncLogRecords() {
           current_zone: currentZone,
         });
       }
-
-      // Check zone breaches
-      if (data.latitude && data.longitude) {
-        await checkZoneBreaches(deviceId, data.latitude, data.longitude, data.speed, fleetNumber, licensePlate);
-      }
     }
   } catch (error) {
     console.error('[GEOTAB] Failed to sync log records:', error.message);
@@ -1547,8 +1542,17 @@ function startPolling(intervalMs = 60000, eventIntervalMs = 15000) {
     fetchAndStoreEvents();
     fetchAndStoreVehicleStatus();
     syncLogRecords();
-    syncDeviceStatus();
     syncIgnitionStatus();
+
+    // New 15s DeviceStatusInfo poller: authoritative positions + isDriving +
+    // driving sessions + fatigue/speed/zone alerts. Owns zone detection now.
+    try {
+      const deviceStatusPoller = require('./deviceStatusPoller');
+      deviceStatusPoller.setWsBroadcast(wsBroadcast);
+      deviceStatusPoller.startPoller(15000);
+    } catch (err) {
+      console.error('[GEOTAB] Device status poller failed to start:', err.message);
+    }
 
     pollingInterval = setInterval(async () => {
       await syncGeotabGroups();
@@ -1557,7 +1561,6 @@ function startPolling(intervalMs = 60000, eventIntervalMs = 15000) {
       await syncGeotabDevices();
       await syncGeotabZones();
       await syncLogRecords();
-      await syncDeviceStatus();
       await syncIgnitionStatus();
       await fetchAndStoreVehicleStatus();
     }, intervalMs);
@@ -1591,6 +1594,10 @@ function stopPolling() {
     clearInterval(eventPollingInterval);
     eventPollingInterval = null;
   }
+  try {
+    const deviceStatusPoller = require('./deviceStatusPoller');
+    deviceStatusPoller.stopPoller();
+  } catch {}
 }
 
 module.exports = { startPolling, stopPolling, syncGeotabEvents, initialSync, setWsBroadcast, syncNewFleetVehicles, checkZoneBreaches };

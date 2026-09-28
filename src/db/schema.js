@@ -235,6 +235,52 @@ const MIGRATIONS_SQL = `
   CREATE INDEX IF NOT EXISTS idx_cost_centers_name ON cost_centers(name);
   CREATE INDEX IF NOT EXISTS idx_cost_centers_code ON cost_centers(code);
 
+  -- RTMS rules configuration
+  CREATE TABLE IF NOT EXISTS rtms_rules (
+    id SERIAL PRIMARY KEY,
+    module TEXT NOT NULL,
+    rule_name TEXT NOT NULL UNIQUE,
+    system_constraint TEXT DEFAULT '',
+    audit_focus TEXT DEFAULT '',
+    max_value NUMERIC DEFAULT 0,
+    min_value NUMERIC DEFAULT 0,
+    unit TEXT DEFAULT '',
+    enabled BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_rtms_rules_module ON rtms_rules(module);
+
+  -- Driver scoring: per-vehicle/driver score tracking
+  CREATE TABLE IF NOT EXISTS driver_scoring (
+    id SERIAL PRIMARY KEY,
+    registration_number TEXT,
+    fleet_number TEXT NOT NULL UNIQUE,
+    driver TEXT,
+    score NUMERIC DEFAULT 100 CHECK (score >= 0),
+    alert_types JSONB DEFAULT '[]'::jsonb,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_driver_scoring_fleet ON driver_scoring(fleet_number);
+  CREATE INDEX IF NOT EXISTS idx_driver_scoring_registration ON driver_scoring(registration_number);
+
+  -- Fleet vehicles (synced from Supabase)
+  CREATE TABLE IF NOT EXISTS fleet_vehicles (
+    fleet_number TEXT,
+    registration_number TEXT,
+    make TEXT,
+    model TEXT,
+    cost_center TEXT,
+    last_synced TIMESTAMPTZ DEFAULT NOW(),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(fleet_number, registration_number)
+  );
+  CREATE INDEX IF NOT EXISTS idx_fleet_vehicles_fleet ON fleet_vehicles(fleet_number);
+
   -- cost_center_id columns on config tables (NULL = global/default config)
   ALTER TABLE alert_definitions ADD COLUMN IF NOT EXISTS cost_center_id INTEGER;
   ALTER TABLE alert_group_configs ADD COLUMN IF NOT EXISTS cost_center_id INTEGER;
@@ -297,38 +343,6 @@ const MIGRATIONS_SQL = `
         ADD CONSTRAINT driver_config_criteria_cc_unique UNIQUE (name, cost_center_id);
     END IF;
   END $$;
-
-  -- Driver scoring: per-vehicle/driver score tracking
-  CREATE TABLE IF NOT EXISTS driver_scoring (
-    id SERIAL PRIMARY KEY,
-    registration_number TEXT,
-    fleet_number TEXT NOT NULL UNIQUE,
-    driver TEXT,
-    score NUMERIC DEFAULT 100 CHECK (score >= 0),
-    alert_types JSONB DEFAULT '[]'::jsonb,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_driver_scoring_fleet ON driver_scoring(fleet_number);
-  CREATE INDEX IF NOT EXISTS idx_driver_scoring_registration ON driver_scoring(registration_number);
-
-  -- RTMS rules configuration
-  CREATE TABLE IF NOT EXISTS rtms_rules (
-    id SERIAL PRIMARY KEY,
-    module TEXT NOT NULL,
-    rule_name TEXT NOT NULL UNIQUE,
-    system_constraint TEXT DEFAULT '',
-    audit_focus TEXT DEFAULT '',
-    max_value NUMERIC DEFAULT 0,
-    min_value NUMERIC DEFAULT 0,
-    unit TEXT DEFAULT '',
-    enabled BOOLEAN DEFAULT TRUE,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_rtms_rules_module ON rtms_rules(module);
 
   -- RTMS driving sessions (engine on/off tracking)
   CREATE TABLE IF NOT EXISTS rtms_driving_sessions (
@@ -404,20 +418,6 @@ const MIGRATIONS_SQL = `
     last_synced TIMESTAMPTZ DEFAULT NOW()
   );
 
-  -- Fleet vehicles (synced from Supabase)
-  CREATE TABLE IF NOT EXISTS fleet_vehicles (
-    fleet_number TEXT,
-    registration_number TEXT,
-    make TEXT,
-    model TEXT,
-    cost_center TEXT,
-    last_synced TIMESTAMPTZ DEFAULT NOW(),
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(fleet_number, registration_number)
-  );
-  CREATE INDEX IF NOT EXISTS idx_fleet_vehicles_fleet ON fleet_vehicles(fleet_number);
-
   -- Telematics events from Geotab
   CREATE TABLE IF NOT EXISTS telematics_events (
     id SERIAL PRIMARY KEY,
@@ -462,33 +462,6 @@ const MIGRATIONS_SQL = `
   ALTER TABLE alert_groups ADD COLUMN IF NOT EXISTS follow_up_at TIMESTAMPTZ;
   ALTER TABLE alert_groups ADD COLUMN IF NOT EXISTS original_severity TEXT;
 
-  -- Seed telematics alert_definitions (Geotab exception events).
-  -- Guarded by name+category: never re-inserts a definition that already exists
-  -- (its signal_code may have been corrected since — a code-based conflict alone
-  -- would resurrect a duplicate with a stale placeholder code on every boot).
-  INSERT INTO alert_definitions (name, category, signal_code, severity, description, is_active)
-  SELECT v.name, v.category, v.signal_code, v.severity, v.description, v.is_active
-  FROM (VALUES
-  ('Speeding', 'telematics', 'speeding', 'HIGH', 'Vehicle exceeding speed limit (Geotab)', true),
-  ('Harsh Braking', 'telematics', 'harshBraking', 'MEDIUM', 'Sudden deceleration detected', true),
-  ('Harsh Cornering', 'telematics', 'harshCornering', 'MEDIUM', 'Aggressive turn detected', true),
-  ('Rapid Acceleration', 'telematics', 'rapidAcceleration', 'MEDIUM', 'Aggressive acceleration detected', true),
-  ('Zone Breach', 'telematics', 'zoneBreach', 'HIGH', 'Vehicle entered restricted zone', true),
-  ('No-Go Zone Entry', 'telematics', 'noGoZoneEntry', 'CRITICAL', 'Vehicle entered no-go zone', true),
-  ('High-Risk Zone Entry', 'telematics', 'highRiskZoneEntry', 'HIGH', 'Vehicle entered high-risk zone', true),
-  ('Idling', 'telematics', 'idling', 'LOW', 'Vehicle idling for extended period', true),
-  ('Engine Hours', 'telematics', 'engineHours', 'LOW', 'Excessive engine hours detected', true),
-  ('Battery Low', 'telematics', 'batteryLow', 'MEDIUM', 'Device battery low', true),
-  ('Tow Detected', 'telematics', 'tow', 'HIGH', 'Vehicle being towed', true),
-  ('Device Removed', 'telematics', 'deviceRemoved', 'CRITICAL', 'Tracking device tampered/removed', true),
-  ('Exception Event', 'telematics', 'exceptionEvent', 'MEDIUM', 'General Geotab exception event', true)
-  ) AS v(name, category, signal_code, severity, description, is_active)
-  WHERE NOT EXISTS (
-    SELECT 1 FROM alert_definitions ad
-    WHERE ad.name = v.name AND ad.category = v.category
-  )
-  ON CONFLICT (signal_code) DO NOTHING;
-
   -- Add missing columns to vehicle_status
   CREATE TABLE IF NOT EXISTS vehicle_status (
     device_id TEXT PRIMARY KEY,
@@ -513,6 +486,14 @@ const MIGRATIONS_SQL = `
   ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS is_online BOOLEAN;
   ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS online_since TIMESTAMPTZ;
   ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS status_seen TIMESTAMPTZ;
+  -- DeviceStatusInfo driving state tracking
+  ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS is_driving BOOLEAN;
+  ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS driving_since TIMESTAMPTZ;
+  ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS current_state_duration INTERVAL;
+  ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS max_speed_this_session DOUBLE PRECISION DEFAULT 0;
+  ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS speed_85_alerted BOOLEAN DEFAULT FALSE;
+  ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS speed_90_alerted BOOLEAN DEFAULT FALSE;
+  ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS fatigue_alerted_thresholds TEXT DEFAULT '[]';
 
   -- Geotab zones
   CREATE TABLE IF NOT EXISTS geotab_zones (
@@ -548,6 +529,45 @@ const MIGRATIONS_SQL = `
   CREATE INDEX IF NOT EXISTS idx_high_risk_zone_entries_device ON high_risk_zone_entries(device_id);
   CREATE INDEX IF NOT EXISTS idx_high_risk_zone_entries_time ON high_risk_zone_entries(entry_time DESC);
   CREATE INDEX IF NOT EXISTS idx_high_risk_zone_entries_active ON high_risk_zone_entries(is_active) WHERE is_active = TRUE;
+
+  -- Zone stop events (persistent stop tracking for high-risk/no-stopping zones)
+  CREATE TABLE IF NOT EXISTS zone_stop_events (
+    id SERIAL PRIMARY KEY,
+    device_id TEXT NOT NULL,
+    fleet_number TEXT,
+    license_plate TEXT,
+    zone_id TEXT NOT NULL,
+    zone_name TEXT NOT NULL,
+    zone_type TEXT NOT NULL,           -- 'high_risk' | 'no_stopping'
+    stop_start TIMESTAMPTZ NOT NULL,
+    stop_end TIMESTAMPTZ,
+    immediate_alert_sent BOOLEAN DEFAULT FALSE,
+    minute_alert_sent BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  );
+  CREATE INDEX IF NOT EXISTS idx_zone_stop_active ON zone_stop_events(device_id, stop_end) WHERE stop_end IS NULL;
+  CREATE INDEX IF NOT EXISTS idx_zone_stop_zone ON zone_stop_events(zone_id, stop_start);
+
+  -- Driving sessions (isDriving transitions from DeviceStatusInfo)
+  CREATE TABLE IF NOT EXISTS driving_sessions (
+    id SERIAL PRIMARY KEY,
+    device_id TEXT NOT NULL,
+    fleet_number TEXT,
+    registration_number TEXT,
+    driving_started_at TIMESTAMPTZ NOT NULL,
+    driving_ended_at TIMESTAMPTZ,
+    duration_minutes NUMERIC GENERATED ALWAYS AS (
+      CASE WHEN driving_ended_at IS NOT NULL
+        THEN EXTRACT(EPOCH FROM (driving_ended_at - driving_started_at)) / 60
+        ELSE NULL
+      END
+    ) STORED,
+    cost_center_id INTEGER,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  );
+  CREATE INDEX IF NOT EXISTS idx_driving_sessions_device ON driving_sessions(device_id);
+  CREATE INDEX IF NOT EXISTS idx_driving_sessions_active ON driving_sessions(driving_ended_at) WHERE driving_ended_at IS NULL;
+  CREATE INDEX IF NOT EXISTS idx_driving_sessions_cc ON driving_sessions(cost_center_id);
 
   -- Vehicle log records (GPS positions)
   CREATE TABLE IF NOT EXISTS vehicle_log_records (
@@ -776,21 +796,6 @@ const MIGRATIONS_SQL = `
   );
   CREATE INDEX IF NOT EXISTS idx_escalation_alertgroups_grp ON escalation_group_alert_groups(escalation_group_id);
 
-  -- Repair requests: Solflo external job integration columns
-  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS contact_name TEXT;
-  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS contact_phone TEXT;
-  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS contact_email TEXT;
-  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS available_at TIMESTAMPTZ;
-  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS issue_description TEXT;
-  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS job_description TEXT;
-  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS priority TEXT DEFAULT 'medium';
-  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS account_code TEXT DEFAULT 'SRS-0001';
-  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS external_job_number TEXT;
-  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS external_job_type TEXT;
-  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS external_status TEXT DEFAULT 'pending';
-  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS external_response JSONB DEFAULT '{}'::jsonb;
-  CREATE INDEX IF NOT EXISTS idx_repair_requests_ext_job ON repair_requests(external_job_number);
-
   -- Repair requests
   CREATE TABLE IF NOT EXISTS repair_requests (
     id SERIAL PRIMARY KEY,
@@ -819,6 +824,21 @@ const MIGRATIONS_SQL = `
   );
   CREATE INDEX IF NOT EXISTS idx_repair_requests_fleet ON repair_requests(fleet_number);
   CREATE INDEX IF NOT EXISTS idx_repair_requests_status ON repair_requests(status);
+  CREATE INDEX IF NOT EXISTS idx_repair_requests_ext_job ON repair_requests(external_job_number);
+
+  -- Repair requests: Solflo external job integration columns
+  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS contact_name TEXT;
+  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS contact_phone TEXT;
+  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS contact_email TEXT;
+  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS available_at TIMESTAMPTZ;
+  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS issue_description TEXT;
+  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS job_description TEXT;
+  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS priority TEXT DEFAULT 'medium';
+  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS account_code TEXT DEFAULT 'SRS-0001';
+  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS external_job_number TEXT;
+  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS external_job_type TEXT;
+  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS external_status TEXT DEFAULT 'pending';
+  ALTER TABLE repair_requests ADD COLUMN IF NOT EXISTS external_response JSONB DEFAULT '{}'::jsonb;
   CREATE INDEX IF NOT EXISTS idx_repair_requests_ext_job ON repair_requests(external_job_number);
 
   -- STRICT CC MODEL backfill: every alert definition belongs to every active

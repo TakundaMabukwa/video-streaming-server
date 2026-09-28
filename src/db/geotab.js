@@ -592,6 +592,120 @@ async function getAllActiveZoneEntries() {
   return result.rows;
 }
 
+// ── Driving sessions (DeviceStatusInfo isDriving transitions) ──
+
+async function getActiveDrivingSession(deviceId) {
+  const result = await query(
+    'SELECT * FROM driving_sessions WHERE device_id = $1 AND driving_ended_at IS NULL ORDER BY driving_started_at DESC LIMIT 1',
+    [deviceId]
+  );
+  return result.rows[0] || null;
+}
+
+async function startDrivingSession({ deviceId, fleetNumber, registrationNumber, costCenterId, startedAt }) {
+  const result = await query(
+    `INSERT INTO driving_sessions (device_id, fleet_number, registration_number, driving_started_at, cost_center_id)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT DO NOTHING
+     RETURNING *`,
+    [deviceId, fleetNumber || null, registrationNumber || null, startedAt || new Date(), costCenterId ?? null]
+  );
+  return result.rows[0] || null;
+}
+
+async function endDrivingSession(deviceId, endedAt) {
+  const result = await query(
+    `UPDATE driving_sessions
+     SET driving_ended_at = $2
+     WHERE device_id = $1 AND driving_ended_at IS NULL
+     RETURNING *`,
+    [deviceId, endedAt || new Date()]
+  );
+  return result.rows[0] || null;
+}
+
+// Track the authoritative driving duration + per-session speed/fatigue flags.
+// Only fields provided get updated; nulls keep the last known value except for the
+// explicitly-passed boolean flags which are always written when defined.
+async function updateVehicleStatusDriving(deviceId, data) {
+  const sets = [];
+  const params = [];
+  let idx = 1;
+  const push = (col, val) => { sets.push(`${col} = $${idx++}`); params.push(val); };
+
+  if (data.isDriving !== undefined) push('is_driving', data.isDriving);
+  if (data.drivingSince !== undefined) push('driving_since', data.drivingSince);
+  if (data.currentStateDurationMs !== undefined) {
+    params.push(data.currentStateDurationMs);
+    sets.push(`current_state_duration = make_interval(secs => $${idx++})`);
+  }
+  if (data.maxSpeed !== undefined) push('max_speed_this_session', data.maxSpeed);
+  if (data.speed85Alerted !== undefined) push('speed_85_alerted', data.speed85Alerted);
+  if (data.speed90Alerted !== undefined) push('speed_90_alerted', data.speed90Alerted);
+  if (data.fatigueAlertedThresholds !== undefined) {
+    push('fatigue_alerted_thresholds', JSON.stringify(data.fatigueAlertedThresholds));
+  }
+  if (sets.length === 0) return null;
+  sets.push(`last_update = NOW()`);
+  params.push(deviceId);
+  const result = await query(
+    `UPDATE vehicle_status SET ${sets.join(', ')} WHERE device_id = $${idx} RETURNING *`,
+    params
+  ).catch((err) => {
+    console.error('[GEOTAB] updateVehicleStatusDriving error:', err.message);
+    return { rows: [] };
+  });
+  return result.rows[0] || null;
+}
+
+// ── Zone stop events (persistent stop tracking) ──
+
+async function getActiveZoneStopEvents(deviceId) {
+  const result = await query(
+    'SELECT * FROM zone_stop_events WHERE device_id = $1 AND stop_end IS NULL ORDER BY stop_start DESC',
+    [deviceId]
+  );
+  return result.rows;
+}
+
+async function startZoneStopEvent({ deviceId, fleetNumber, licensePlate, zoneId, zoneName, zoneType, stoppedAt }) {
+  const result = await query(
+    `INSERT INTO zone_stop_events (device_id, fleet_number, license_plate, zone_id, zone_name, zone_type, stop_start)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     RETURNING *`,
+    [deviceId, fleetNumber || null, licensePlate || null, zoneId, zoneName, zoneType, stoppedAt || new Date()]
+  );
+  return result.rows[0] || null;
+}
+
+async function endZoneStopEvent(id, endedAt) {
+  const result = await query(
+    'UPDATE zone_stop_events SET stop_end = $2 WHERE id = $1 RETURNING *',
+    [id, endedAt || new Date()]
+  );
+  return result.rows[0] || null;
+}
+
+async function endZoneStopEventsByDevice(deviceId, zoneIds, endedAt) {
+  if (!zoneIds || zoneIds.length === 0) return;
+  await query(
+    `UPDATE zone_stop_events SET stop_end = $2
+     WHERE device_id = $1 AND stop_end IS NULL AND zone_id = ANY($3::text[])
+     RETURNING id`,
+    [deviceId, endedAt || new Date(), zoneIds]
+  ).catch(() => {});
+}
+
+async function markZoneStopAlertSent(id, flag) {
+  const col = flag === 'minute' ? 'minute_alert_sent' : 'immediate_alert_sent';
+  // Only toggle the alert flag — the stop event stays OPEN until the vehicle
+  // leaves/moves (closed by endZoneStopEvent in the poller).
+  await query(
+    `UPDATE zone_stop_events SET ${col} = TRUE WHERE id = $1`,
+    [id]
+  ).catch(() => {});
+}
+
 module.exports = {
   extractFleetNumber,
   parseDuration,
@@ -628,4 +742,13 @@ module.exports = {
   getActiveZoneEntries,
   getZoneEntries,
   getAllActiveZoneEntries,
+  getActiveDrivingSession,
+  startDrivingSession,
+  endDrivingSession,
+  updateVehicleStatusDriving,
+  getActiveZoneStopEvents,
+  startZoneStopEvent,
+  endZoneStopEvent,
+  endZoneStopEventsByDevice,
+  markZoneStopAlertSent,
 };

@@ -32,8 +32,7 @@ async function buildStrictAlertFilter(deviceCC) {
     const ccId = deviceCC.get(g.device_id);
     const alarmKey = (g.alarm_type || '').toLowerCase();
     if (g.source_type === 'telematics') {
-      const ccMap = ccId ? (telNameMapByCC[ccId] || {}) : {};
-      const nameMap = { ...globalTelNameMap, ...ccMap };
+      const nameMap = ccId ? (telNameMapByCC[ccId] || {}) : globalTelNameMap;
       return !!nameMap[alarmKey];
     }
     const sigMap = ccId ? (perCCMaps[ccId] || {}) : (perCCMaps[0] || {});
@@ -43,8 +42,7 @@ async function buildStrictAlertFilter(deviceCC) {
   const severityFor = (g) => {
     const ccId = deviceCC.get(g.device_id);
     if (g.source_type === 'telematics') {
-      const ccMap = ccId ? (telNameMapByCC[ccId] || {}) : {};
-      return { ...globalTelNameMap, ...ccMap };
+      return ccId ? (telNameMapByCC[ccId] || {}) : globalTelNameMap;
     }
     return ccId ? (perCCMaps[ccId] || {}) : (perCCMaps[0] || {});
   };

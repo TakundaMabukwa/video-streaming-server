@@ -21,6 +21,8 @@ const ccTelematicsCache = new Map();
 const ccTelematicsNameCache = new Map();
 const ccTelematicsNameSevCache = new Map();
 
+const singleDefCache = new Map(); // `${signalCode}:${ccId|global}` -> { def, ts }
+
 function cacheKeyFor(ids) {
   if (!ids || ids.length === 0) return 'global';
   return ids.slice().sort().join(',');
@@ -219,9 +221,25 @@ async function getTelematicsNameMap(costCenterIds) {
 
     try {
       const result = await db.query(
-        `SELECT name, signal_code, severity FROM alert_definitions
+        `SELECT name, signal_code, severity FROM alert_definitions d
          WHERE category = 'telematics' AND is_active = true AND name IS NOT NULL AND name != ''
-           AND signal_code IS DISTINCT FROM 'exceptionEvent'`
+           AND signal_code IS DISTINCT FROM 'exceptionEvent'
+           AND (
+             -- genuinely global: no per-CC override rows at all
+             NOT EXISTS (
+               SELECT 1 FROM alert_definition_overrides o
+               JOIN cost_centers cc ON cc.id = o.cost_center_id
+               WHERE o.alert_definition_id = d.id AND cc.is_active IS DISTINCT FROM false
+             )
+             OR
+             -- in-set for at least one active cost center
+             EXISTS (
+               SELECT 1 FROM alert_definition_overrides o
+               JOIN cost_centers cc ON cc.id = o.cost_center_id
+               WHERE o.alert_definition_id = d.id AND cc.is_active IS DISTINCT FROM false
+                 AND o.is_active IS DISTINCT FROM false
+             )
+           )`
       );
       const map = {};
       const signalCodeMap = {};
@@ -287,9 +305,25 @@ async function getTelematicsNameSeverityMap(costCenterIds) {
 
     try {
       const result = await db.query(
-        `SELECT name, signal_code, severity FROM alert_definitions
+        `SELECT name, signal_code, severity FROM alert_definitions d
          WHERE category = 'telematics' AND is_active = true AND name IS NOT NULL AND name != ''
-           AND signal_code IS DISTINCT FROM 'exceptionEvent'`
+           AND signal_code IS DISTINCT FROM 'exceptionEvent'
+           AND (
+             -- genuinely global: no per-CC override rows at all
+             NOT EXISTS (
+               SELECT 1 FROM alert_definition_overrides o
+               JOIN cost_centers cc ON cc.id = o.cost_center_id
+               WHERE o.alert_definition_id = d.id AND cc.is_active IS DISTINCT FROM false
+             )
+             OR
+             -- in-set for at least one active cost center
+             EXISTS (
+               SELECT 1 FROM alert_definition_overrides o
+               JOIN cost_centers cc ON cc.id = o.cost_center_id
+               WHERE o.alert_definition_id = d.id AND cc.is_active IS DISTINCT FROM false
+                 AND o.is_active IS DISTINCT FROM false
+             )
+           )`
       );
       const map = {};
       for (const row of result.rows) {
@@ -380,6 +414,63 @@ function invalidateCache() {
   ccTelematicsCache.clear();
   ccTelematicsNameCache.clear();
   ccTelematicsNameSevCache.clear();
+  singleDefCache.clear();
 }
 
-module.exports = { getVideoSeverityMap, getTelematicsSeverityMap, getTelematicsNameMap, getTelematicsNameSeverityMap, getPerCCSeverityMaps, getVideoNameMap, invalidateCache };
+/**
+ * Check whether a telematics alert definition (by exact signal_code) is active
+ * for a given cost center, and return the definition when it is.
+ * - signalCode must match an is_active=true definition. No match → null.
+ * - costCenterId == null (CC-less vehicle) → definition's own is_active decides
+ *   (global definitions are ONLY for vehicles with no cost center, mirroring
+ *   the strict CC rule used by the severity-map builders above).
+ * - costCenterId set → requires an active override row for that CC
+ *   (o.is_active IS DISTINCT FROM false); no override → null.
+ * @param {string} signalCode - exact alert_definitions.signal_code
+ * @param {number|null} [costCenterId]
+ * @returns {Promise<Object|null>} the matched { id, name, severity } definition or null
+ */
+async function isAlertActiveForCC(signalCode, costCenterId) {
+  if (!signalCode) return null;
+  const key = `${String(signalCode).toLowerCase()}:${costCenterId == null ? 'global' : costCenterId}`;
+  const now = Date.now();
+  const cached = singleDefCache.get(key);
+  if (cached && now - cached.ts < CACHE_TTL_MS) return cached.def;
+
+  let def = null;
+  try {
+    const result = await db.query(
+      `SELECT id, name, severity, signal_code FROM alert_definitions
+       WHERE signal_code = $1 AND is_active = true
+       LIMIT 1`,
+      [signalCode]
+    );
+    const row = result.rows[0];
+    if (!row) {
+      singleDefCache.set(key, { def: null, ts: now });
+      return null;
+    }
+    if (costCenterId == null) {
+      def = { id: row.id, name: row.name, severity: row.severity || 'MEDIUM' };
+    } else {
+      const ov = await db.query(
+        `SELECT 1 FROM alert_definition_overrides
+         WHERE alert_definition_id = $1 AND cost_center_id = $2
+           AND is_active IS DISTINCT FROM false
+         LIMIT 1`,
+        [row.id, costCenterId]
+      );
+      if (ov.rows.length > 0) {
+        def = { id: row.id, name: row.name, severity: row.severity || 'MEDIUM' };
+      }
+    }
+  } catch (error) {
+    console.error('[alert_definitions] isAlertActiveForCC error:', error.message);
+    def = null;
+  }
+
+  singleDefCache.set(key, { def, ts: Date.now() });
+  return def;
+}
+
+module.exports = { getVideoSeverityMap, getTelematicsSeverityMap, getTelematicsNameMap, getTelematicsNameSeverityMap, getPerCCSeverityMaps, getVideoNameMap, isAlertActiveForCC, invalidateCache };
