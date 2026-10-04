@@ -454,14 +454,14 @@ async function isAlertActiveForCC(signalCode, costCenterId) {
       def = { id: row.id, name: row.name, severity: row.severity || 'MEDIUM' };
     } else {
       const ov = await db.query(
-        `SELECT 1 FROM alert_definition_overrides
+        `SELECT severity FROM alert_definition_overrides
          WHERE alert_definition_id = $1 AND cost_center_id = $2
            AND is_active IS DISTINCT FROM false
          LIMIT 1`,
         [row.id, costCenterId]
       );
       if (ov.rows.length > 0) {
-        def = { id: row.id, name: row.name, severity: row.severity || 'MEDIUM' };
+        def = { id: row.id, name: row.name, severity: String(ov.rows[0].severity || row.severity || 'MEDIUM').toLowerCase() };
       }
     }
   } catch (error) {

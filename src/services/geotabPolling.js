@@ -925,6 +925,7 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
         lat: evtLat,
         lon: evtLon,
         sourceType: 'telematics',
+        severity: String(matchedDef.severity || 'MEDIUM').toLowerCase(),
       });
       if (!groupRow) continue; // vehicle not in fleet_vehicles — no alert
       alerted++;
@@ -1284,6 +1285,7 @@ async function createZoneEntryAlert({ deviceId, fleetNumber, licensePlate, lat, 
       lat,
       lon,
       sourceType: 'telematics',
+      severity: String(matchedDef.severity || 'MEDIUM').toLowerCase(),
     });
     if (!groupRow || groupRow.id == null) return null;
 

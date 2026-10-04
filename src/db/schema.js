@@ -481,6 +481,9 @@ const MIGRATIONS_SQL = `
   ALTER TABLE alert_groups ADD COLUMN IF NOT EXISTS follow_up BOOLEAN DEFAULT FALSE;
   ALTER TABLE alert_groups ADD COLUMN IF NOT EXISTS follow_up_at TIMESTAMPTZ;
   ALTER TABLE alert_groups ADD COLUMN IF NOT EXISTS original_severity TEXT;
+  -- Severity resolved at emit time (CC override honored); read paths re-derive
+  -- from alert_definitions/overrides, this column is a faithful stored snapshot.
+  ALTER TABLE alert_groups ADD COLUMN IF NOT EXISTS severity TEXT;
 
   -- Add missing columns to vehicle_status
   CREATE TABLE IF NOT EXISTS vehicle_status (

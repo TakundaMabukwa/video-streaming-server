@@ -414,6 +414,10 @@ async function syncAlerts(deviceIds, startTime, endTime) {
           groupMap[key] = r;
         }
       }
+      let severityMap = null;
+      try {
+        severityMap = await getVideoSeverityMap([]);
+      } catch (_) { /* fall back to PRIORITY_MAP */ }
       const groupEntries = Object.values(groupMap).map(r => ({
         deviceId: r.deviceId,
         deviceName: r.deviceName,
@@ -423,11 +427,8 @@ async function syncAlerts(deviceIds, startTime, endTime) {
         alarmTs: r.alarmTs ? new Date(r.alarmTs) : null,
         lat: r.lat,
         lon: r.lon,
+        severity: resolveBaseSeverity(r.alarmType, severityMap),
       }));
-      let severityMap = null;
-      try {
-        severityMap = await getVideoSeverityMap([]);
-      } catch (_) { /* fall back to PRIORITY_MAP */ }
       const groupSeverityByKey = {};
       if (groupEntries.length > 0) {
         try {

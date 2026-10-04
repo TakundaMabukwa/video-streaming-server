@@ -1,7 +1,7 @@
 const { query } = require('./pool');
 const { isRegisteredVehicle } = require('../services/fleetRegistryGuard');
 
-async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, alertId, alarmTs, lat, lon, sourceType = 'video' }) {
+async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, alertId, alarmTs, lat, lon, sourceType = 'video', severity }) {
   // Only vehicles in fleet_vehicles may raise alerts.
   if (!(await isRegisteredVehicle({ deviceId, deviceName }))) return null;
 
@@ -28,10 +28,11 @@ async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, al
          lat = COALESCE($4, alert_groups.lat),
          lon = COALESCE($5, alert_groups.lon),
          alarm_text = COALESCE(NULLIF($6, ''), alert_groups.alarm_text),
+         severity = COALESCE(NULLIF($7, ''), alert_groups.severity),
          updated_at = NOW()
-       WHERE group_key = $7
+       WHERE group_key = $8
        RETURNING id, group_key, count, alarm_type`,
-      [alertId, alarmTs, deviceName, lat, lon, alarmText, groupKey]
+      [alertId, alarmTs, deviceName, lat, lon, alarmText, severity, groupKey]
     );
     return result.rows[0];
   }
@@ -48,10 +49,10 @@ async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, al
   }
 
   const result = await query(
-    `INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon, source_type)
-     VALUES ($1, $2, $3, $4, $5, 1, $6, $7, $8, $9, $10)
+    `INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon, source_type, severity)
+     VALUES ($1, $2, $3, $4, $5, 1, $6, $7, $8, $9, $10, $11)
      RETURNING id, group_key, count, alarm_type`,
-    [groupKey, deviceId, deviceName, alarmType, alarmText, alertId, alarmTs || null, lat, lon, sourceType]
+    [groupKey, deviceId, deviceName, alarmType, alarmText, alertId, alarmTs || null, lat, lon, sourceType, severity]
   );
   return result.rows[0];
 }
@@ -66,18 +67,18 @@ async function batchUpsertAlertGroups(groups) {
   if (allowed.length === 0) return [];
   const params = [];
   const placeholders = allowed.map((g, i) => {
-    const base = i * 9;
+    const base = i * 10;
     params.push(
       `${g.deviceId}:${g.alarmType}`.toLowerCase(),
       g.deviceId, g.deviceName || null, g.alarmType, g.alarmText || null,
-      g.alertId, g.alarmTs || null, g.lat || null, g.lon || null
+      g.alertId, g.alarmTs || null, g.lat || null, g.lon || null, g.severity || null
     );
-    return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, 1, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9})`;
+    return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, 1, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}, $${base + 10})`;
   }).join(',');
   // On conflict only bump ACTIVE groups. Resolved groups stay closed (Resolve sticks);
   // a later active twin can still be created via the non-conflict path below.
   const result = await query(
-    `INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon)
+    `INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon, severity)
      VALUES ${placeholders}
      ON CONFLICT (group_key) DO UPDATE SET
        count = alert_groups.count + 1,
@@ -87,6 +88,7 @@ async function batchUpsertAlertGroups(groups) {
        lat = COALESCE(EXCLUDED.lat, alert_groups.lat),
        lon = COALESCE(EXCLUDED.lon, alert_groups.lon),
        alarm_text = COALESCE(NULLIF(EXCLUDED.alarm_text, ''), alert_groups.alarm_text),
+       severity = COALESCE(NULLIF(EXCLUDED.severity, ''), alert_groups.severity),
        updated_at = NOW()
        WHERE alert_groups.resolved = FALSE
        RETURNING id, group_key, count, alarm_type`,

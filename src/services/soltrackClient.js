@@ -202,6 +202,7 @@ async function handleFrame(frame) {
           lat: frame.lat,
           lon: frame.lon,
           sourceType: 'telematics',
+          severity: String(matchedDef.severity || 'MEDIUM').toLowerCase(),
         });
 
         await db.query(

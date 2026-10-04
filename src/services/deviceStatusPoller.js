@@ -244,6 +244,7 @@ async function emitDeviceStatusAlert({ deviceId, fleetNumber, licensePlate, sign
       lat: lat ?? null,
       lon: lon ?? null,
       sourceType: 'telematics',
+      severity: String(def.severity || 'MEDIUM').toLowerCase(),
     });
     if (!groupRow) return null;
 
