@@ -535,6 +535,12 @@ const MIGRATIONS_SQL = `
     raw_data JSONB DEFAULT '{}',
     last_synced TIMESTAMPTZ DEFAULT NOW()
   );
+  -- Local edits made via the Stops UI: sync skips these rows on conflict so the
+  -- 5-min Geotab sync cannot clobber user changes; is_deleted is a tombstone
+  -- (a hard delete would be re-inserted by the next sync).
+  ALTER TABLE geotab_zones ADD COLUMN IF NOT EXISTS locally_modified TIMESTAMPTZ;
+  ALTER TABLE geotab_zones ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN DEFAULT FALSE;
+  CREATE INDEX IF NOT EXISTS idx_geotab_zones_deleted ON geotab_zones(is_deleted) WHERE is_deleted = TRUE;
 
   -- High risk zone entries
   CREATE TABLE IF NOT EXISTS high_risk_zone_entries (

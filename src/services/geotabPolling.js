@@ -36,6 +36,18 @@ function invalidateZonesCache() {
   zonesCache = { data: null, ts: 0 };
 }
 
+// Called by the Stops CRUD routes so in-zone breach checks pick up a local
+// edit/delete immediately instead of waiting for the 5-min sync TTL.
+async function refreshZoneCaches() {
+  try {
+    const allZones = await db.getGeotabZones();
+    setCachedAllZones(allZones);
+    invalidateZonesCache();
+  } catch (error) {
+    console.error('[ZONES] Failed to refresh zone caches:', error.message);
+  }
+}
+
 // ── Persistent cursors (sync_state table) ──
 
 const SYNC_STATE_EVENT_VERSION = 'geotab:event_version';
@@ -1611,4 +1623,4 @@ function stopPolling() {
   } catch {}
 }
 
-module.exports = { startPolling, stopPolling, syncGeotabEvents, initialSync, setWsBroadcast, syncNewFleetVehicles, checkZoneBreaches };
+module.exports = { startPolling, stopPolling, syncGeotabEvents, initialSync, setWsBroadcast, syncNewFleetVehicles, checkZoneBreaches, refreshZoneCaches };

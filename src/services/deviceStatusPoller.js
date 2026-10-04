@@ -60,6 +60,9 @@ let cachedCredentials = null;
 let credentialsExpiry = null;
 
 let zonesState = { data: null, ts: 0 };
+// Called by the Stops CRUD routes: drop the 5-min zones cache so stop alerts
+// use the edited geometry on the next poll cycle, not up to 5 minutes later.
+function invalidateZonesCache() { zonesState = { data: null, ts: 0 }; }
 let fleetSet = null;
 let fleetTs = 0;
 let geotabMap = null;
@@ -792,4 +795,4 @@ async function runOnce() {
   await pollDeviceStatus();
 }
 
-module.exports = { startPoller, stopPoller, runOnce, setWsBroadcast, pollDeviceStatus, parseGeotabDurationMs };
+module.exports = { startPoller, stopPoller, runOnce, setWsBroadcast, pollDeviceStatus, parseGeotabDurationMs, invalidateZonesCache };

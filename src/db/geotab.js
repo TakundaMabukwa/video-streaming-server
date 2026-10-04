@@ -439,7 +439,8 @@ async function upsertGeotabZones(zones) {
        ON CONFLICT (id) DO UPDATE SET
          name = EXCLUDED.name, points = EXCLUDED.points, zone_types = EXCLUDED.zone_types,
          comment = EXCLUDED.comment, is_high_risk = EXCLUDED.is_high_risk, is_no_go = EXCLUDED.is_no_go,
-         raw_data = EXCLUDED.raw_data, last_synced = NOW()`,
+         raw_data = EXCLUDED.raw_data, last_synced = NOW()
+       WHERE geotab_zones.locally_modified IS NULL`,
       [
         zone.id,
         zone.name || null,
@@ -455,13 +456,55 @@ async function upsertGeotabZones(zones) {
 }
 
 async function getGeotabZones() {
-  const result = await query('SELECT * FROM geotab_zones ORDER BY name');
+  const result = await query('SELECT * FROM geotab_zones WHERE is_deleted IS NOT TRUE ORDER BY name');
   return result.rows;
 }
 
 async function getHighRiskZones() {
-  const result = await query('SELECT * FROM geotab_zones WHERE is_high_risk = TRUE OR is_no_go = TRUE ORDER BY name');
+  const result = await query('SELECT * FROM geotab_zones WHERE (is_high_risk = TRUE OR is_no_go = TRUE) AND is_deleted IS NOT TRUE ORDER BY name');
   return result.rows;
+}
+
+// Local zone edits (Stops UI). locally_modified pins the row so the 5-min
+// Geotab sync skips it on conflict instead of overwriting the edit.
+async function updateGeotabZone(id, { name, points, comment, isHighRisk, isNoGo }) {
+  const result = await query(
+    `UPDATE geotab_zones
+     SET name = $2, points = $3, comment = $4, is_high_risk = $5, is_no_go = $6,
+         locally_modified = NOW(), last_synced = NOW()
+     WHERE id = $1 AND is_deleted IS NOT TRUE
+     RETURNING *`,
+    [id, name, JSON.stringify(points), comment, isHighRisk, isNoGo]
+  );
+  return result.rows[0] || null;
+}
+
+async function createGeotabZone({ id, name, points, comment, isHighRisk, isNoGo }) {
+  const result = await query(
+    `INSERT INTO geotab_zones (id, name, points, zone_types, comment, is_high_risk, is_no_go, raw_data, locally_modified, last_synced)
+     VALUES ($1, $2, $3, '[]', $4, $5, $6, '{}', NOW(), NOW())
+     ON CONFLICT (id) DO UPDATE SET
+       name = EXCLUDED.name, points = EXCLUDED.points, comment = EXCLUDED.comment,
+       is_high_risk = EXCLUDED.is_high_risk, is_no_go = EXCLUDED.is_no_go,
+       is_deleted = FALSE, locally_modified = NOW(), last_synced = NOW()
+     WHERE geotab_zones.locally_modified IS NULL
+     RETURNING *`,
+    [id, name, JSON.stringify(points), comment, isHighRisk, isNoGo]
+  );
+  return result.rows[0] || null;
+}
+
+// Tombstone: excluded from every zone read (list, maps, in-zone checks) but the
+// row survives so the next Geotab sync cannot resurrect it (sync skips it via
+// locally_modified).
+async function softDeleteGeotabZone(id) {
+  const result = await query(
+    `UPDATE geotab_zones SET is_deleted = TRUE, locally_modified = NOW()
+     WHERE id = $1 AND is_deleted IS NOT TRUE
+     RETURNING id`,
+    [id]
+  );
+  return result.rows[0] || null;
 }
 
 // ── Vehicle Log Records ──
@@ -734,6 +777,9 @@ module.exports = {
   upsertGeotabZones,
   getGeotabZones,
   getHighRiskZones,
+  updateGeotabZone,
+  createGeotabZone,
+  softDeleteGeotabZone,
   upsertVehicleLogRecords,
   getVehicleLogRecords,
   getLatestLogRecord,

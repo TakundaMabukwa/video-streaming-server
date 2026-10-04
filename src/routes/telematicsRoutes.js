@@ -211,9 +211,93 @@ router.get('/zones', async (req, res) => {
 router.get('/zones-lite', async (req, res) => {
   try {
     const result = await db.query(
-      'SELECT id, name, points, is_high_risk, is_no_go FROM geotab_zones ORDER BY name'
+      'SELECT id, name, points, is_high_risk, is_no_go FROM geotab_zones WHERE is_deleted IS NOT TRUE ORDER BY name'
     );
     res.json({ success: true, data: result.rows, count: result.rows.length });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ── Zone CRUD (Stops UI) ──
+// Writes go straight into geotab_zones — the same table the pollers use for
+// vehicle-in-zone risk checks — so edits take effect live. locally_modified
+// (set by the db layer) shields the row from the 5-min Geotab sync; is_deleted
+// tombstones prevent resurrection.
+
+function validateZonePayload(body) {
+  const name = String((body && body.name) || '').trim();
+  if (!name) return { error: 'name is required' };
+
+  let points = body.points;
+  if (typeof points === 'string') {
+    try { points = JSON.parse(points); } catch { return { error: 'points must be valid JSON' }; }
+  }
+  if (!Array.isArray(points) || points.length < 3) {
+    return { error: 'points must be an array of at least 3 vertices' };
+  }
+  const clean = [];
+  for (const p of points) {
+    const x = Number(p && p.x); // longitude
+    const y = Number(p && p.y); // latitude
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return { error: 'each point needs numeric x (lng) and y (lat)' };
+    if (x < -180 || x > 180 || y < -90 || y > 90) return { error: 'point coordinates out of range' };
+    clean.push({ x, y });
+  }
+
+  const type = String((body && body.type) || 'normal').toLowerCase();
+  if (!['high_risk', 'no_go', 'normal'].includes(type)) return { error: "type must be one of 'high_risk', 'no_go', 'normal'" };
+
+  return {
+    name,
+    points: clean,
+    comment: body.comment ? String(body.comment).trim().slice(0, 1000) : null,
+    isHighRisk: type === 'high_risk',
+    isNoGo: type === 'no_go',
+  };
+}
+
+async function zoneCachesRefresh() {
+  // Lazy require: mirror the pollers' own pattern, avoids load-order coupling.
+  const deviceStatusPoller = require('../services/deviceStatusPoller');
+  const geotabPolling = require('../services/geotabPolling');
+  deviceStatusPoller.invalidateZonesCache();
+  await geotabPolling.refreshZoneCaches();
+}
+
+router.post('/zones', async (req, res) => {
+  try {
+    const payload = validateZonePayload(req.body || {});
+    if (payload.error) return res.status(400).json({ success: false, message: payload.error });
+    const id = `local_${require('crypto').randomUUID()}`;
+    const zone = await db.createGeotabZone({ id, ...payload });
+    if (!zone) return res.status(409).json({ success: false, message: 'zone id already exists' });
+    await zoneCachesRefresh();
+    res.status(201).json({ success: true, data: zone });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+router.put('/zones/:id', async (req, res) => {
+  try {
+    const payload = validateZonePayload(req.body || {});
+    if (payload.error) return res.status(400).json({ success: false, message: payload.error });
+    const zone = await db.updateGeotabZone(req.params.id, payload);
+    if (!zone) return res.status(404).json({ success: false, message: 'zone not found' });
+    await zoneCachesRefresh();
+    res.json({ success: true, data: zone });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+router.delete('/zones/:id', async (req, res) => {
+  try {
+    const zone = await db.softDeleteGeotabZone(req.params.id);
+    if (!zone) return res.status(404).json({ success: false, message: 'zone not found' });
+    await zoneCachesRefresh();
+    res.json({ success: true, data: { id: zone.id, deleted: true } });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
