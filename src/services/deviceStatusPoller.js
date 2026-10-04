@@ -590,6 +590,14 @@ async function pollDeviceStatus() {
             deviceId, fleetNumber, registrationNumber: licensePlate,
             costCenterId: ccId, startedAt: dateTime,
           });
+          // Pre-seed thresholds from the CURRENT currentStateDuration. Geotab
+          // only resets this counter on a genuine trip-state change, so a brief
+          // pause that didn't reset it must not re-fire already-consumed
+          // thresholds; a real new trip has a small durMs and fires normally.
+          const curMinutes = durMs !== null ? durMs / 60000 : 0;
+          const preAlerted = FATIGUE_THRESHOLDS
+            .filter((t) => curMinutes >= t.minutes)
+            .map((t) => t.signalCode);
           await db.updateVehicleStatusDriving(deviceId, {
             isDriving: true,
             drivingSince: dateTime,
@@ -597,7 +605,7 @@ async function pollDeviceStatus() {
             maxSpeed: speed ?? 0,
             speed85Alerted: false,
             speed90Alerted: false,
-            fatigueAlertedThresholds: [],
+            fatigueAlertedThresholds: preAlerted,
           });
         } else {
           await db.endDrivingSession(deviceId, dateTime);
