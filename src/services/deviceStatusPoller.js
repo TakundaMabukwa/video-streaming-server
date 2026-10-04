@@ -5,12 +5,29 @@ const { findVehicleCostCenterId } = require('./costCenterLookup');
 const { isAlertActiveForCC } = require('../db/alert_definitions');
 const { isRegisteredVehicle } = require('./fleetRegistryGuard');
 const { escalateSeverity } = require('../helpers/transform');
+const {
+  FATIGUE_3H_CODE,
+  FATIGUE_6H_CODE,
+  FATIGUE_9H_CODE,
+  DURATION_8H_CODE,
+  DURATION_12H_CODE,
+  DURATION_15H_CODE,
+  SPEED_85_CODE,
+  SPEED_90_CODE,
+  ZONE_ENTRY_CODE,
+  NOGO_ENTRY_CODE,
+  ZONE_STOP_IMMEDIATE_CODE,
+  ZONE_STOP_1MIN_HIGH_CODE,
+  ZONE_STOP_1MIN_NO_CODE,
+} = require('../helpers/pollerOwnedAlerts');
 
 const GEOTAB_URL = 'https://my.geotab.com/apiv1';
 const POLL_INTERVAL_MS = 15000;
 
-// Speed-cutoff for "stopped" zone logic (km/h)
+// Speed-cutoff(s) for "stopped" zone logic (km/h). High-risk zones flag a stop
+// immediately at the tight threshold; No-Stopping zones require speed < 10.
 const STOP_SPEED = 5;
+const STOP_SPEED_NO_STOPPING = 10;
 const ZONES_CACHE_TTL = 5 * 60 * 1000;
 const META_CACHE_TTL = 60 * 1000;
 
@@ -18,21 +35,13 @@ const META_CACHE_TTL = 60 * 1000;
 // Definition names are resolved at runtime via isAlertActiveForCC — nothing
 // here is hardcoded by name. Sorted ascending so each threshold fires once.
 const FATIGUE_THRESHOLDS = [
-  { minutes: 180, signalCode: 'a43F6lFwgIUq_gkgmgSX08g' }, // Driver Fatigue 3h
-  { minutes: 360, signalCode: 'aScBH27NHXUqTLcl8QcCo4g' }, // Driver Fatigue 6h
-  { minutes: 480, signalCode: 'aXmPcWqFx3kKp1XKdQDQEYQ' }, // 8 Hour Duration Check
-  { minutes: 540, signalCode: 'adT7lgnAOhEep8a1M4u09eg' }, // Driver fatigue 9h
-  { minutes: 720, signalCode: 'aJ2f9avKM80Ch7JgyCqOl7A' }, // 12 Hour Duration Check
-  { minutes: 900, signalCode: 'aTZcSSADJ60eeqxk2DNGkZA' }, // 15 Hour Duration Check
+  { minutes: 180, signalCode: FATIGUE_3H_CODE }, // Driver Fatigue 3h
+  { minutes: 360, signalCode: FATIGUE_6H_CODE }, // Driver Fatigue 6h
+  { minutes: 480, signalCode: DURATION_8H_CODE }, // 8 Hour Duration Check
+  { minutes: 540, signalCode: FATIGUE_9H_CODE }, // Driver fatigue 9h
+  { minutes: 720, signalCode: DURATION_12H_CODE }, // 12 Hour Duration Check
+  { minutes: 900, signalCode: DURATION_15H_CODE }, // 15 Hour Duration Check
 ];
-
-// Speed / zone alert signal codes.
-const SPEED_85_CODE = 'aURw7fNBdxEGWY3NXil_yIg'; // Heavy Duty Max Speeding 85km/h
-const SPEED_90_CODE = 'aLv1Bv53LBkClq5rSQ5QPkQ'; // Heavy Duty Max Speeding 90KM/H
-const ZONE_ENTRY_CODE = 'aCmnsH92P1kqGBTWyRmdacA'; // Entering High Risk Area
-const ZONE_STOP_IMMEDIATE_CODE = 'aKW3NJEDtS0OpMwwVlTHWJQ'; // Stopped High Risk area
-const ZONE_STOP_1MIN_HIGH_CODE = 'aCOAc4GcoSkKgsIS9Qnb7mA'; // Stopped > 1min High Risk
-const ZONE_STOP_1MIN_NO_CODE = 'aUg2ERYlb3UChMJWTat0fKw'; // Stopped > 1min No Stopping
 
 // ── Module state ──
 let pollTimer = null;
@@ -313,9 +322,8 @@ async function processZoneForDevice(deviceId, fleetNumber, licensePlate, lat, lo
   if (currentZoneIds.length === 0) return;
 
   const wasInside = entryMap.get(deviceId) || new Set();
-  const isStopped = Number(speed) < STOP_SPEED;
 
-  // New entries → zone entry alert (every entry), high-risk zones only.
+  // New entries → zone entry alert (every entry), high-risk + no-go zones.
   for (const z of insideZones) {
     if (wasInside.has(z.id)) continue;
     const riskLevel = z.is_no_go ? 'CRITICAL' : 'HIGH';
@@ -331,18 +339,22 @@ async function processZoneForDevice(deviceId, fleetNumber, licensePlate, lat, lo
       speed: speed ?? null,
       entryTime: nowTs,
     });
-    if (entry && z.is_high_risk) {
+    if (entry && (z.is_high_risk || z.is_no_go)) {
       const recent = await db.query(
         `SELECT 1 FROM alert_groups WHERE device_id = $1 AND source_type = 'telematics'
-           AND alarm_type IN ('Entering High Risk Area', 'No-Go Zone Entry')
+           AND alarm_type IN ('Entering High Risk Area', 'Entering No-Go Zone')
            AND last_alert_ts >= NOW() - interval '2 minutes'
          LIMIT 1`,
         [deviceId]
       ).catch(() => ({ rows: [] }));
       if (recent.rows.length === 0) {
+        const signalCode = z.is_no_go ? NOGO_ENTRY_CODE : ZONE_ENTRY_CODE;
+        const alarmText = z.is_no_go
+          ? `Entering No-Go Zone in zone ${z.name}`
+          : `Entering High Risk Area in zone ${z.name}`;
         await emitDeviceStatusAlert({
-          deviceId, fleetNumber, licensePlate, signalCode: ZONE_ENTRY_CODE,
-          alarmText: `Entering High Risk Area in zone ${z.name}`,
+          deviceId, fleetNumber, licensePlate, signalCode,
+          alarmText,
           lat, lon, speed, ts: nowTs,
           extra: { zoneName: z.name },
         });
@@ -350,9 +362,12 @@ async function processZoneForDevice(deviceId, fleetNumber, licensePlate, lat, lo
     }
   }
 
-  // Zone stops (speed < 5): immediate + >1min alerts, persistent tracking.
+  // Zone stops: immediate + >1min alerts, persistent tracking. Stop thresholds
+  // are per zone type — high-risk zones flag at speed < 5, No-Stopping at < 10.
   for (const z of insideZones) {
     const zoneType = z.is_high_risk ? 'high_risk' : 'no_stopping';
+    const stopThreshold = zoneType === 'high_risk' ? STOP_SPEED : STOP_SPEED_NO_STOPPING;
+    const isStopped = Number(speed) < stopThreshold;
     const stopKey = `${deviceId}:${z.id}`;
     let stop = stopMap.get(stopKey);
 

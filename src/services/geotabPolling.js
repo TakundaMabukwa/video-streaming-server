@@ -3,6 +3,7 @@ const https = require('https');
 const { fetchVehiclesFromSupabase } = require('../helpers/supabaseClient');
 const { getTelematicsNameMap } = require('../db/alert_definitions');
 const { matchAlertDefinition } = require('../helpers/alertMatching');
+const { isPollerOwnedAlert } = require('../helpers/pollerOwnedAlerts');
 const { processAlertDeduction } = require('./driverScoringService');
 const { escalateSeverity } = require('../helpers/transform');
 
@@ -882,6 +883,14 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
         continue;
       }
 
+      // Our DeviceStatusInfo poller owns alert_group creation for these
+      // telematics types. The event has already been archived to
+      // telematics_events above (kept for comparing our detection vs what
+      // Geotab sent) — the feed must NOT create an alert_group / new-alert.
+      if (isPollerOwnedAlert(matchedDef)) {
+        continue;
+      }
+
       // Zone monitoring rule: if the same zone alert already exists for this
       // vehicle in alert_groups within the last 2 minutes, skip entirely —
       // no alert insert, no group insert, no count increment. Otherwise
@@ -1046,7 +1055,7 @@ async function syncGeotabZones() {
     if (zones.length > 0) {
       await db.upsertGeotabZones(zones);
       const highRisk = zones.filter(z => (z.name || '').toUpperCase().includes('HIGH RISK'));
-      const noGo = zones.filter(z => (z.name || '').toUpperCase().includes('NO GO'));
+      const noGo = zones.filter(z => ['NO GO', 'NO STOP', 'DIESEL', 'HIJACK'].some(token => (z.name || '').toUpperCase().includes(token)));
       console.log(`[GEOTAB] Synced ${zones.length} zones (${highRisk.length} high risk, ${noGo.length} no go)`);
     }
     // Refresh cached zones for WS enrichment

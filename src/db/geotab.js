@@ -432,7 +432,7 @@ async function upsertGeotabZones(zones) {
   for (const zone of zones) {
     const name = (zone.name || '').toUpperCase();
     const isHighRisk = name.includes('HIGH RISK');
-    const isNoGo = name.includes('NO GO');
+    const isNoGo = ['NO GO', 'NO STOP', 'DIESEL', 'HIJACK'].some((token) => name.includes(token));
     await query(
       `INSERT INTO geotab_zones (id, name, points, zone_types, comment, is_high_risk, is_no_go, raw_data, last_synced)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
