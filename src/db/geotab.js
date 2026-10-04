@@ -642,6 +642,8 @@ async function updateVehicleStatusDriving(deviceId, data) {
   if (data.maxSpeed !== undefined) push('max_speed_this_session', data.maxSpeed);
   if (data.speed85Alerted !== undefined) push('speed_85_alerted', data.speed85Alerted);
   if (data.speed90Alerted !== undefined) push('speed_90_alerted', data.speed90Alerted);
+  if (data.speed85DwellSince !== undefined) push('speed_85_dwell_since', data.speed85DwellSince);
+  if (data.speed90DwellSince !== undefined) push('speed_90_dwell_since', data.speed90DwellSince);
   if (data.fatigueAlertedThresholds !== undefined) {
     push('fatigue_alerted_thresholds', JSON.stringify(data.fatigueAlertedThresholds));
   }

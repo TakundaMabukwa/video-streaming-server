@@ -514,6 +514,11 @@ const MIGRATIONS_SQL = `
   ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS speed_85_alerted BOOLEAN DEFAULT FALSE;
   ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS speed_90_alerted BOOLEAN DEFAULT FALSE;
   ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS fatigue_alerted_thresholds TEXT DEFAULT '[]';
+  -- Speed episode dwell: timestamp when speed last dropped below threshold and we
+  -- started re-arming; an alert fires once per sustained episode and only re-arms
+  -- after the dwell window (see deviceStatusPoller).
+  ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS speed_85_dwell_since TIMESTAMPTZ;
+  ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS speed_90_dwell_since TIMESTAMPTZ;
 
   -- Geotab zones
   CREATE TABLE IF NOT EXISTS geotab_zones (

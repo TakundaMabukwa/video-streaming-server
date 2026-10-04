@@ -31,6 +31,14 @@ const STOP_SPEED_NO_STOPPING = 10;
 const ZONES_CACHE_TTL = 5 * 60 * 1000;
 const META_CACHE_TTL = 60 * 1000;
 
+// Freshness gate: a vehicle only counts as live when Geotab reports it as
+// currently communicating AND its own event time (dateTime) is recent. Anything
+// older than this is last-known data and must not drive alerts.
+const DATA_FRESH_MS = 5 * 60 * 1000;
+// Speed episode re-arm dwell: after a speed alert fires, the vehicle must stay
+// below the threshold for ~60s (≈4 polls) before the alert can fire again.
+const SPEED_REARM_DWELL_MS = 60 * 1000;
+
 // Fatigue thresholds (minutes) -> alert_definitions.signal_code.
 // Definition names are resolved at runtime via isAlertActiveForCC — nothing
 // here is hardcoded by name. Sorted ascending so each threshold fires once.
@@ -476,6 +484,9 @@ async function pollDeviceStatus() {
 
     let positionUpdated = 0;
     let drivingChanged = 0;
+    let freshCount = 0;
+    let staleCount = 0;
+    let offlineCount = 0;
 
     for (const d of statuses) {
       const deviceId = d.device?.id;
@@ -490,6 +501,18 @@ async function pollDeviceStatus() {
       const fleetNumber = gDevice.fleetNumber;
       const licensePlate = gDevice.licensePlate;
 
+      // Freshness gate — dateTime is the device's own event time; isDeviceCommunicating
+      // tells us it is currently talking to Geotab. Both are per-event, so no DB lookup.
+      const fixAgeMs = dateTime ? Date.now() - new Date(dateTime).getTime() : Infinity;
+      const communicating = d.isDeviceCommunicating === true;
+      const isFresh = communicating && fixAgeMs <= DATA_FRESH_MS;
+      if (communicating) {
+        if (isFresh) freshCount++;
+        else staleCount++;
+      } else {
+        offlineCount++;
+      }
+
       await db.upsertVehicleStatus(deviceId, {
         plate: gDevice.name || null,
         licensePlate,
@@ -503,7 +526,6 @@ async function pollDeviceStatus() {
 
       // Real online state (isDeviceCommunicating + duration).
       try {
-        const communicating = d.isDeviceCommunicating === true;
         let onlineSince = null;
         if (communicating) {
           const durMs = parseGeotabDurationMs(d.currentStateDuration);
@@ -530,9 +552,13 @@ async function pollDeviceStatus() {
       if (firstSeen) {
         const spd0 = Number(speed) || 0;
         const curMinutes = durMs !== null ? durMs / 60000 : 0;
-        const preAlerted = FATIGUE_THRESHOLDS
-          .filter((t) => curMinutes >= t.minutes)
-          .map((t) => t.signalCode);
+        // Fatigue pre-seed only counts driving time (currentStateDuration counts
+        // stopped time when not driving, so a parked baseline must not pre-fill).
+        const preAlerted = currDriving
+          ? FATIGUE_THRESHOLDS
+              .filter((t) => curMinutes >= t.minutes)
+              .map((t) => t.signalCode)
+          : [];
         const ccId = await findVehicleCostCenterId(fleetNumber || deviceId).catch(() => null);
         if (currDriving) {
           await db.startDrivingSession({
@@ -613,12 +639,13 @@ async function pollDeviceStatus() {
       if (!isRegisteredToken(fleetNumber, licensePlate, fleetSet)) continue;
       if (lat == null || lon == null) continue;
 
-      // Fatigue from authoritative currentStateDuration.
+      // Fatigue from authoritative currentStateDuration — driving sessions only,
+      // and only while the vehicle's data is fresh (dateTime recent + communicating).
       const alertedFatigue = (() => {
         try { return JSON.parse(prevRow.fatigue_alerted_thresholds || '[]'); } catch { return []; }
       })();
       const newFatigue = [...alertedFatigue];
-      if (durMs !== null && durMs > 0) {
+      if (isFresh && currDriving && durMs !== null && durMs > 0) {
         const curMinutes = durMs / 60000;
         for (const t of FATIGUE_THRESHOLDS) {
           if (curMinutes >= t.minutes && !newFatigue.includes(t.signalCode)) {
@@ -633,45 +660,83 @@ async function pollDeviceStatus() {
         }
       }
 
-      // Speed alerts (drops below threshold → reset → rise again = new alert).
+      // Speed alerts — one alert per sustained episode. Fires on the first fresh
+      // crossing; re-arms only after speed stays below the threshold for a dwell
+      // window (~60s ≈ 4 polls) so brief dips don't re-trigger. Only fresh
+      // readings may advance the episode state (stale dips can't re-arm).
+      const spd = Number(speed);
       let s85 = !!prevRow.speed_85_alerted;
       let s90 = !!prevRow.speed_90_alerted;
-      const spd = Number(speed);
-      if (spd >= 90 && !s90) {
-        await emitDeviceStatusAlert({
-          deviceId, fleetNumber, licensePlate, signalCode: SPEED_90_CODE,
-          alarmText: `Speed ${spd} km/h exceeded 90 km/h`,
-          lat, lon, speed, ts: dateTime,
-          extra: { speed: spd },
-        });
-        s90 = true;
-        s85 = true; // 90 supersedes 85
-      } else if (spd >= 85 && !s85) {
-        await emitDeviceStatusAlert({
-          deviceId, fleetNumber, licensePlate, signalCode: SPEED_85_CODE,
-          alarmText: `Speed ${spd} km/h exceeded 85 km/h`,
-          lat, lon, speed, ts: dateTime,
-          extra: { speed: spd },
-        });
-        s85 = true;
-      }
-      if (spd < 85) s85 = false;
-      if (spd < 90) s90 = false;
+      let dwell85 = prevRow.speed_85_dwell_since ? new Date(prevRow.speed_85_dwell_since).getTime() : null;
+      let dwell90 = prevRow.speed_90_dwell_since ? new Date(prevRow.speed_90_dwell_since).getTime() : null;
 
-      if (s85 !== prevRow.speed_85_alerted || s90 !== prevRow.speed_90_alerted ||
+      if (isFresh) {
+        const nowMs = Date.now();
+
+        // Re-arm bookkeeping: while alerted, count a continuous below-threshold
+        // dwell; a re-crossing resets it (same episode).
+        if (spd < 90) {
+          if (s90) {
+            if (dwell90 === null) dwell90 = nowMs;
+            else if (nowMs - dwell90 >= SPEED_REARM_DWELL_MS) { s90 = false; dwell90 = null; }
+          }
+        } else {
+          dwell90 = null;
+        }
+        if (spd < 85) {
+          if (s85) {
+            if (dwell85 === null) dwell85 = nowMs;
+            else if (nowMs - dwell85 >= SPEED_REARM_DWELL_MS) { s85 = false; dwell85 = null; }
+          }
+        } else {
+          dwell85 = null;
+        }
+
+        if (spd >= 90 && !s90) {
+          await emitDeviceStatusAlert({
+            deviceId, fleetNumber, licensePlate, signalCode: SPEED_90_CODE,
+            alarmText: `Speed ${spd} km/h exceeded 90 km/h`,
+            lat, lon, speed, ts: dateTime,
+            extra: { speed: spd },
+          });
+          s90 = true;
+          s85 = true; // 90 supersedes 85
+          dwell90 = null;
+          dwell85 = null;
+        } else if (spd >= 85 && !s85) {
+          await emitDeviceStatusAlert({
+            deviceId, fleetNumber, licensePlate, signalCode: SPEED_85_CODE,
+            alarmText: `Speed ${spd} km/h exceeded 85 km/h`,
+            lat, lon, speed, ts: dateTime,
+            extra: { speed: spd },
+          });
+          s85 = true;
+          dwell85 = null;
+        }
+      }
+
+      const dwell85Ms = prevRow.speed_85_dwell_since ? new Date(prevRow.speed_85_dwell_since).getTime() : null;
+      const dwell90Ms = prevRow.speed_90_dwell_since ? new Date(prevRow.speed_90_dwell_since).getTime() : null;
+      if (s85 !== !!prevRow.speed_85_alerted || s90 !== !!prevRow.speed_90_alerted ||
+          dwell85 !== dwell85Ms || dwell90 !== dwell90Ms ||
           newFatigue.join(',') !== alertedFatigue.join(',')) {
         await db.updateVehicleStatusDriving(deviceId, {
           speed85Alerted: s85,
           speed90Alerted: s90,
+          speed85DwellSince: dwell85 !== null ? new Date(dwell85).toISOString() : null,
+          speed90DwellSince: dwell90 !== null ? new Date(dwell90).toISOString() : null,
           fatigueAlertedThresholds: newFatigue,
         });
       }
 
-      // Zone entry / stop monitoring.
-      await processZoneForDevice(deviceId, fleetNumber, licensePlate, lat, lon, speed, dateTime, zones, entryMap, stopMap);
+      // Zone entry / stop monitoring — only while the fix is current, so stale
+      // last-known positions can't create or extend zone events.
+      if (isFresh) {
+        await processZoneForDevice(deviceId, fleetNumber, licensePlate, lat, lon, speed, dateTime, zones, entryMap, stopMap);
+      }
     }
 
-    console.log(`[DEVSTATUS] poll: ${statuses.length} statuses, ${positionUpdated} positions, ${drivingChanged} driving transitions`);
+    console.log(`[DEVSTATUS] poll: ${statuses.length} statuses, ${positionUpdated} positions, ${drivingChanged} driving transitions | fresh ${freshCount}, stale ${staleCount}, offline ${offlineCount}`);
   } catch (error) {
     console.error('[DEVSTATUS] poll failed:', error.message);
   } finally {
