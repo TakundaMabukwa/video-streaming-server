@@ -783,9 +783,13 @@ const MIGRATIONS_SQL = `
   END $$;
 
   -- ============================================================
-  -- Escalation Groups: contact people per cost center and alert.
+  -- Escalation Groups: contact people notified per cost center.
   -- Escalation group = a named set of contacts (emails) attached to
-  -- one cost center, triggered for whichever alerts are linked.
+  -- one cost center (used for filtering/identity). Notifications are
+  -- sent per category, each scoped to its own cost-center array:
+  --   repair_cost_center_ids -> who receives repair notifications
+  --   ncr_cost_center_ids    -> who receives NCR notifications
+  -- An empty array means "global" = all cost centers.
   -- ============================================================
   CREATE TABLE IF NOT EXISTS escalation_groups (
     id SERIAL PRIMARY KEY,
@@ -799,6 +803,11 @@ const MIGRATIONS_SQL = `
   );
   CREATE INDEX IF NOT EXISTS idx_escalation_groups_cc ON escalation_groups(cost_center_id);
 
+  ALTER TABLE escalation_groups
+    ADD COLUMN IF NOT EXISTS repair_cost_center_ids INTEGER[] NOT NULL DEFAULT '{}';
+  ALTER TABLE escalation_groups
+    ADD COLUMN IF NOT EXISTS ncr_cost_center_ids INTEGER[] NOT NULL DEFAULT '{}';
+
   CREATE TABLE IF NOT EXISTS escalation_group_members (
     id SERIAL PRIMARY KEY,
     escalation_group_id INTEGER NOT NULL REFERENCES escalation_groups(id) ON DELETE CASCADE,
@@ -809,26 +818,9 @@ const MIGRATIONS_SQL = `
   );
   CREATE INDEX IF NOT EXISTS idx_escalation_members_group ON escalation_group_members(escalation_group_id);
 
-  -- Link each escalation group to specific alert definitions (the individual alerts).
-  -- This supersedes an earlier version that linked to alert_group_configs; drop that
-  -- old empty table if present so the new FK-to-alert_definitions takes effect.
-  DO $$
-  BEGIN
-    IF EXISTS (
-      SELECT 1 FROM information_schema.columns
-      WHERE table_name = 'escalation_group_alert_groups'
-        AND column_name = 'alert_group_config_id'
-    ) THEN
-      DROP TABLE escalation_group_alert_groups;
-    END IF;
-  END $$;
-
-  CREATE TABLE IF NOT EXISTS escalation_group_alert_groups (
-    escalation_group_id INTEGER NOT NULL REFERENCES escalation_groups(id) ON DELETE CASCADE,
-    alert_definition_id INTEGER NOT NULL REFERENCES alert_definitions(id) ON DELETE CASCADE,
-    PRIMARY KEY (escalation_group_id, alert_definition_id)
-  );
-  CREATE INDEX IF NOT EXISTS idx_escalation_alertgroups_grp ON escalation_group_alert_groups(escalation_group_id);
+  -- Alert-definition linking was removed: notifications now flow through the
+  -- Repair / NCR categories above. Drop the obsolete link table if present.
+  DROP TABLE IF EXISTS escalation_group_alert_groups;
 
   -- Repair requests
   CREATE TABLE IF NOT EXISTS repair_requests (

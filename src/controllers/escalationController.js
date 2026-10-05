@@ -2,6 +2,13 @@ const db = require('../db');
 const { sendSuccess, sendError } = require('../helpers/response');
 
 // ── Escalation Groups ──
+// A group is a shared contact list. Notifications are sent per category,
+// each scoped to its own cost-center array. Empty array = all cost centers.
+
+function toIntArray(value) {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.map((v) => Number(v)).filter((n) => Number.isInteger(n)))];
+}
 
 async function listEscalationGroups(req, res) {
   try {
@@ -17,10 +24,9 @@ async function listEscalationGroups(req, res) {
       groups = await db.query('SELECT * FROM escalation_groups ORDER BY name');
     }
 
-    // Fetch members + linked alerts in two bulk queries
+    // Fetch members in one bulk query
     const groupIds = groups.rows.map((g) => g.id);
     let membersByGroup = {};
-    let alertsByGroup = {};
     if (groupIds.length > 0) {
       const members = await db.query(
         `SELECT em.escalation_group_id, em.id, em.email, em.name AS member_name, em.is_active
@@ -33,30 +39,13 @@ async function listEscalationGroups(req, res) {
         if (!membersByGroup[m.escalation_group_id]) membersByGroup[m.escalation_group_id] = [];
         membersByGroup[m.escalation_group_id].push(m);
       }
-
-      const alerts = await db.query(
-        `SELECT ega.escalation_group_id, ad.id, ad.name, ad.category, ad.signal_code
-         FROM escalation_group_alert_groups ega
-         JOIN alert_definitions ad ON ad.id = ega.alert_definition_id
-         WHERE ega.escalation_group_id = ANY($1)
-         ORDER BY ad.name`,
-        [groupIds]
-      );
-      for (const a of alerts.rows) {
-        if (!alertsByGroup[a.escalation_group_id]) alertsByGroup[a.escalation_group_id] = [];
-        alertsByGroup[a.escalation_group_id].push({
-          id: a.id,
-          name: a.name,
-          category: a.category,
-          signal_code: a.signal_code,
-        });
-      }
     }
 
     const result = groups.rows.map((g) => ({
       ...g,
+      repair_cost_center_ids: g.repair_cost_center_ids || [],
+      ncr_cost_center_ids: g.ncr_cost_center_ids || [],
       members: membersByGroup[g.id] || [],
-      alerts: alertsByGroup[g.id] || [],
     }));
 
     sendSuccess(res, result, 'Escalation groups retrieved');
@@ -67,18 +56,33 @@ async function listEscalationGroups(req, res) {
 
 async function createEscalationGroup(req, res) {
   try {
-    const { name, cost_center_id, description = '', emails = [], alert_definition_ids = [] } = req.body;
+    const {
+      name,
+      cost_center_id,
+      description = '',
+      emails = [],
+      repair_cost_center_ids = [],
+      ncr_cost_center_ids = [],
+    } = req.body;
     if (!name) return sendError(res, 'name required', 400);
 
+    const repairCcs = toIntArray(repair_cost_center_ids);
+    const ncrCcs = toIntArray(ncr_cost_center_ids);
+
     const groupResult = await db.query(
-      `INSERT INTO escalation_groups (name, cost_center_id, description)
-       VALUES ($1, $2, $3) RETURNING *`,
-      [name.trim(), cost_center_id != null ? Number(cost_center_id) : null, description]
+      `INSERT INTO escalation_groups (name, cost_center_id, description, repair_cost_center_ids, ncr_cost_center_ids)
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [
+        name.trim(),
+        cost_center_id != null ? Number(cost_center_id) : null,
+        description,
+        repairCcs,
+        ncrCcs,
+      ]
     );
     const group = groupResult.rows[0];
 
     await insertMembers(group.id, emails);
-    await insertAlertDefinitions(group.id, alert_definition_ids);
 
     const result = await fetchGroupWithRelations(group.id);
     sendSuccess(res, result, 'Escalation group created');
@@ -91,7 +95,15 @@ async function createEscalationGroup(req, res) {
 async function updateEscalationGroup(req, res) {
   try {
     const { id } = req.params;
-    const { name, cost_center_id, description, is_active, emails, alert_definition_ids } = req.body;
+    const {
+      name,
+      cost_center_id,
+      description,
+      is_active,
+      emails,
+      repair_cost_center_ids,
+      ncr_cost_center_ids,
+    } = req.body;
 
     const fields = [];
     const values = [];
@@ -101,6 +113,16 @@ async function updateEscalationGroup(req, res) {
     if (cost_center_id !== undefined) { fields.push(`cost_center_id = $${idx++}`); values.push(cost_center_id != null ? Number(cost_center_id) : null); }
     if (description !== undefined) { fields.push(`description = $${idx++}`); values.push(description); }
     if (is_active !== undefined) { fields.push(`is_active = $${idx++}`); values.push(is_active); }
+    if (repair_cost_center_ids !== undefined) {
+      if (!Array.isArray(repair_cost_center_ids)) return sendError(res, 'repair_cost_center_ids must be an array', 400);
+      fields.push(`repair_cost_center_ids = $${idx++}`);
+      values.push(toIntArray(repair_cost_center_ids));
+    }
+    if (ncr_cost_center_ids !== undefined) {
+      if (!Array.isArray(ncr_cost_center_ids)) return sendError(res, 'ncr_cost_center_ids must be an array', 400);
+      fields.push(`ncr_cost_center_ids = $${idx++}`);
+      values.push(toIntArray(ncr_cost_center_ids));
+    }
     fields.push(`updated_at = NOW()`);
 
     if (fields.length > 1) {
@@ -108,14 +130,10 @@ async function updateEscalationGroup(req, res) {
       await db.query(`UPDATE escalation_groups SET ${fields.join(', ')} WHERE id = $${idx}`, values);
     }
 
-    // Replace members and linked alerts if provided
+    // Replace members if provided
     if (Array.isArray(emails)) {
       await db.query('DELETE FROM escalation_group_members WHERE escalation_group_id = $1', [id]);
       await insertMembers(id, emails);
-    }
-    if (Array.isArray(alert_definition_ids)) {
-      await db.query('DELETE FROM escalation_group_alert_groups WHERE escalation_group_id = $1', [id]);
-      await insertAlertDefinitions(id, alert_definition_ids);
     }
 
     const result = await fetchGroupWithRelations(id);
@@ -150,18 +168,6 @@ async function insertMembers(groupId, emails) {
   }
 }
 
-async function insertAlertDefinitions(groupId, alertDefinitionIds) {
-  const list = Array.isArray(alertDefinitionIds) ? alertDefinitionIds : [];
-  if (list.length > 0) {
-    const placeholders = list.map((_, i) => `($1, $${i + 2})`).join(', ');
-    await db.query(
-      `INSERT INTO escalation_group_alert_groups (escalation_group_id, alert_definition_id) VALUES ${placeholders}
-       ON CONFLICT DO NOTHING`,
-      [groupId, ...list]
-    );
-  }
-}
-
 async function fetchGroupWithRelations(id) {
   const group = await db.query('SELECT * FROM escalation_groups WHERE id = $1', [id]);
   if (group.rows.length === 0) return null;
@@ -171,42 +177,13 @@ async function fetchGroupWithRelations(id) {
      WHERE escalation_group_id = $1 ORDER BY email`,
     [id]
   );
-  const alerts = await db.query(
-    `SELECT ad.id, ad.name, ad.category, ad.signal_code FROM escalation_group_alert_groups ega
-     JOIN alert_definitions ad ON ad.id = ega.alert_definition_id
-     WHERE ega.escalation_group_id = $1 ORDER BY ad.name`,
-    [id]
-  );
 
   return {
     ...group.rows[0],
+    repair_cost_center_ids: group.rows[0].repair_cost_center_ids || [],
+    ncr_cost_center_ids: group.rows[0].ncr_cost_center_ids || [],
     members: members.rows,
-    alerts: alerts.rows,
   };
-}
-
-// ── Fuzzy search over alert definitions ──
-
-async function searchAlertDefinitions(req, res) {
-  try {
-    const { search = '', limit = 15 } = req.query;
-    const q = `%${String(search).trim()}%`;
-    const result = await db.query(
-      `SELECT id, name, category, signal_code, description
-         FROM alert_definitions
-        WHERE name ILIKE $1 OR signal_code ILIKE $1 OR description ILIKE $1
-        ORDER BY CASE
-          WHEN name ILIKE $2 THEN 0
-          WHEN name ILIKE $1 THEN 1
-          ELSE 2
-        END, name
-        LIMIT $3`,
-      [q, `${String(search).trim()}%`, Number(limit) || 15]
-    );
-    sendSuccess(res, result.rows, 'Alert definitions retrieved');
-  } catch (error) {
-    sendError(res, error.message, 500);
-  }
 }
 
 module.exports = {
@@ -214,5 +191,4 @@ module.exports = {
   createEscalationGroup,
   updateEscalationGroup,
   deleteEscalationGroup,
-  searchAlertDefinitions,
 };
