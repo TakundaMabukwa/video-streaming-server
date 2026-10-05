@@ -27,7 +27,7 @@ router.post('/', async (req, res) => {
   try {
     const {
       alert_id, fleet_number, registration, device_id, cost_center_id, notes, created_by,
-      contact_name, contact_phone, contact_email, available_at, issue_description, priority, account_code,
+      contact_name, contact_phone, contact_email, available_at = null, issue_description, priority, account_code,
     } = req.body || {};
 
     const fleet = String(fleet_number || '').trim();
@@ -35,7 +35,6 @@ router.post('/', async (req, res) => {
     if (!String(contact_name || '').trim()) return res.status(400).json({ success: false, message: 'contact_name is required' });
     if (!String(contact_phone || '').trim()) return res.status(400).json({ success: false, message: 'contact_phone is required' });
     if (!String(contact_email || '').trim()) return res.status(400).json({ success: false, message: 'contact_email is required' });
-    if (!available_at) return res.status(400).json({ success: false, message: 'available_at is required' });
     if (!String(issue_description || '').trim()) return res.status(400).json({ success: false, message: 'issue_description is required' });
 
     const prio = ['low', 'medium', 'high'].includes(String(priority || '').toLowerCase())
@@ -48,9 +47,9 @@ router.post('/', async (req, res) => {
       String(issue_description).trim(),
       `Alert: ${(req.body.alarm_type || req.body.alarmType || '').toString().trim() || 'N/A'} (${fleet} / ${String(registration || '').trim() || 'N/A'})`,
       `Contact: ${String(contact_name).trim()} - ${String(contact_phone).trim()} - ${String(contact_email).trim()}`,
-      `Vehicle available: ${formatSAST(available_at)}`,
+      available_at ? `Vehicle available: ${formatSAST(available_at)}` : null,
       `Requested by: ${String(created_by || 'SRS user').trim()} via SRS alerts`,
-    ].join('\n');
+    ].filter(Boolean).join('\n');
 
     let external = null;
     let externalError = null;
