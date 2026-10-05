@@ -209,7 +209,10 @@ async function resolveAlertGroupById(id, updates) {
   }
   if (updates.documents !== undefined) {
     sets.push(`documents = $${idx++}`);
-    params.push(updates.documents);
+    // JSONB: pg sends JS arrays as Postgres array literals, which jsonb rejects.
+    params.push(
+      typeof updates.documents === 'string' ? updates.documents : JSON.stringify(updates.documents),
+    );
   }
   if (updates.follow_up !== undefined) {
     sets.push(`follow_up = $${idx++}`);
