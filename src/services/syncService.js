@@ -446,7 +446,7 @@ async function syncAlerts(deviceIds, startTime, endTime) {
               groupId: row.id != null ? String(row.id) : '',
             };
           }
-        } catch (_) { /* group upsert failure must not block WS */ }
+        } catch (groupErr) { console.error('[SYNC] group upsert failed — alert stored without a group:', groupErr.message); }
       }
 
       if (wsBroadcast) {
@@ -618,18 +618,42 @@ function getStatus() {
   return { ...rest };
 }
 
-async function startAutoSync(intervalMs = 30000) {
-  await runSync();
-  // Media refetch disabled — alerts are synced without constant media fetching.
-  syncState.syncInterval = setInterval(async () => {
+const MIN_SYNC_TICK_MS = 5000;
+const DEFAULT_SYNC_TICK_MS = 15000;
+
+let autoSyncEnabled = false;
+
+function scheduleAutoSync(tickStart, maxInterval) {
+  const cycleMs = Date.now() - tickStart;
+  // Pace tick-to-tick: run again shortly after a cycle ends, but never faster
+  // than MIN_SYNC_TICK_MS and never slower than maxInterval. A plain
+  // setInterval drops a tick whenever a cycle outlives the interval, which
+  // silently doubles the delay before a new alert lands.
+  const target = Math.max(MIN_SYNC_TICK_MS, Math.min(maxInterval, cycleMs + 1000));
+  const wait = Math.max(0, tickStart + target - Date.now());
+  syncState.lastPacedIntervalMs = target;
+  if (!autoSyncEnabled) return;
+  syncState.syncInterval = setTimeout(async () => {
+    if (!autoSyncEnabled) return;
+    const nextStart = Date.now();
     await runSync();
-  }, intervalMs);
-  console.log(`[SYNC] Auto-sync every ${intervalMs / 1000}s (media fetch disabled)`);
+    scheduleAutoSync(nextStart, maxInterval);
+  }, wait);
+}
+
+async function startAutoSync(intervalMs = DEFAULT_SYNC_TICK_MS) {
+  const maxInterval = Math.max(MIN_SYNC_TICK_MS, intervalMs);
+  autoSyncEnabled = true;
+  const tickStart = Date.now();
+  await runSync();
+  scheduleAutoSync(tickStart, maxInterval);
+  console.log(`[SYNC] Auto-sync paced (min ${MIN_SYNC_TICK_MS / 1000}s, max ${maxInterval / 1000}s, media fetch disabled)`);
 }
 
 function stopAutoSync() {
+  autoSyncEnabled = false;
   if (syncState.syncInterval) {
-    clearInterval(syncState.syncInterval);
+    clearTimeout(syncState.syncInterval);
     syncState.syncInterval = null;
   }
 }

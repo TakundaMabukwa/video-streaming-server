@@ -176,21 +176,37 @@ async function getAlertTypes(req, res) {
   }
 }
 
+// `?limit=` handling for endpoints that now support fetching *everything*.
+// - absent / `0` / `all`  -> null (no LIMIT)
+// - a positive integer     -> that value
+// - anything else          -> the endpoint's own default
+function parseLimit(raw, fallback) {
+  if (raw === undefined || raw === null) return null;
+  const s = String(raw).trim();
+  if (s === '') return null;
+  if (s === '0' || s.toLowerCase() === 'all') return null;
+  const n = Number.parseInt(s, 10);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return n;
+}
+
+function groupsToAlerts(groups, { passes, severityFor }, { includeCount = true } = {}) {
+  return groups.filter((g) => passes(g)).map((g) => {
+    const t = transformDbAlert(g, severityFor(g));
+    if (includeCount) t.count = g.count || 1;
+    return t;
+  });
+}
+
 async function getActiveAlerts(req, res) {
   try {
-    const limit = parseInt(req.query.limit) || 2000;
+    const limit = parseLimit(req.query.limit, 2000);
     const groups = await db.getActiveAlertGroupsWithMedia({ limit });
 
     const { deviceCC } = await batchResolveDeviceCC(groups);
-    const { passes, severityFor } = await buildStrictAlertFilter(deviceCC);
+    const filter = await buildStrictAlertFilter(deviceCC);
 
-    const alerts = groups
-      .filter((g) => passes(g))
-      .map((g) => {
-        const t = transformDbAlert(g, severityFor(g));
-        t.count = g.count || 1;
-        return t;
-      });
+    const alerts = groupsToAlerts(groups, filter);
 
     res.json({ success: true, alerts, count: alerts.length, total: alerts.length, source: 'eps-db' });
   } catch (error) {
@@ -200,19 +216,15 @@ async function getActiveAlerts(req, res) {
 
 async function getResolvedAlerts(req, res) {
   try {
-    const limit = parseInt(req.query.limit) || 2000;
+    // Closed history stays capped by default (12k+ rows); callers must ask
+    // explicitly for more or for everything (`?limit=0` / `?limit=all`).
+    const limit = parseLimit(req.query.limit, 2000);
     const groups = await db.getResolvedAlertGroupsWithMedia({ limit });
 
     const { deviceCC } = await batchResolveDeviceCC(groups);
-    const { passes, severityFor } = await buildStrictAlertFilter(deviceCC);
+    const filter = await buildStrictAlertFilter(deviceCC);
 
-    const alerts = groups
-      .filter((g) => passes(g))
-      .map((g) => {
-        const t = transformDbAlert(g, severityFor(g));
-        t.count = g.count || 1;
-        return t;
-      });
+    const alerts = groupsToAlerts(groups, filter);
 
     res.json({ success: true, alerts, count: alerts.length, total: alerts.length, source: 'eps-db' });
   } catch (error) {
@@ -222,17 +234,45 @@ async function getResolvedAlerts(req, res) {
 
 async function getActiveAlertsAll(req, res) {
   try {
-    const limit = parseInt(req.query.limit) || 2000;
+    const limit = parseLimit(req.query.limit, 2000);
     const groups = await db.getActiveAlertGroupsAll({ limit });
 
     const { deviceCC } = await batchResolveDeviceCC(groups);
-    const { passes, severityFor } = await buildStrictAlertFilter(deviceCC);
+    const filter = await buildStrictAlertFilter(deviceCC);
 
-    const alerts = groups
-      .filter((g) => passes(g))
-      .map((g) => transformDbAlert(g, severityFor(g)));
+    const alerts = groupsToAlerts(groups, filter, { includeCount: false });
 
     res.json({ success: true, alerts, count: alerts.length, total: alerts.length, source: 'eps-db' });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+}
+
+// GET /alerts?status=new|active|resolved|closed&limit=&offset=
+//
+// This used to fall through to the catch-all in alertRoutes.js, which answers
+// `{ alerts: [], count: 0 }` for every unknown path — so the alert bell and the
+// closed-status tab were permanently empty.
+async function listAlerts(req, res) {
+  try {
+    const status = String(req.query.status ?? '').trim();
+    const limit = parseLimit(req.query.limit, 2000);
+    const offset = Number.parseInt(String(req.query.offset ?? ''), 10) || 0;
+
+    const groups = await db.listAlertGroups({ status, limit, offset });
+
+    const { deviceCC } = await batchResolveDeviceCC(groups);
+    const filter = await buildStrictAlertFilter(deviceCC);
+
+    const alerts = groupsToAlerts(groups, filter);
+
+    res.json({
+      success: true,
+      alerts,
+      count: alerts.length,
+      total: alerts.length,
+      source: 'eps-db'
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -1165,6 +1205,7 @@ module.exports = {
   getActiveAlerts,
   getActiveAlertsAll,
   getResolvedAlerts,
+  listAlerts,
   getResolvedAlertCount,
   getAlertById,
   getAlertScreenshots,

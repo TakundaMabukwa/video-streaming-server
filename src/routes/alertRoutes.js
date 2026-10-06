@@ -1,6 +1,6 @@
 const express = require('express');
 const { getAlertTypes, getAlarmPage, getAlertFeed, getAlarmFilesById, getAlarmFilesByPage, getDevices } = require('../controllers/alertController');
-const { getActiveAlerts, getActiveAlertsAll, getResolvedAlerts, getResolvedAlertCount, getAlertById, getAlertScreenshots, getAlertMedia, acknowledgeAlert, resolveAlert, escalateAlert, markFalseAlert, uploadDocumentToAlert, followUpAlert, clearFollowUp, getAlertHistory } = require('../controllers/dbAlertController');
+const { getActiveAlerts, getActiveAlertsAll, getResolvedAlerts, getResolvedAlertCount, getAlertById, getAlertScreenshots, getAlertMedia, acknowledgeAlert, resolveAlert, escalateAlert, markFalseAlert, uploadDocumentToAlert, followUpAlert, clearFollowUp, getAlertHistory, listAlerts } = require('../controllers/dbAlertController');
 const db = require('../db');
 const apiClient = require('../helpers/apiClient');
 
@@ -20,6 +20,9 @@ router.get('/active-all', getActiveAlertsAll);
 router.get('/resolved', getResolvedAlerts);
 router.get('/resolved-count', getResolvedAlertCount);
 router.get('/history', getAlertHistory);
+// GET /alerts?status=new|active|resolved|closed&limit=&offset= — previously fell
+// through to the catch-all below and always answered with an empty list.
+router.get('/', listAlerts);
 router.post('/bulk-close', resolveAlertsBulk);
 router.get('/:id/screenshots', getAlertScreenshots);
 router.get('/:id/media', getAlertMedia);

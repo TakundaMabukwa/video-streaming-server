@@ -65,8 +65,13 @@ async function batchUpsertAlertGroups(groups) {
     if (await isRegisteredVehicle({ deviceId: g.deviceId, deviceName: g.deviceName })) allowed.push(g);
   }
   if (allowed.length === 0) return [];
+  // One entry per device+type: ON CONFLICT cannot touch the same row twice.
+  const byKey = new Map();
+  for (const g of allowed) byKey.set(`${g.deviceId}:${g.alarmType}`.toLowerCase(), g);
+  const entries = Array.from(byKey.values());
+
   const params = [];
-  const placeholders = allowed.map((g, i) => {
+  const placeholders = entries.map((g, i) => {
     const base = i * 10;
     params.push(
       `${g.deviceId}:${g.alarmType}`.toLowerCase(),
@@ -75,8 +80,7 @@ async function batchUpsertAlertGroups(groups) {
     );
     return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, 1, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}, $${base + 10})`;
   }).join(',');
-  // On conflict only bump ACTIVE groups. Resolved groups stay closed (Resolve sticks);
-  // a later active twin can still be created via the non-conflict path below.
+  // On conflict only bump ACTIVE groups. Resolved groups stay closed (Resolve sticks).
   const result = await query(
     `INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon, severity)
      VALUES ${placeholders}
@@ -94,6 +98,38 @@ async function batchUpsertAlertGroups(groups) {
        RETURNING id, group_key, count, alarm_type`,
     params
   );
+
+  // A conflict against a RESOLVED group satisfies neither the INSERT nor the
+  // DO UPDATE (the WHERE kills it), so no row comes back. Mirror upsertAlertGroup()
+  // and open a fresh active twin for those keys — otherwise the raw alert is
+  // already in `alerts`, the sync high-water mark advances past it, and the
+  // event never reaches alert_groups or the frontend.
+  const settled = new Set(result.rows.map((r) => r.group_key));
+  const twins = entries.filter((g) => !settled.has(`${g.deviceId}:${g.alarmType}`.toLowerCase()));
+  if (twins.length > 0) {
+    const tParams = [];
+    const stamp = Date.now().toString(36);
+    const tPlaceholders = twins.map((g, i) => {
+      const base = i * 10;
+      const suffix = `${g.alertId ? '-' + String(g.alertId).slice(-6) : ''}-${Math.random().toString(36).slice(2, 7)}`;
+      tParams.push(
+        `${g.deviceId}:${g.alarmType}`.toLowerCase() + ':' + stamp + suffix,
+        g.deviceId, g.deviceName || null, g.alarmType, g.alarmText || null,
+        g.alertId, g.alarmTs || null, g.lat || null, g.lon || null, g.severity || null
+      );
+      return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, 1, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}, $${base + 10})`;
+    }).join(',');
+
+    const twinResult = await query(
+      `INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon, severity)
+       VALUES ${tPlaceholders}
+       RETURNING id, group_key, count, alarm_type`,
+      tParams
+    );
+    result.rows.push(...twinResult.rows);
+    console.log(`[ALERT-GROUPS] reopened ${twinResult.rows.length} group(s) behind a resolved twin`);
+  }
+
   return result.rows;
 }
 
@@ -130,31 +166,90 @@ async function getAlertGroupByAlertId(alertId) {
   return result.rows[0] || null;
 }
 
+// `limit` of null/0/undefined means "no LIMIT" — callers that want every row
+// (currently the dashboard's unresolved board) pass null.
+function isBounded(limit) {
+  return Number.isFinite(limit) && limit > 0;
+}
+
 async function getActiveAlertGroupsWithMedia({ limit = 2000 } = {}) {
+  const bounded = isBounded(limit);
   const result = await query(
     `SELECT g.*
      FROM alert_groups g
      WHERE g.resolved = FALSE
      ORDER BY g.last_alert_ts DESC NULLS LAST
-     LIMIT $1`,
-    [limit]
+     ${bounded ? 'LIMIT $1' : ''}`,
+    bounded ? [limit] : []
   );
   return result.rows;
 }
 
 async function getActiveAlertGroupsAll({ limit = 2000 } = {}) {
+  const bounded = isBounded(limit);
   const result = await query(
     `SELECT g.*
      FROM alert_groups g
      WHERE g.resolved = FALSE
      ORDER BY g.last_alert_ts DESC NULLS LAST
-     LIMIT $1`,
-    [limit]
+     ${bounded ? 'LIMIT $1' : ''}`,
+    bounded ? [limit] : []
   );
   return result.rows;
 }
 
+// Status-filtered listing backing GET /alerts (the frontend asks for
+// ?status=new / resolved / closed / active). `limit` null => no LIMIT.
+async function listAlertGroups({ status = '', limit = null, offset = 0 } = {}) {
+  const s = String(status || '').trim().toLowerCase();
+  const where = [];
+  if (s === 'active' || s === 'open') {
+    where.push('g.resolved = FALSE');
+  } else if (s === 'new') {
+    where.push('g.resolved = FALSE', "g.status = 'new'");
+  } else if (s === 'resolved' || s === 'closed') {
+    where.push('g.resolved = TRUE');
+  }
+
+  const wantsResolved = where.length === 0 || s === 'resolved' || s === 'closed';
+  const bounded = isBounded(limit);
+  const offsetN = Number.isFinite(offset) && offset > 0 ? Math.floor(offset) : 0;
+
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const limitSql = bounded ? `LIMIT $1` : '';
+  const offsetSql = offsetN > 0 ? (bounded ? `OFFSET $2` : `OFFSET $1`) : '';
+  const params = bounded ? [limit] : [];
+  if (offsetN > 0) params.push(offsetN);
+
+  // Resolved rows take their documents from the original alert (alert_groups
+  // documents are only the group's own); active rows have no media join today
+  // (see getActiveAlertGroupsWithMedia) so keep them on the cheap path.
+  const query_ = wantsResolved
+    ? `SELECT g.*, COALESCE(a.documents, g.documents) AS documents,
+              jsonb_agg(DISTINCT jsonb_build_object(
+                'id', m.id, 'file_url', m.file_url, 'file_type', m.file_type,
+                'file_size', m.file_size, 'created_at', m.created_at
+              )) FILTER (WHERE m.id IS NOT NULL) AS media
+       FROM alert_groups g
+       LEFT JOIN alerts a ON a.id = g.last_alert_id
+       LEFT JOIN alert_media m ON m.alert_id = g.last_alert_id
+       ${whereSql}
+       GROUP BY g.id, a.documents
+       ORDER BY g.last_alert_ts DESC NULLS LAST, g.updated_at DESC NULLS LAST
+       ${limitSql} ${offsetSql}`
+    : `SELECT g.*
+       FROM alert_groups g
+       ${whereSql}
+       ORDER BY g.last_alert_ts DESC NULLS LAST
+       ${limitSql} ${offsetSql}`;
+
+  const result = await query(query_, params);
+  if (!wantsResolved) return result.rows;
+  return result.rows.map(r => ({ ...r, media: (r.media || []).filter(m => m.id !== null) }));
+}
+
 async function getResolvedAlertGroupsWithMedia({ limit = 2000 } = {}) {
+  const bounded = isBounded(limit);
   const result = await query(
     `SELECT g.*, COALESCE(a.documents, g.documents) AS documents,
             jsonb_agg(DISTINCT jsonb_build_object(
@@ -167,8 +262,8 @@ async function getResolvedAlertGroupsWithMedia({ limit = 2000 } = {}) {
      WHERE g.resolved = TRUE
      GROUP BY g.id, a.documents
      ORDER BY g.updated_at DESC NULLS LAST, g.last_alert_ts DESC NULLS LAST
-     LIMIT $1`,
-    [limit]
+     ${bounded ? 'LIMIT $1' : ''}`,
+    bounded ? [limit] : []
   );
   return result.rows.map(r => ({
     ...r,
@@ -333,4 +428,5 @@ module.exports = {
   resolveAlertGroupById,
   appendAlertGroupDocument,
   getAlertGroupStats,
+  listAlertGroups,
 };

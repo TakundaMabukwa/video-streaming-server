@@ -216,15 +216,17 @@ router.post('/increment', async (req, res) => {
 
           // Create alert_group for the NCR
           const groupKey = `${fleet_number}:NCR: ${alert_type}`;
+          const { resolveNcrDeviceName } = require('../services/driverScoringService');
+          const ncrDeviceName = await resolveNcrDeviceName(fleet_number);
           await client.query(
-            `INSERT INTO alert_groups (group_key, device_id, alarm_type, count, last_alert_id, last_alert_ts, source_type, status, resolved, false_alert, created_at, updated_at)
-             VALUES ($1, $2, $3, 1, $4, NOW(), 'telematics', 'new', false, false, NOW(), NOW())
+            `INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, count, last_alert_id, last_alert_ts, source_type, status, resolved, false_alert, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, 1, $5, NOW(), 'telematics', 'new', false, false, NOW(), NOW())
              ON CONFLICT (group_key) DO UPDATE SET
                count = alert_groups.count + 1,
                last_alert_id = EXCLUDED.last_alert_id,
                last_alert_ts = EXCLUDED.last_alert_ts,
                updated_at = NOW()`,
-            [groupKey, fleet_number, `NCR: ${alert_type}`, ncrId]
+            [groupKey, fleet_number, ncrDeviceName, `NCR: ${alert_type}`, ncrId]
           );
 
           ncrCreated = true;

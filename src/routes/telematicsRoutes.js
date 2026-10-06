@@ -196,6 +196,54 @@ router.get('/vehicle-status-all', async (req, res) => {
   }
 });
 
+// GET /api/telematics/vehicles/online
+// Last-known vehicle state for every vehicle that is currently online.
+// Query: driving=true, ignition=true, staleMinutes=15 (freshness window), state=all
+router.get('/vehicles/online', async (req, res) => {
+  try {
+    const q = req.query;
+    const truthy = (v) => ['1', 'true', 'yes', 'on'].includes(String(v ?? '').toLowerCase());
+    const staleMinutes = Number.parseInt(q.staleMinutes ?? q.stale_minutes ?? '', 10);
+    const stale = Number.isFinite(staleMinutes) && staleMinutes >= 0 ? staleMinutes : 15;
+
+    const where = ['vs.is_online = TRUE', 'vs.last_update >= NOW() - make_interval(mins => $1)'];
+    const params = [String(stale)];
+
+    if (truthy(q.driving)) where.push('vs.is_driving = TRUE');
+    if (truthy(q.ignition) || truthy(q.engine)) where.push('vs.ignition_on = TRUE');
+
+    const result = await db.query(
+      `SELECT vs.device_id, vs.fleet_number, vs.plate, vs.license_plate,
+              vs.is_online, vs.online_since,
+              vs.is_driving, vs.driving_since, vs.current_state_duration,
+              vs.engine_on, vs.ignition_on, vs.speed,
+              vs.latitude, vs.longitude, vs.last_log_time, vs.last_update
+       FROM vehicle_status vs
+       WHERE ${where.join(' AND ')}
+       ORDER BY vs.fleet_number NULLS LAST, vs.plate NULLS LAST, vs.device_id`,
+      params
+    );
+
+    const vehicles = result.rows.map((r) => ({
+      ...r,
+      state: r.is_driving ? 'driving' : (r.ignition_on || r.engine_on) ? 'idling' : 'stationary'
+    }));
+
+    res.json({
+      success: true,
+      data: vehicles,
+      vehicles,
+      count: vehicles.length,
+      driving: vehicles.filter((v) => v.state === 'driving').length,
+      idling: vehicles.filter((v) => v.state === 'idling').length,
+      source: 'vehicle_status',
+      asOf: new Date().toISOString()
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // ── Geotab Zones ──
 
 router.get('/zones', async (req, res) => {

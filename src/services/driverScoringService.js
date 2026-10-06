@@ -137,15 +137,16 @@ async function processAlertDeduction(fleet_number, alert_type) {
 
         // Create alert_group for the NCR
         const groupKey = `${fleet_number}:NCR: ${alert_type}`;
+        const ncrDeviceName = await resolveNcrDeviceName(fleet_number);
         await client.query(
-          `INSERT INTO alert_groups (group_key, device_id, alarm_type, count, last_alert_id, last_alert_ts, source_type, status, resolved, false_alert, created_at, updated_at)
-           VALUES ($1, $2, $3, 1, $4, NOW(), 'telematics', 'new', false, false, NOW(), NOW())
+          `INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, count, last_alert_id, last_alert_ts, source_type, status, resolved, false_alert, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, 1, $5, NOW(), 'telematics', 'new', false, false, NOW(), NOW())
            ON CONFLICT (group_key) DO UPDATE SET
              count = alert_groups.count + 1,
              last_alert_id = EXCLUDED.last_alert_id,
              last_alert_ts = EXCLUDED.last_alert_ts,
              updated_at = NOW()`,
-          [groupKey, fleet_number, `NCR: ${alert_type}`, ncrId]
+          [groupKey, fleet_number, ncrDeviceName, `NCR: ${alert_type}`, ncrId]
         );
 
         ncrCreated = true;
@@ -195,6 +196,25 @@ async function processAlertDeduction(fleet_number, alert_type) {
     throw err;
   } finally {
     client.release();
+  }
+}
+
+// Resolve the display name stored on NCR alert_groups (fleet - registration).
+// Falls back to the fleet number alone so the vehicle is never blank.
+async function resolveNcrDeviceName(fleetNumber) {
+  const fleet = String(fleetNumber || '').trim();
+  if (!fleet) return fleet;
+  try {
+    const { rows } = await query(
+      `SELECT registration_number FROM fleet_vehicles
+       WHERE lower(replace(trim(fleet_number), ' ', '')) = lower(replace(trim($1), ' ', ''))
+       LIMIT 1`,
+      [fleet]
+    );
+    const reg = rows[0] && rows[0].registration_number ? String(rows[0].registration_number).trim() : '';
+    return reg ? `${fleet} - ${reg}` : fleet;
+  } catch (_) {
+    return fleet;
   }
 }
 
@@ -407,4 +427,5 @@ module.exports = {
   processAlertDeduction,
   applyNcrDeduction,
   insertAutoIncident,
+  resolveNcrDeviceName,
 };
