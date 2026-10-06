@@ -197,19 +197,19 @@ router.get('/vehicle-status-all', async (req, res) => {
 });
 
 // GET /api/telematics/vehicles/online
-// Last-known vehicle state for every vehicle that is currently online.
-// Query: driving=true, ignition=true, staleMinutes=15 (freshness window), state=all
+// Engine-on (driving) vehicles with a fresh telematics timestamp: is_driving=true
+// AND the Geotab dateTime (vs.last_log_time) within the last 2 minutes.
+// Query: staleMinutes=2 (window on telematics time), ignition=true
 router.get('/vehicles/online', async (req, res) => {
   try {
     const q = req.query;
     const truthy = (v) => ['1', 'true', 'yes', 'on'].includes(String(v ?? '').toLowerCase());
     const staleMinutes = Number.parseInt(q.staleMinutes ?? q.stale_minutes ?? '', 10);
-    const stale = Number.isFinite(staleMinutes) && staleMinutes >= 0 ? staleMinutes : 15;
+    const stale = Number.isFinite(staleMinutes) && staleMinutes >= 0 ? staleMinutes : 2;
 
-    const where = ['vs.is_online = TRUE', 'vs.last_update >= NOW() - make_interval(mins => $1)'];
+    const where = ['vs.is_driving = TRUE', 'vs.last_log_time >= NOW() - make_interval(mins => $1)'];
     const params = [String(stale)];
 
-    if (truthy(q.driving)) where.push('vs.is_driving = TRUE');
     if (truthy(q.ignition) || truthy(q.engine)) where.push('vs.ignition_on = TRUE');
 
     const result = await db.query(
