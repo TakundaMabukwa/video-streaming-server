@@ -522,6 +522,9 @@ const MIGRATIONS_SQL = `
   -- after the dwell window (see deviceStatusPoller).
   ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS speed_85_dwell_since TIMESTAMPTZ;
   ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS speed_90_dwell_since TIMESTAMPTZ;
+  -- Fast /vehicles/online: engine-on (is_driving=true) with fresh telematics time.
+  CREATE INDEX IF NOT EXISTS idx_vehicle_status_driving_live
+    ON vehicle_status (last_log_time DESC) WHERE is_driving = TRUE;
 
   -- Geotab zones
   CREATE TABLE IF NOT EXISTS geotab_zones (
