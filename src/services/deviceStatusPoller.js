@@ -237,6 +237,20 @@ async function emitDeviceStatusAlert({ deviceId, fleetNumber, licensePlate, sign
     const alertId = `dst-${deviceId}-${signalCode}-${Date.now()}`;
     const alarmTs = ts || new Date().toISOString();
 
+    // Speeding: the Geotab feed may already have recorded this spike (tel-*)
+    // within 60s. Skip the poller copy so one spike is not counted twice.
+    if (signalCode === SPEED_85_CODE || signalCode === SPEED_90_CODE) {
+      const feedDup = await db.query(
+        `SELECT 1 FROM alert_groups
+         WHERE device_id = $1 AND alarm_type = $2 AND source_type = 'telematics'
+           AND last_alert_id LIKE 'tel-%'
+           AND ABS(EXTRACT(EPOCH FROM (last_alert_ts - $3::timestamptz))) <= 60
+         LIMIT 1`,
+        [deviceId, def.name, alarmTs]
+      ).catch(() => ({ rows: [] }));
+      if (feedDup.rows.length > 0) return null;
+    }
+
     const groupRow = await db.upsertAlertGroup({
       deviceId,
       deviceName,
@@ -679,6 +693,11 @@ async function pollDeviceStatus() {
       const spd = Number(speed);
       let s85 = !!prevRow.speed_85_alerted;
       let s90 = !!prevRow.speed_90_alerted;
+      // Speeding diagnostics: log every snapshot at or above 80 km/h so a missed
+      // alert can be explained from the data (fresh flag + prior alert state).
+      if (spd >= 80) {
+        console.log(`[SPEED-POLL] ${fleetNumber || deviceId} ${licensePlate || ''} spd=${spd} fresh=${isFresh} at=${dateTime} prev85=${s85} prev90=${s90}`);
+      }
       let dwell85 = prevRow.speed_85_dwell_since ? new Date(prevRow.speed_85_dwell_since).getTime() : null;
       let dwell90 = prevRow.speed_90_dwell_since ? new Date(prevRow.speed_90_dwell_since).getTime() : null;
 

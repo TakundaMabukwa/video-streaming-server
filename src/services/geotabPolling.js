@@ -3,7 +3,7 @@ const https = require('https');
 const { fetchVehiclesFromSupabase } = require('../helpers/supabaseClient');
 const { getTelematicsNameMap } = require('../db/alert_definitions');
 const { matchAlertDefinition } = require('../helpers/alertMatching');
-const { isPollerOwnedAlert } = require('../helpers/pollerOwnedAlerts');
+const { isPollerOwnedAlert, SPEED_85_CODE, SPEED_90_CODE } = require('../helpers/pollerOwnedAlerts');
 const { processAlertDeduction } = require('./driverScoringService');
 const { escalateSeverity } = require('../helpers/transform');
 
@@ -899,8 +899,24 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
       // telematics types. The event has already been archived to
       // telematics_events above (kept for comparing our detection vs what
       // Geotab sent) — the feed must NOT create an alert_group / new-alert.
-      if (isPollerOwnedAlert(matchedDef)) {
+      // Speeding is the exception: the feed also creates these groups, because
+      // the poller's 15s snapshots can miss short speed spikes. Skip the feed
+      // copy when the poller already recorded a speeding alert for this vehicle
+      // within 60s of the event, so one spike is not counted twice.
+      const isSpeedingEvent = eventCode === SPEED_85_CODE || eventCode === SPEED_90_CODE;
+      if (isPollerOwnedAlert(matchedDef) && !isSpeedingEvent) {
         continue;
+      }
+      if (isSpeedingEvent) {
+        const pollerDup = await db.query(
+          `SELECT 1 FROM alert_groups
+           WHERE device_id = $1 AND alarm_type = $2 AND source_type = 'telematics'
+             AND last_alert_id LIKE 'dst-%'
+             AND ABS(EXTRACT(EPOCH FROM (last_alert_ts - $3::timestamptz))) <= 60
+           LIMIT 1`,
+          [geotabDeviceId, matchedDef.name, new Date(eventTime).toISOString()]
+        ).catch(() => ({ rows: [] }));
+        if (pollerDup.rows.length > 0) continue;
       }
 
       // Zone monitoring rule: if the same zone alert already exists for this
