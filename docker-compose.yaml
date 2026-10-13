@@ -7,7 +7,7 @@ services:
       POSTGRES_PASSWORD: SRS@981234#*
       POSTGRES_DB: eps_alerts
     ports:
-      - "5433:5432"
+      - "127.0.0.1:5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:

@@ -543,6 +543,7 @@ const MIGRATIONS_SQL = `
   -- (a hard delete would be re-inserted by the next sync).
   ALTER TABLE geotab_zones ADD COLUMN IF NOT EXISTS locally_modified TIMESTAMPTZ;
   ALTER TABLE geotab_zones ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN DEFAULT FALSE;
+  ALTER TABLE geotab_zones ADD COLUMN IF NOT EXISTS is_no_stopping BOOLEAN DEFAULT FALSE;
   CREATE INDEX IF NOT EXISTS idx_geotab_zones_deleted ON geotab_zones(is_deleted) WHERE is_deleted = TRUE;
 
   -- High risk zone entries

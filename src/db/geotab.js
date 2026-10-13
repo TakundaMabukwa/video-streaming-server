@@ -432,7 +432,9 @@ async function upsertGeotabZones(zones) {
   for (const zone of zones) {
     const name = (zone.name || '').toUpperCase();
     const isHighRisk = name.includes('HIGH RISK');
-    const isNoGo = ['NO GO', 'NO STOP', 'DIESEL', 'HIJACK'].some((token) => name.includes(token));
+    // No-stopping is NOT derived from the name (it has its own explicit flag,
+    // is_no_stopping, which this sync never writes). 'NO STOP' is removed here.
+    const isNoGo = ['NO GO', 'DIESEL', 'HIJACK'].some((token) => name.includes(token));
     await query(
       `INSERT INTO geotab_zones (id, name, points, zone_types, comment, is_high_risk, is_no_go, raw_data, last_synced)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
@@ -461,8 +463,18 @@ async function getGeotabZones() {
 }
 
 async function getHighRiskZones() {
-  const result = await query('SELECT * FROM geotab_zones WHERE (is_high_risk = TRUE OR is_no_go = TRUE) AND is_deleted IS NOT TRUE ORDER BY name');
+  const result = await query('SELECT * FROM geotab_zones WHERE (is_high_risk = TRUE OR is_no_go = TRUE OR is_no_stopping = TRUE) AND is_deleted IS NOT TRUE ORDER BY name');
   return result.rows;
+}
+
+// Explicit no-stopping flag. Set by an operator, never by name; the Geotab sync
+// does not write this column, so it survives every sync.
+async function setZoneNoStopping(zoneId, flag) {
+  const result = await query(
+    'UPDATE geotab_zones SET is_no_stopping = $2 WHERE id = $1 RETURNING id, name, is_no_stopping',
+    [zoneId, !!flag]
+  );
+  return result.rows[0] || null;
 }
 
 // Local zone edits (Stops UI). locally_modified pins the row so the 5-min
@@ -679,7 +691,9 @@ async function updateVehicleStatusDriving(deviceId, data) {
   if (data.isDriving !== undefined) push('is_driving', data.isDriving);
   if (data.drivingSince !== undefined) push('driving_since', data.drivingSince);
   if (data.currentStateDurationMs !== undefined) {
-    params.push(data.currentStateDurationMs);
+    // Input is milliseconds; make_interval(secs => ...) takes seconds.
+    // Passing ms unchanged stored durations 1000x too large.
+    params.push(data.currentStateDurationMs == null ? null : data.currentStateDurationMs / 1000);
     sets.push(`current_state_duration = make_interval(secs => $${idx++})`);
   }
   if (data.maxSpeed !== undefined) push('max_speed_this_session', data.maxSpeed);
@@ -777,6 +791,7 @@ module.exports = {
   upsertGeotabZones,
   getGeotabZones,
   getHighRiskZones,
+  setZoneNoStopping,
   updateGeotabZone,
   createGeotabZone,
   softDeleteGeotabZone,

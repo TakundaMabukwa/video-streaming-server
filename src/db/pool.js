@@ -7,6 +7,16 @@ const pool = new Pool({
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000,
   statement_timeout: 45000,
+  // Client-side bound: a query whose socket died silently rejects instead of
+  // hanging forever (this is what stalls a poll with no log line).
+  query_timeout: 60000,
+  keepAlive: true,
+  keepAliveInitialDelayMillis: 10000,
+});
+
+// Surface idle-client errors instead of letting them crash or vanish.
+pool.on('error', (err) => {
+  console.error('[pool] idle client error:', err.message);
 });
 
 async function query(text, params) {

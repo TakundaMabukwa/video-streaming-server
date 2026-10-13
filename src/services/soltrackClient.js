@@ -106,7 +106,13 @@ function parseEventTime(locTime, fallback = new Date()) {
 const lastUnknownWrite = new Map();
 const UNKNOWN_WRITE_THROTTLE = 30 * 1000;
 
+// DB persistence of unknown regs is OFF by default: it opened one pool
+// connection per distinct unknown reg and exhausted the pool. Set
+// SOLTRACK_PERSIST_UNKNOWN=1 to re-enable. Counts stay in memory (stats.unknown).
+const PERSIST_UNKNOWN = process.env.SOLTRACK_PERSIST_UNKNOWN === '1';
+
 async function logUnknownVehicle(reg, frame) {
+  if (!PERSIST_UNKNOWN) return;
   const key = normalizeReg(reg);
   const now = Date.now();
   const lastWrite = lastUnknownWrite.get(key);

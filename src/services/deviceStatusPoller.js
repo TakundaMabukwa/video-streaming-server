@@ -162,7 +162,7 @@ async function getZones() {
     if (ring.length < 3) continue;
     try {
       const poly = turf.cleanCoords(turf.simplify(turf.polygon([ring]), { tolerance: 0.0001, highQuality: false }));
-      built.push({ id: z.id, name: z.name, is_high_risk: !!z.is_high_risk, is_no_go: !!z.is_no_go, polygon: poly });
+      built.push({ id: z.id, name: z.name, is_high_risk: !!z.is_high_risk, is_no_go: !!z.is_no_go, is_no_stopping: !!z.is_no_stopping, polygon: poly });
     } catch { continue; }
   }
   zonesState = { data: built, ts: Date.now() };
@@ -224,13 +224,17 @@ async function emitDeviceStatusAlert({ deviceId, fleetNumber, licensePlate, sign
   try {
     const ccId = await findVehicleCostCenterId(fleetNumber || deviceId).catch(() => null);
     const def = await isAlertActiveForCC(signalCode, ccId).catch(() => null);
-    if (!def) return null;
+    if (!def) {
+      logDropOnce(`def:${signalCode}:${ccId}`, `[DEVSTATUS] dropped ${signalCode} for ${fleetNumber || deviceId}: no active definition for cost centre ${ccId}`);
+      return null;
+    }
 
     const deviceName = fleetNumber
       ? `${fleetNumber}${licensePlate ? ' - ' + licensePlate : ''}`
       : (licensePlate || deviceId);
 
     if (!(await isRegisteredVehicle({ deviceId, deviceName }))) {
+      logDropOnce(`reg:${deviceId}`, `[DEVSTATUS] dropped alerts for ${deviceName}: not in fleet_vehicles (registry guard)`);
       return null;
     }
 
@@ -345,14 +349,31 @@ async function processZoneForDevice(deviceId, fleetNumber, licensePlate, lat, lo
       insideZones.push(z);
     }
   }
-  if (currentZoneIds.length === 0) return;
-
   const wasInside = entryMap.get(deviceId) || new Set();
 
-  // New entries → zone entry alert (every entry), high-risk + no-go zones.
+  // Exits FIRST and never gated by "inside anything": any open entry whose zone
+  // no longer contains this fix is closed, including when the vehicle is outside
+  // every watched zone. (The old early return skipped this, leaving entries open.)
+  for (const zoneId of wasInside) {
+    if (currentZoneIds.includes(zoneId)) continue;
+    try {
+      await db.query(
+        `UPDATE high_risk_zone_entries SET is_active = FALSE, exit_time = $2
+         WHERE device_id = $1 AND zone_id = $3 AND is_active = TRUE`,
+        [deviceId, nowTs, zoneId]
+      );
+      wasInside.delete(zoneId);
+    } catch (err) {
+      console.error(`[ZONE] exit close failed device=${deviceId} zone=${zoneId}: ${err.message}`);
+    }
+  }
+
+  // New entries → recorded for every watched zone. An entry is only ever
+  // blocked by an entry that is still open for the SAME zone, never by other
+  // zones or by recent alerts.
   for (const z of insideZones) {
     if (wasInside.has(z.id)) continue;
-    const riskLevel = z.is_no_go ? 'CRITICAL' : 'HIGH';
+    const riskLevel = z.is_no_go ? 'CRITICAL' : z.is_high_risk ? 'HIGH' : 'MEDIUM';
     const entry = await db.insertZoneEntry({
       deviceId,
       fleetNumber,
@@ -366,30 +387,22 @@ async function processZoneForDevice(deviceId, fleetNumber, licensePlate, lat, lo
       entryTime: nowTs,
     });
     if (entry && (z.is_high_risk || z.is_no_go)) {
-      const recent = await db.query(
-        `SELECT 1 FROM alert_groups WHERE device_id = $1 AND source_type = 'telematics'
-           AND alarm_type IN ('Entering High Risk Area', 'Entering No-Go Zone')
-           AND last_alert_ts >= NOW() - interval '2 minutes'
-         LIMIT 1`,
-        [deviceId]
-      ).catch(() => ({ rows: [] }));
-      if (recent.rows.length === 0) {
-        const signalCode = z.is_no_go ? NOGO_ENTRY_CODE : ZONE_ENTRY_CODE;
-        const alarmText = z.is_no_go
-          ? `Entering No-Go Zone in zone ${z.name}`
-          : `Entering High Risk Area in zone ${z.name}`;
-        await emitDeviceStatusAlert({
-          deviceId, fleetNumber, licensePlate, signalCode,
-          alarmText,
-          lat, lon, speed, ts: nowTs,
-          extra: { zoneName: z.name },
-        });
-      }
+      const signalCode = z.is_no_go ? NOGO_ENTRY_CODE : ZONE_ENTRY_CODE;
+      const alarmText = z.is_no_go
+        ? `Entering No-Go Zone in zone ${z.name}`
+        : `Entering High Risk Area in zone ${z.name}`;
+      await emitDeviceStatusAlert({
+        deviceId, fleetNumber, licensePlate, signalCode,
+        alarmText,
+        lat, lon, speed, ts: nowTs,
+        extra: { zoneName: z.name },
+      });
     }
   }
 
   // Zone stops: immediate + >1min alerts, persistent tracking. Stop thresholds
   // are per zone type — high-risk zones flag at speed < 5, No-Stopping at < 10.
+  // Zone category is an explicit flag (is_no_stopping), never a name match.
   for (const z of insideZones) {
     const zoneType = z.is_high_risk ? 'high_risk' : 'no_stopping';
     const stopThreshold = zoneType === 'high_risk' ? STOP_SPEED : STOP_SPEED_NO_STOPPING;
@@ -447,25 +460,67 @@ async function processZoneForDevice(deviceId, fleetNumber, licensePlate, lat, lo
     }
   }
 
-  // Zone exits → close high_risk_zone_entries.
-  for (const zoneId of wasInside) {
-    if (!currentZoneIds.includes(zoneId)) {
-      await db.query(
-        `UPDATE high_risk_zone_entries SET is_active = FALSE, exit_time = $2
-         WHERE device_id = $1 AND zone_id = $3 AND is_active = TRUE`,
-        [deviceId, nowTs, zoneId]
-      ).catch(() => {});
-    }
-  }
 }
 
 // ── Main poll ──
 
+// ── Heartbeat + watchdog ──
+// Every poll logs start/end with the last stage reached. The watchdog clears a
+// poll that runs past POLL_STUCK_MS so the next tick can run, and logs the stage
+// it was stuck in. A poll generation id stops a stale poll from clearing the
+// flag of a newer one.
+let pollGen = 0;
+let pollStartedAt = 0;
+let pollStage = 'idle';
+let lastPollEndedAt = 0;
+let lastPollMs = 0;
+let lastPollError = null;
+let watchdogTimer = null;
+const fatigueDropLogged = new Set();
+// Logs a drop reason once per key so gates are visible without flooding the log.
+const dropLogged = new Set();
+function logDropOnce(key, message) {
+  if (dropLogged.has(key)) return;
+  dropLogged.add(key);
+  console.log(message);
+}
+const POLL_STUCK_MS = 60000;
+const WATCHDOG_EVERY_MS = 15000;
+
+function markStage(name) { pollStage = name; }
+
+function getPollHealth() {
+  return {
+    inFlight,
+    stage: pollStage,
+    startedAt: pollStartedAt ? new Date(pollStartedAt).toISOString() : null,
+    runningMs: inFlight ? Date.now() - pollStartedAt : 0,
+    lastEndedAt: lastPollEndedAt ? new Date(lastPollEndedAt).toISOString() : null,
+    lastMs: lastPollMs,
+    lastError: lastPollError,
+  };
+}
+
+function watchdogTick() {
+  if (!inFlight) return;
+  const running = Date.now() - pollStartedAt;
+  if (running > POLL_STUCK_MS) {
+    console.error(`[DEVSTATUS] WATCHDOG: poll#${pollGen} stuck for ${running}ms at stage=${pollStage}; clearing so next tick runs`);
+    lastPollError = `stuck at ${pollStage} for ${running}ms`;
+    inFlight = false;
+    pollGen++; // the stuck poll's finally must not touch the flag
+  }
+}
+
 async function pollDeviceStatus() {
   if (inFlight) return;
   inFlight = true;
+  const gen = ++pollGen;
+  pollStartedAt = Date.now();
+  markStage('auth');
   try {
     const credentials = await geotabAuthenticate();
+    markStage('fetch-status');
     const response = await geotabFetch({
       method: 'Get',
       params: { typeName: 'DeviceStatusInfo', credentials },
@@ -479,9 +534,26 @@ async function pollDeviceStatus() {
     const statuses = response.result || [];
     if (statuses.length === 0) return;
 
+    markStage('load-caches');
     const [fleetSet, gMap, zones] = await Promise.all([getFleetSet(), getGeotabMap(), getZones()]);
 
+    // Open entries whose zone is no longer watched (flag removed or zone deleted)
+    // can never be closed by a fix, so close them here once per poll.
+    markStage('close-unwatched-entries');
+    try {
+      const watchedIds = zones.map((z) => z.id);
+      const closed = await db.query(
+        `UPDATE high_risk_zone_entries SET is_active = FALSE, exit_time = COALESCE(exit_time, NOW())
+         WHERE is_active = TRUE AND NOT (zone_id = ANY($1::text[]))`,
+        [watchedIds]
+      );
+      if (closed.rowCount > 0) console.log(`[ZONE] closed ${closed.rowCount} entries for unwatched zones`);
+    } catch (err) {
+      console.error('[ZONE] unwatched-entry close failed:', err.message);
+    }
+
     // Batch-load active zone entries + active stop events (single queries).
+    markStage('load-entries');
     const activeEntries = await db.query('SELECT device_id, zone_id FROM high_risk_zone_entries WHERE is_active = TRUE')
       .then((r) => r.rows).catch(() => []);
     const activeStops = await db.query('SELECT * FROM zone_stop_events WHERE stop_end IS NULL')
@@ -506,9 +578,11 @@ async function pollDeviceStatus() {
     let staleCount = 0;
     let offlineCount = 0;
 
+    markStage('device-loop');
     for (const d of statuses) {
       const deviceId = d.device?.id;
       if (!deviceId) continue;
+      markStage(`device:${deviceId}`);
       const gDevice = gMap.get(deviceId);
       if (!gDevice) continue; // only known fleet devices
 
@@ -675,13 +749,24 @@ async function pollDeviceStatus() {
         const curMinutes = durMs / 60000;
         for (const t of FATIGUE_THRESHOLDS) {
           if (curMinutes >= t.minutes && !newFatigue.includes(t.signalCode)) {
-            await emitDeviceStatusAlert({
+            const groupRow = await emitDeviceStatusAlert({
               deviceId, fleetNumber, licensePlate, signalCode: t.signalCode,
               alarmText: `${defNameFor(t.signalCode)} exceeded (${t.minutes} min)`,
               lat, lon, speed, ts: dateTime,
               extra: { drivingMinutes: Math.round(curMinutes) },
             });
-            newFatigue.push(t.signalCode);
+            // Record the threshold ONLY once its alert exists. A failed emit (gate,
+            // missing definition, DB error) writes nothing, so it is retried on the
+            // next poll instead of being silently consumed.
+            if (groupRow) {
+              newFatigue.push(t.signalCode);
+            } else {
+              const key = `${deviceId}:${t.signalCode}`;
+              if (!fatigueDropLogged.has(key)) {
+                fatigueDropLogged.add(key);
+                console.log(`[FATIGUE] no alert created for ${fleetNumber || deviceId} ${t.minutes}h threshold (will retry); see the reason logged above`);
+              }
+            }
           }
         }
       }
@@ -768,10 +853,17 @@ async function pollDeviceStatus() {
     }
 
     console.log(`[DEVSTATUS] poll: ${statuses.length} statuses, ${positionUpdated} positions, ${drivingChanged} driving transitions | fresh ${freshCount}, stale ${staleCount}, offline ${offlineCount}`);
+    lastPollError = null;
   } catch (error) {
-    console.error('[DEVSTATUS] poll failed:', error.message);
+    lastPollError = `${pollStage}: ${error.message}`;
+    console.error(`[DEVSTATUS] poll failed at stage=${pollStage}:`, error.message);
   } finally {
-    inFlight = false;
+    if (gen === pollGen) {
+      inFlight = false;
+      lastPollEndedAt = Date.now();
+      lastPollMs = lastPollEndedAt - pollStartedAt;
+      console.log(`[DEVSTATUS] poll#${gen} end stage=${pollStage} ms=${lastPollMs}`);
+    }
   }
 }
 
@@ -798,9 +890,13 @@ function setWsBroadcast(fn) {
 
 function startPoller(intervalMs = POLL_INTERVAL_MS) {
   if (pollTimer) clearInterval(pollTimer);
-  pollTimer = setInterval(() => { pollDeviceStatus().catch(() => {}); }, intervalMs);
-  pollDeviceStatus().catch(() => {});
-  console.log(`[DEVSTATUS] poller started (every ${intervalMs / 1000}s)`);
+  if (watchdogTimer) clearInterval(watchdogTimer);
+  pollTimer = setInterval(() => {
+    pollDeviceStatus().catch((err) => console.error('[DEVSTATUS] tick error:', err.message));
+  }, intervalMs);
+  watchdogTimer = setInterval(watchdogTick, WATCHDOG_EVERY_MS);
+  pollDeviceStatus().catch((err) => console.error('[DEVSTATUS] tick error:', err.message));
+  console.log(`[DEVSTATUS] poller started (every ${intervalMs / 1000}s, watchdog ${POLL_STUCK_MS / 1000}s)`);
 }
 
 function stopPoller() {
@@ -808,10 +904,14 @@ function stopPoller() {
     clearInterval(pollTimer);
     pollTimer = null;
   }
+  if (watchdogTimer) {
+    clearInterval(watchdogTimer);
+    watchdogTimer = null;
+  }
 }
 
 async function runOnce() {
   await pollDeviceStatus();
 }
 
-module.exports = { startPoller, stopPoller, runOnce, setWsBroadcast, pollDeviceStatus, parseGeotabDurationMs, invalidateZonesCache };
+module.exports = { startPoller, stopPoller, runOnce, setWsBroadcast, pollDeviceStatus, parseGeotabDurationMs, invalidateZonesCache, getPollHealth };
