@@ -440,7 +440,7 @@ async function processZoneForDevice(deviceId, fleetNumber, licensePlate, lat, lo
             lat, lon, speed, ts: nowTs,
             extra: { 
               zoneName: z.name, 
-              zoneType: z.is_no_go ? 'no_go' : z.is_high_risk ? 'high_risk' : 'no_stopping',
+              zoneType: z.is_no_go ? 'no_go' : z.is_no_stopping ? 'no_stopping' : 'high_risk',
               etaSeconds: Math.round(etaSeconds),
               distanceMeters: Math.round(distanceToEntry * 1000),
               bearing: bearing.toFixed(1)
@@ -491,31 +491,28 @@ async function processZoneForDevice(deviceId, fleetNumber, licensePlate, lat, lo
       entryTime: nowTs,
     });
     if (entry && (z.is_high_risk || z.is_no_go || z.is_no_stopping)) {
-      let signalCode, alarmText;
-      if (z.is_no_go) {
-        signalCode = NOGO_ENTRY_CODE;
-        alarmText = `Entering No-Go Zone in zone ${z.name}`;
-      } else if (z.is_no_stopping) {
-        signalCode = NO_STOP_ENTRY_CODE;
-        alarmText = `Entering No Stopping Zone in zone ${z.name}`;
-      } else {
-        signalCode = ZONE_ENTRY_CODE;
-        alarmText = `Entering High Risk Area in zone ${z.name}`;
-      }
+      // Determine zone type with priority: no_go > no_stopping > high_risk
+      const zoneType = z.is_no_go ? 'no_go' : z.is_no_stopping ? 'no_stopping' : 'high_risk';
+      const zoneConfig = {
+        no_go: { code: NOGO_ENTRY_CODE, text: 'No-Go Zone' },
+        no_stopping: { code: NO_STOP_ENTRY_CODE, text: 'No Stopping Zone' },
+        high_risk: { code: ZONE_ENTRY_CODE, text: 'High Risk Area' },
+      }[zoneType];
       await emitDeviceStatusAlert({
-        deviceId, fleetNumber, licensePlate, signalCode,
-        alarmText,
+        deviceId, fleetNumber, licensePlate, signalCode: zoneConfig.code,
+        alarmText: `Entering ${zoneConfig.text} in zone ${z.name}`,
         lat, lon, speed, ts: nowTs,
-        extra: { zoneName: z.name },
+        extra: { zoneName: z.name, zoneType },
       });
     }
   }
 
   // Zone stops: immediate + >1min alerts, persistent tracking. Stop thresholds
-  // are per zone type — high-risk zones flag at speed < 5, No-Stopping at < 10.
+  // are per zone type — high-risk/no-go zones flag at speed < 5, No-Stopping at < 10.
   // Zone category is an explicit flag (is_no_stopping), never a name match.
   for (const z of insideZones) {
-    const zoneType = z.is_high_risk ? 'high_risk' : 'no_stopping';
+    // Zone type for stop logic: no_go and high_risk use high_risk threshold; no_stopping uses its own
+    const zoneType = z.is_no_stopping ? 'no_stopping' : 'high_risk';
     const stopThreshold = zoneType === 'high_risk' ? STOP_SPEED : STOP_SPEED_NO_STOPPING;
     const isStopped = Number(speed) < stopThreshold;
     const stopKey = `${deviceId}:${z.id}`;

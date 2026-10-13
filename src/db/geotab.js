@@ -431,10 +431,17 @@ async function upsertGeotabZones(zones) {
   if (!zones || zones.length === 0) return;
   for (const zone of zones) {
     const name = (zone.name || '').toUpperCase();
-    const isHighRisk = name.includes('HIGH RISK');
-    // No-go tokens: NO GO, DIESEL, HIJACK, NO STOP (NO STOP also sets is_no_stopping)
-    const isNoGo = ['NO GO', 'NO STOP', 'DIESEL', 'HIJACK'].some((token) => name.includes(token));
-    const isNoStopping = name.includes('NO STOP');
+    
+    // Zone type determination — mutually exclusive categories based on name tokens
+    // Priority order: NO STOP > NO GO > HIGH RISK
+    const hasNoStop = name.includes('NO STOP');
+    const hasNoGo = ['NO GO', 'DIESEL', 'HIJACK'].some((token) => name.includes(token));
+    const hasHighRisk = name.includes('HIGH RISK');
+    
+    // Mutually exclusive: NO STOP zones are only no_stopping, not no_go
+    const isNoStopping = hasNoStop;
+    const isNoGo = !hasNoStop && hasNoGo;
+    const isHighRisk = !hasNoStop && !hasNoGo && hasHighRisk;
     let points = zone.points || [];
     if (typeof points === 'string') {
       try { points = JSON.parse(points); } catch { points = []; }
