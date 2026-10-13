@@ -626,6 +626,10 @@ const MIGRATIONS_SQL = `
 
   -- Open-board list: WHERE resolved=FALSE AND false_alert=FALSE ORDER BY last_alert_ts DESC
   CREATE INDEX IF NOT EXISTS idx_ag_open_list ON alert_groups(resolved, false_alert, last_alert_ts DESC) WHERE resolved = FALSE AND false_alert = FALSE;
+  -- Per-vehicle first paint: DISTINCT ON (device_id) ... ORDER BY device_id, last_alert_ts DESC
+  CREATE INDEX IF NOT EXISTS idx_ag_per_vehicle ON alert_groups(device_id, last_alert_ts DESC) WHERE resolved = FALSE AND false_alert = FALSE;
+  -- Cursor-paginated hydration: keyset on (last_alert_ts DESC, id DESC)
+  CREATE INDEX IF NOT EXISTS idx_ag_open_cursor ON alert_groups(last_alert_ts DESC, id DESC) WHERE resolved = FALSE AND false_alert = FALSE;
   -- Delta polling: changed-since cursor over the open set
   CREATE INDEX IF NOT EXISTS idx_ag_open_updated ON alert_groups(updated_at) WHERE resolved = FALSE AND false_alert = FALSE;
   -- Delta tombstones: resolved-since cursor

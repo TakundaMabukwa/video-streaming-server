@@ -20,12 +20,13 @@ function setWsBroadcast(fn) { wsBroadcast = fn; }
  */
 async function buildStrictAlertFilter(deviceCC) {
   const ccIds = [...new Set([...deviceCC.values()])];
-  const perCCMaps = await getPerCCSeverityMaps(ccIds);
-  const globalTelNameMap = await getTelematicsNameSeverityMap([]).catch(() => ({}));
+  const [perCCMaps, globalTelNameMap, ...perCCNameMaps] = await Promise.all([
+    getPerCCSeverityMaps(ccIds),
+    getTelematicsNameSeverityMap([]).catch(() => ({})),
+    ...ccIds.map((cc) => getTelematicsNameSeverityMap([cc]).catch(() => ({}))),
+  ]);
   const telNameMapByCC = {};
-  for (const cc of ccIds) {
-    telNameMapByCC[cc] = await getTelematicsNameSeverityMap([cc]).catch(() => ({}));
-  }
+  ccIds.forEach((cc, i) => { telNameMapByCC[cc] = perCCNameMaps[i] || {}; });
 
   const passes = (g) => {
     if (String(g.alarm_type || '').startsWith('NCR:')) return true;
@@ -232,6 +233,30 @@ async function getActiveAlerts(req, res) {
       return res.json({ success: true, changed, removed: removedIds, asOf, source: 'eps-db' });
     }
 
+    // Cursor-paginated hydration: ?cursorTs=ISO&cursorId=N&limit=10000.
+    // Lets the dashboard hydrate 65k rows in background chunks instead of one
+    // unbounded flush (30s socket timeout + gzip CPU spike). Keep-alive for compat:
+    // no cursor => legacy unbounded behavior.
+    const cursorTsRaw = req.query.cursorTs ? String(req.query.cursorTs).trim() : '';
+    const cursorTs = cursorTsRaw && !Number.isNaN(Date.parse(cursorTsRaw)) ? new Date(cursorTsRaw).toISOString() : null;
+    const cursorIdRaw = req.query.cursorId ? String(req.query.cursorId).trim() : '';
+    const cursorId = cursorIdRaw !== '' && Number.isFinite(Number(cursorIdRaw)) ? Number(cursorIdRaw) : null;
+    if (cursorTs || cursorId != null || req.query.limit != null) {
+      const rawLimit = req.query.limit != null ? parseLimit(req.query.limit, 10000) : 10000;
+      const pageLimit = rawLimit == null ? 10000 : rawLimit; // explicit all => one big page (compat)
+      const page = await db.getActiveAlertGroupsPage({ limit: pageLimit, cursorTs, cursorId });
+      const { deviceCC } = forceAll ? { deviceCC: new Map() } : await batchResolveDeviceCC(page.rows);
+      const filter = await buildStrictAlertFilter(deviceCC);
+      const alwaysPass = { ...filter, passes: () => true };
+      const alerts = groupsToAlerts(page.rows, forceAll ? alwaysPass : filter);
+      const pageInfo = { hasMore: page.hasMore, nextCursorTs: page.nextCursorTs, nextCursorId: page.nextCursorId };
+      if (compact) {
+        const packed = db.packAlerts(alerts);
+        return res.json({ success: true, columns: packed.columns, rows: packed.rows, count: alerts.length, page: pageInfo, asOf: new Date().toISOString(), source: 'eps-db' });
+      }
+      return res.json({ success: true, alerts, count: alerts.length, page: pageInfo, asOf: new Date().toISOString(), source: 'eps-db' });
+    }
+
     const limit = parseLimit(req.query.limit, 2000);
     const groups = await db.getActiveAlertGroupsWithMedia({ limit });
 
@@ -248,6 +273,27 @@ async function getActiveAlerts(req, res) {
       return res.json({ success: true, columns: packed.columns, rows: packed.rows, count: alerts.length, total: alerts.length, asOf: new Date().toISOString(), source: 'eps-db' });
     }
     res.json({ success: true, alerts, count: alerts.length, total: alerts.length, source: 'eps-db' });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+}
+
+// Fast first paint: latest open group per vehicle. Small payload (one row per
+// device) so the board renders instantly; the full 65k set hydrates after.
+async function getActivePerVehicleAlerts(req, res) {
+  try {
+    const forceAll = req.query.includeAll === '1' || req.query.includeAll === 'true';
+    const compact = req.query.compact === '1' || req.query.compact === 'true';
+    const groups = await db.getActivePerVehicleGroups();
+    const { deviceCC } = forceAll ? { deviceCC: new Map() } : await batchResolveDeviceCC(groups);
+    const filter = await buildStrictAlertFilter(deviceCC);
+    const alwaysPass = { ...filter, passes: () => true };
+    const alerts = groupsToAlerts(groups, forceAll ? alwaysPass : filter);
+    if (compact) {
+      const packed = db.packAlerts(alerts);
+      return res.json({ success: true, columns: packed.columns, rows: packed.rows, count: alerts.length, total: alerts.length, asOf: new Date().toISOString(), source: 'eps-db', view: 'per-vehicle' });
+    }
+    res.json({ success: true, alerts, count: alerts.length, total: alerts.length, asOf: new Date().toISOString(), source: 'eps-db', view: 'per-vehicle' });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -1249,6 +1295,7 @@ module.exports = {
   getAlertTypes,
   getActiveAlerts,
   getActiveAlertsAll,
+  getActivePerVehicleAlerts,
   getActiveAlertCounts,
   getResolvedAlerts,
   listAlerts,

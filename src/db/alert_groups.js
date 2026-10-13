@@ -236,6 +236,66 @@ async function getActiveAlertGroupsAll({ limit = 2000 } = {}) {
   return result.rows;
 }
 
+// Fast first paint: latest open group per vehicle (device_id). Small result
+// (one row per device, not per group) so the board can render instantly and
+// hydrate the full 65k set in the background. Uses DISTINCT ON which is
+// backed by idx_ag_per_vehicle (device_id, last_alert_ts DESC).
+async function getActivePerVehicleGroups() {
+  const result = await query(
+    `SELECT DISTINCT ON (g.device_id) ${BOARD_COLUMNS}
+     FROM alert_groups g
+     WHERE g.resolved = FALSE AND g.false_alert = FALSE
+       AND g.device_id IS NOT NULL AND g.device_id <> ''
+     ORDER BY g.device_id, g.last_alert_ts DESC NULLS LAST`,
+    []
+  );
+  // Board expects recency order, not device_id order.
+  result.rows.sort((a, b) => {
+    const ta = a.last_alert_ts ? new Date(a.last_alert_ts).getTime() : 0;
+    const tb = b.last_alert_ts ? new Date(b.last_alert_ts).getTime() : 0;
+    return tb - ta;
+  });
+  return result.rows;
+}
+
+// Cursor-paginated full-board hydration: avoids one unbounded 65k-row flush
+// (30s socket timeout + gzip CPU spike). Keyset on (last_alert_ts, id).
+// cursorTs ISO string, cursorId integer; both null on first page.
+async function getActiveAlertGroupsPage({ limit = 10000, cursorTs = null, cursorId = null } = {}) {
+  const n = Number.isFinite(Number(limit)) && Number(limit) > 0 ? Math.min(Math.floor(Number(limit)), 20000) : 10000;
+  const params = [];
+  let cursorSql = '';
+  if (cursorTs) {
+    params.push(cursorTs);
+    if (cursorId != null && Number.isFinite(Number(cursorId))) {
+      params.push(Number(cursorId));
+      cursorSql = `AND ((g.last_alert_ts < $1::timestamptz) OR (g.last_alert_ts = $1::timestamptz AND g.id < $2))`;
+    } else {
+      cursorSql = `AND (g.last_alert_ts < $1::timestamptz)`;
+    }
+  }
+  params.push(n + 1); // fetch one extra to detect hasMore
+  const limitIdx = params.length;
+  const result = await query(
+    `SELECT ${BOARD_COLUMNS}
+     FROM alert_groups g
+     WHERE g.resolved = FALSE AND g.false_alert = FALSE
+     ${cursorSql}
+     ORDER BY g.last_alert_ts DESC NULLS LAST, g.id DESC
+     LIMIT $${limitIdx}`,
+    params
+  );
+  const hasMore = result.rows.length > n;
+  const rows = hasMore ? result.rows.slice(0, n) : result.rows;
+  const last = rows[rows.length - 1];
+  return {
+    rows,
+    hasMore,
+    nextCursorTs: hasMore && last ? last.last_alert_ts : null,
+    nextCursorId: hasMore && last ? last.id : null,
+  };
+}
+
 // Minimal rows for the fast header-counts endpoint. Same open set as the
 // board list (resolved=FALSE AND false_alert=FALSE) but only the columns the
 // CC filter + escalation math need — no payload, no transform.
@@ -528,6 +588,8 @@ module.exports = {
   getAlertGroupByAlertId,
   getActiveAlertGroupsAll,
   getActiveAlertGroupsWithMedia,
+  getActivePerVehicleGroups,
+  getActiveAlertGroupsPage,
   getResolvedAlertGroupsWithMedia,
   getResolvedAlertGroupCount,
   resolveAlertGroup,
