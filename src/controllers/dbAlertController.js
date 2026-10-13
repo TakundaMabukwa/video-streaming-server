@@ -243,17 +243,21 @@ async function getResolvedAlerts(req, res) {
 }
 
 // Fast header counts for the open board — severity buckets + total, no rows.
-// Same open set, same CC filter, and same escalation math as the board list,
-// so the header numbers match the lanes exactly once both arrive.
+//
+// Mirrors the board exactly: one card per device (latest group wins, lane
+// lifted to the device's highest open severity), same CC filter, same
+// escalation math as transformDbAlert. Header numbers therefore match the
+// pre-existing client-computed cards (per-device), NOT the raw group total.
+const LEVEL_RANK = { low: 1, medium: 2, high: 3, critical: 4 };
+const LEVEL_BY_RANK = ['low', 'low', 'medium', 'high', 'critical'];
 async function getActiveAlertCounts(req, res) {
   try {
     const rows = await db.getActiveAlertCountRows();
     const { deviceCC } = await batchResolveDeviceCC(rows);
     const { passes, severityFor } = await buildStrictAlertFilter(deviceCC);
-    const bySeverity = { critical: 0, high: 0, medium: 0, low: 0 };
-    let total = 0;
+    const maxRankByDevice = new Map();
     for (const g of rows) {
-      if (!passes(g)) continue;
+      if (!g.device_id || !passes(g)) continue;
       // Mirror transformDbAlert: active follow-up within 15 min forces low.
       let level;
       if (g.follow_up && g.follow_up_at && (Date.now() - new Date(g.follow_up_at).getTime()) < 15 * 60 * 1000) {
@@ -262,11 +266,15 @@ async function getActiveAlertCounts(req, res) {
         const base = resolveBaseSeverity(g.alarm_type, severityFor(g));
         level = String(escalateSeverity(base, g.count) || 'medium').toLowerCase();
       }
-      if (bySeverity[level] === undefined) bySeverity[level] = 0;
-      bySeverity[level] += 1;
-      total += 1;
+      const rank = LEVEL_RANK[level] ?? 1;
+      if (rank > (maxRankByDevice.get(g.device_id) ?? 0)) maxRankByDevice.set(g.device_id, rank);
     }
-    res.json({ success: true, bySeverity, total, source: 'eps-db' });
+    const bySeverity = { critical: 0, high: 0, medium: 0, low: 0 };
+    for (const rank of maxRankByDevice.values()) {
+      const level = LEVEL_BY_RANK[rank] || 'low';
+      bySeverity[level] += 1;
+    }
+    res.json({ success: true, bySeverity, total: maxRankByDevice.size, source: 'eps-db' });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }

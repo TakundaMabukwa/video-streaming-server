@@ -241,7 +241,7 @@ async function getActiveAlertGroupsAll({ limit = 2000 } = {}) {
 // CC filter + escalation math need — no payload, no transform.
 async function getActiveAlertCountRows() {
   const result = await query(
-    `SELECT device_id, device_name, alarm_type, source_type, severity, count, follow_up, follow_up_at
+    `SELECT device_id, device_name, alarm_type, source_type, severity, count, follow_up, follow_up_at, last_alert_ts
      FROM alert_groups
      WHERE resolved = FALSE AND false_alert = FALSE`
   );
