@@ -285,6 +285,7 @@ async function emitDeviceStatusAlert({ deviceId, fleetNumber, licensePlate, sign
       alarmTs,
       lat: lat ?? null,
       lon: lon ?? null,
+      speed: speed ?? null,
       sourceType: 'telematics',
       severity: String(def.severity || 'MEDIUM').toLowerCase(),
     });

@@ -101,11 +101,13 @@ function transformDbAlert(record, severityMap) {
 
   const screenshotUrls = screenshotEntries.map((m) => m.url).filter(Boolean);
 
+  const speedNum = record.speed == null || record.speed === '' ? null : Number(record.speed);
   return {
     id,
     last_alert_id: record.last_alert_id || null,
     alarmId: record.last_alert_id || null,
     alert_type: alarmType,
+    speed: Number.isFinite(speedNum) ? speedNum : null,
     type: alarmType,
     priority: effectiveSeverity,
     severity: effectiveSeverity,
@@ -150,6 +152,7 @@ function transformDbAlert(record, severityMap) {
         vehicleId: deviceId,
         plateNumber: record.device_name,
       },
+      ...(Number.isFinite(speedNum) ? { speed: speedNum } : {}),
     },
   };
 }

@@ -1,6 +1,6 @@
 const express = require('express');
 const { getAlertTypes, getAlarmPage, getAlertFeed, getAlarmFilesById, getAlarmFilesByPage, getDevices } = require('../controllers/alertController');
-const { getActiveAlerts, getActiveAlertsAll, getResolvedAlerts, getResolvedAlertCount, getAlertById, getAlertScreenshots, getAlertMedia, acknowledgeAlert, resolveAlert, escalateAlert, markFalseAlert, uploadDocumentToAlert, followUpAlert, clearFollowUp, getAlertHistory, listAlerts } = require('../controllers/dbAlertController');
+const { getActiveAlerts, getActiveAlertsAll, getActiveAlertCounts, getResolvedAlerts, getResolvedAlertCount, getAlertById, getAlertScreenshots, getAlertMedia, acknowledgeAlert, resolveAlert, escalateAlert, markFalseAlert, uploadDocumentToAlert, followUpAlert, clearFollowUp, getAlertHistory, listAlerts } = require('../controllers/dbAlertController');
 const db = require('../db');
 const apiClient = require('../helpers/apiClient');
 
@@ -17,6 +17,7 @@ router.get('/devices', getDevices);
 
 router.get('/active', getActiveAlerts);
 router.get('/active-all', getActiveAlertsAll);
+router.get('/active-counts', getActiveAlertCounts);
 router.get('/resolved', getResolvedAlerts);
 router.get('/resolved-count', getResolvedAlertCount);
 router.get('/history', getAlertHistory);

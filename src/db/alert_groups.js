@@ -1,7 +1,7 @@
 const { query } = require('./pool');
 const { isRegisteredVehicle } = require('../services/fleetRegistryGuard');
 
-async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, alertId, alarmTs, lat, lon, sourceType = 'video', severity }) {
+async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, alertId, alarmTs, lat, lon, speed, sourceType = 'video', severity }) {
   // Only vehicles in fleet_vehicles may raise alerts.
   if (!(await isRegisteredVehicle({ deviceId, deviceName }))) return null;
 
@@ -27,12 +27,13 @@ async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, al
          device_name = COALESCE(NULLIF($3, ''), alert_groups.device_name),
          lat = COALESCE($4, alert_groups.lat),
          lon = COALESCE($5, alert_groups.lon),
-         alarm_text = COALESCE(NULLIF($6, ''), alert_groups.alarm_text),
-         severity = COALESCE(NULLIF($7, ''), alert_groups.severity),
+         speed = COALESCE($6, alert_groups.speed),
+         alarm_text = COALESCE(NULLIF($7, ''), alert_groups.alarm_text),
+         severity = COALESCE(NULLIF($8, ''), alert_groups.severity),
          updated_at = NOW()
-       WHERE group_key = $8
+       WHERE group_key = $9
        RETURNING id, group_key, count, alarm_type`,
-      [alertId, alarmTs, deviceName, lat, lon, alarmText, severity, groupKey]
+      [alertId, alarmTs, deviceName, lat, lon, speed ?? null, alarmText, severity, groupKey]
     );
     return result.rows[0];
   }
@@ -49,10 +50,10 @@ async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, al
   }
 
   const result = await query(
-    `INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon, source_type, severity)
-     VALUES ($1, $2, $3, $4, $5, 1, $6, $7, $8, $9, $10, $11)
+    `INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon, speed, source_type, severity)
+     VALUES ($1, $2, $3, $4, $5, 1, $6, $7, $8, $9, $10, $11, $12)
      RETURNING id, group_key, count, alarm_type`,
-    [groupKey, deviceId, deviceName, alarmType, alarmText, alertId, alarmTs || null, lat, lon, sourceType, severity]
+    [groupKey, deviceId, deviceName, alarmType, alarmText, alertId, alarmTs || null, lat, lon, speed ?? null, sourceType, severity]
   );
   return result.rows[0];
 }
@@ -72,17 +73,17 @@ async function batchUpsertAlertGroups(groups) {
 
   const params = [];
   const placeholders = entries.map((g, i) => {
-    const base = i * 10;
+    const base = i * 11;
     params.push(
       `${g.deviceId}:${g.alarmType}`.toLowerCase(),
       g.deviceId, g.deviceName || null, g.alarmType, g.alarmText || null,
-      g.alertId, g.alarmTs || null, g.lat || null, g.lon || null, g.severity || null
+      g.alertId, g.alarmTs || null, g.lat || null, g.lon || null, g.speed ?? null, g.severity || null
     );
-    return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, 1, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}, $${base + 10})`;
+    return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, 1, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}, $${base + 10}, $${base + 11})`;
   }).join(',');
   // On conflict only bump ACTIVE groups. Resolved groups stay closed (Resolve sticks).
   const result = await query(
-    `INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon, severity)
+    `INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon, speed, severity)
      VALUES ${placeholders}
      ON CONFLICT (group_key) DO UPDATE SET
        count = alert_groups.count + 1,
@@ -91,6 +92,7 @@ async function batchUpsertAlertGroups(groups) {
        device_name = COALESCE(NULLIF(EXCLUDED.device_name, ''), alert_groups.device_name),
        lat = COALESCE(EXCLUDED.lat, alert_groups.lat),
        lon = COALESCE(EXCLUDED.lon, alert_groups.lon),
+       speed = COALESCE(EXCLUDED.speed, alert_groups.speed),
        alarm_text = COALESCE(NULLIF(EXCLUDED.alarm_text, ''), alert_groups.alarm_text),
        severity = COALESCE(NULLIF(EXCLUDED.severity, ''), alert_groups.severity),
        updated_at = NOW()
@@ -131,12 +133,13 @@ async function batchUpsertAlertGroups(groups) {
              device_name = COALESCE(NULLIF($3, ''), alert_groups.device_name),
              lat = COALESCE($4, alert_groups.lat),
              lon = COALESCE($5, alert_groups.lon),
-             alarm_text = COALESCE(NULLIF($6, ''), alert_groups.alarm_text),
-             severity = COALESCE(NULLIF($7, ''), alert_groups.severity),
+             speed = COALESCE($6, alert_groups.speed),
+             alarm_text = COALESCE(NULLIF($7, ''), alert_groups.alarm_text),
+             severity = COALESCE(NULLIF($8, ''), alert_groups.severity),
              updated_at = NOW()
-           WHERE group_key = $8 AND resolved = FALSE
+           WHERE group_key = $9 AND resolved = FALSE
            RETURNING id, group_key, count, alarm_type`,
-          [g.alertId, g.alarmTs || null, g.deviceName || null, g.lat || null, g.lon || null, g.alarmText || null, g.severity || null, existing.rows[0].group_key]
+          [g.alertId, g.alarmTs || null, g.deviceName || null, g.lat || null, g.lon || null, g.speed ?? null, g.alarmText || null, g.severity || null, existing.rows[0].group_key]
         );
         if (bumped.rows.length > 0) {
           result.rows.push(bumped.rows[0]);
@@ -146,11 +149,11 @@ async function batchUpsertAlertGroups(groups) {
       const freshKey = `${g.deviceId}:${g.alarmType}`.toLowerCase() + ':' + stamp +
         `${g.alertId ? '-' + String(g.alertId).slice(-6) : ''}-${Math.random().toString(36).slice(2, 7)}`;
       const inserted = await query(
-        `INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon, source_type, severity)
-         VALUES ($1, $2, $3, $4, $5, 1, $6, $7, $8, $9, $10, $11)
+        `INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon, speed, source_type, severity)
+         VALUES ($1, $2, $3, $4, $5, 1, $6, $7, $8, $9, $10, $11, $12)
          RETURNING id, group_key, count, alarm_type`,
         [freshKey, g.deviceId, g.deviceName || null, g.alarmType, g.alarmText || null,
-         g.alertId, g.alarmTs || null, g.lat || null, g.lon || null, g.sourceType || 'video', g.severity || null]
+         g.alertId, g.alarmTs || null, g.lat || null, g.lon || null, g.speed ?? null, g.sourceType || 'video', g.severity || null]
       );
       if (inserted.rows.length > 0) result.rows.push(inserted.rows[0]);
     }
@@ -199,12 +202,20 @@ function isBounded(limit) {
   return Number.isFinite(limit) && limit > 0;
 }
 
+// Light board columns: everything the open board and cards need, nothing
+// heavy (no documents JSON blobs beyond what cards use, no media joins).
+const BOARD_COLUMNS = `g.id, g.group_key, g.device_id, g.device_name, g.alarm_type,
+  g.alarm_text, g.count, g.last_alert_id, g.last_alert_ts, g.lat, g.lon, g.speed,
+  g.status, g.resolved, g.false_alert, g.resolved_at, g.resolved_by,
+  g.source_type, g.severity, g.follow_up, g.follow_up_at, g.original_severity,
+  g.created_at, g.updated_at`;
+
 async function getActiveAlertGroupsWithMedia({ limit = 2000 } = {}) {
   const bounded = isBounded(limit);
   const result = await query(
-    `SELECT g.*
+    `SELECT ${BOARD_COLUMNS}
      FROM alert_groups g
-     WHERE g.resolved = FALSE
+     WHERE g.resolved = FALSE AND g.false_alert = FALSE
      ORDER BY g.last_alert_ts DESC NULLS LAST
      ${bounded ? 'LIMIT $1' : ''}`,
     bounded ? [limit] : []
@@ -215,12 +226,24 @@ async function getActiveAlertGroupsWithMedia({ limit = 2000 } = {}) {
 async function getActiveAlertGroupsAll({ limit = 2000 } = {}) {
   const bounded = isBounded(limit);
   const result = await query(
-    `SELECT g.*
+    `SELECT ${BOARD_COLUMNS}
      FROM alert_groups g
-     WHERE g.resolved = FALSE
+     WHERE g.resolved = FALSE AND g.false_alert = FALSE
      ORDER BY g.last_alert_ts DESC NULLS LAST
      ${bounded ? 'LIMIT $1' : ''}`,
     bounded ? [limit] : []
+  );
+  return result.rows;
+}
+
+// Minimal rows for the fast header-counts endpoint. Same open set as the
+// board list (resolved=FALSE AND false_alert=FALSE) but only the columns the
+// CC filter + escalation math need — no payload, no transform.
+async function getActiveAlertCountRows() {
+  const result = await query(
+    `SELECT device_id, device_name, alarm_type, source_type, severity, count, follow_up, follow_up_at
+     FROM alert_groups
+     WHERE resolved = FALSE AND false_alert = FALSE`
   );
   return result.rows;
 }
@@ -275,8 +298,19 @@ async function listAlertGroups({ status = '', limit = null, offset = 0 } = {}) {
   return result.rows.map(r => ({ ...r, media: (r.media || []).filter(m => m.id !== null) }));
 }
 
-async function getResolvedAlertGroupsWithMedia({ limit = 2000 } = {}) {
+async function getResolvedAlertGroupsWithMedia({ limit = 2000, from = null, to = null } = {}) {
   const bounded = isBounded(limit);
+  const params = [];
+  const where = ['g.resolved = TRUE'];
+  if (from) {
+    params.push(from);
+    where.push(`COALESCE(g.updated_at, g.last_alert_ts) >= $${params.length}::timestamptz`);
+  }
+  if (to) {
+    params.push(to);
+    where.push(`COALESCE(g.updated_at, g.last_alert_ts) <= $${params.length}::timestamptz`);
+  }
+  if (bounded) params.push(limit);
   const result = await query(
     `SELECT g.*, COALESCE(a.documents, g.documents) AS documents,
             jsonb_agg(DISTINCT jsonb_build_object(
@@ -286,11 +320,11 @@ async function getResolvedAlertGroupsWithMedia({ limit = 2000 } = {}) {
      FROM alert_groups g
      LEFT JOIN alerts a ON a.id = g.last_alert_id
      LEFT JOIN alert_media m ON m.alert_id = g.last_alert_id
-     WHERE g.resolved = TRUE
+     WHERE ${where.join(' AND ')}
      GROUP BY g.id, a.documents
      ORDER BY g.updated_at DESC NULLS LAST, g.last_alert_ts DESC NULLS LAST
-     ${bounded ? 'LIMIT $1' : ''}`,
-    bounded ? [limit] : []
+     ${bounded ? `LIMIT $${params.length}` : ''}`,
+    params
   );
   return result.rows.map(r => ({
     ...r,
@@ -444,6 +478,7 @@ module.exports = {
   upsertAlertGroup,
   batchUpsertAlertGroups,
   getActiveAlertGroups,
+  getActiveAlertCountRows,
   getAlertGroupById,
   getAlertGroupByKey,
   getAlertGroupByAlertId,

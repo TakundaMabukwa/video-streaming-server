@@ -952,6 +952,7 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
         alarmTs: eventTime,
         lat: evtLat,
         lon: evtLon,
+        speed: evtSpeed ?? null,
         sourceType: 'telematics',
         severity: String(matchedDef.severity || 'MEDIUM').toLowerCase(),
       });
@@ -1312,6 +1313,7 @@ async function createZoneEntryAlert({ deviceId, fleetNumber, licensePlate, lat, 
       alarmTs: entryTime,
       lat,
       lon,
+      speed: speed ?? null,
       sourceType: 'telematics',
       severity: String(matchedDef.severity || 'MEDIUM').toLowerCase(),
     });

@@ -207,6 +207,7 @@ async function handleFrame(frame) {
           alarmTs: eventTime,
           lat: frame.lat,
           lon: frame.lon,
+          speed: speed ?? null,
           sourceType: 'telematics',
           severity: String(matchedDef.severity || 'MEDIUM').toLowerCase(),
         });

@@ -377,11 +377,12 @@ router.get('/zone-entries-active', async (req, res) => {
 router.get('/log-records/:deviceId', async (req, res) => {
   try {
     const { deviceId } = req.params;
-    const { from, to } = req.query;
+    const { from, to, limit } = req.query;
     if (!from || !to) {
       return res.status(400).json({ success: false, message: 'from and to query params required' });
     }
-    const records = await db.getVehicleLogRecords(deviceId, from, to);
+    // Capped (default 300) — the map only needs a ±15min path polyline.
+    const records = await db.getVehicleLogRecords(deviceId, from, to, limit ?? 300);
     res.json({ success: true, data: records, count: records.length });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });

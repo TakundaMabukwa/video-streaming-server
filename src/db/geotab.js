@@ -553,10 +553,11 @@ async function upsertVehicleLogRecords(records) {
   }
 }
 
-async function getVehicleLogRecords(deviceId, from, to) {
+async function getVehicleLogRecords(deviceId, from, to, limit = 300) {
+  const n = Number.isFinite(Number(limit)) && Number(limit) > 0 ? Math.min(Math.floor(Number(limit)), 2000) : 300;
   const result = await query(
-    'SELECT * FROM vehicle_log_records WHERE device_id = $1 AND record_time BETWEEN $2 AND $3 ORDER BY record_time ASC',
-    [deviceId, from, to]
+    'SELECT * FROM vehicle_log_records WHERE device_id = $1 AND record_time BETWEEN $2 AND $3 ORDER BY record_time ASC LIMIT $4',
+    [deviceId, from, to, n]
   );
   return result.rows;
 }

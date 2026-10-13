@@ -2,7 +2,7 @@ const db = require('../db');
 const syncService = require('../services/syncService');
 const { sendSuccess, sendError } = require('../helpers/response');
 const { uploadDocument } = require('../helpers/storage');
-const { transformDbAlert } = require('../helpers/transform');
+const { transformDbAlert, resolveBaseSeverity, escalateSeverity } = require('../helpers/transform');
 const { getTelematicsNameSeverityMap, getPerCCSeverityMaps } = require('../db/alert_definitions');
 const { findVehicleCostCenterId, resolveFleetNumber } = require('../services/costCenterLookup');
 const { applyNcrDeduction } = require('../services/driverScoringService');
@@ -225,15 +225,48 @@ async function getResolvedAlerts(req, res) {
   try {
     // Closed history stays capped by default (12k+ rows); callers must ask
     // explicitly for more or for everything (`?limit=0` / `?limit=all`).
+    // Date window: ?from=ISO&to=ISO (Closed lane defaults to last 7 days).
     const limit = parseLimit(req.query.limit, 2000);
-    const groups = await db.getResolvedAlertGroupsWithMedia({ limit });
+    const from = req.query.from ? String(req.query.from) : null;
+    const to = req.query.to ? String(req.query.to) : null;
+    const groups = await db.getResolvedAlertGroupsWithMedia({ limit, from, to });
 
     const { deviceCC } = await batchResolveDeviceCC(groups);
     const filter = await buildStrictAlertFilter(deviceCC);
 
     const alerts = groupsToAlerts(groups, filter);
 
-    res.json({ success: true, alerts, count: alerts.length, total: alerts.length, source: 'eps-db' });
+    res.json({ success: true, alerts, count: alerts.length, total: alerts.length, source: 'eps-db', from, to });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+}
+
+// Fast header counts for the open board — severity buckets + total, no rows.
+// Same open set, same CC filter, and same escalation math as the board list,
+// so the header numbers match the lanes exactly once both arrive.
+async function getActiveAlertCounts(req, res) {
+  try {
+    const rows = await db.getActiveAlertCountRows();
+    const { deviceCC } = await batchResolveDeviceCC(rows);
+    const { passes, severityFor } = await buildStrictAlertFilter(deviceCC);
+    const bySeverity = { critical: 0, high: 0, medium: 0, low: 0 };
+    let total = 0;
+    for (const g of rows) {
+      if (!passes(g)) continue;
+      // Mirror transformDbAlert: active follow-up within 15 min forces low.
+      let level;
+      if (g.follow_up && g.follow_up_at && (Date.now() - new Date(g.follow_up_at).getTime()) < 15 * 60 * 1000) {
+        level = 'low';
+      } else {
+        const base = resolveBaseSeverity(g.alarm_type, severityFor(g));
+        level = String(escalateSeverity(base, g.count) || 'medium').toLowerCase();
+      }
+      if (bySeverity[level] === undefined) bySeverity[level] = 0;
+      bySeverity[level] += 1;
+      total += 1;
+    }
+    res.json({ success: true, bySeverity, total, source: 'eps-db' });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -566,8 +599,10 @@ async function resolveHistoryDeviceIds(deviceId, fleetNumber) {
 
 async function getAlertHistory(req, res) {
   try {
-    const days = Math.min(Math.max(parseInt(req.query.days) || 30, 1), 365);
-    const limit = Math.min(Math.max(parseInt(req.query.limit) || 200, 1), 2000);
+    // Modal timeline defaults to the last 7 days / 100 rows ("load more"
+    // asks explicitly); caps unchanged so callers can still widen.
+    const days = Math.min(Math.max(parseInt(req.query.days) || 7, 1), 365);
+    const limit = Math.min(Math.max(parseInt(req.query.limit) || 100, 1), 2000);
     const deviceId = String(req.query.device_id || req.query.vehicleId || '').trim();
     const fleetNumber = String(req.query.fleet_number || req.query.fleetNumber || '').trim();
     const includeResolved = ['true', '1', 'yes'].includes(String(req.query.include_resolved || '').toLowerCase());
@@ -1174,6 +1209,7 @@ module.exports = {
   getAlertTypes,
   getActiveAlerts,
   getActiveAlertsAll,
+  getActiveAlertCounts,
   getResolvedAlerts,
   listAlerts,
   getResolvedAlertCount,

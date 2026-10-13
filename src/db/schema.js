@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS alert_groups (
     last_alert_ts TIMESTAMPTZ,
     lat DOUBLE PRECISION,
     lon DOUBLE PRECISION,
+    speed DOUBLE PRECISION,
     status TEXT DEFAULT 'new',
     resolved BOOLEAN DEFAULT FALSE,
     false_alert BOOLEAN DEFAULT FALSE,
@@ -60,7 +61,7 @@ CREATE TABLE IF NOT EXISTS alert_groups (
     documents JSONB DEFAULT '[]'::jsonb,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
-);
+  );
 
 CREATE INDEX IF NOT EXISTS idx_alert_groups_device ON alert_groups(device_id);
 CREATE INDEX IF NOT EXISTS idx_alert_groups_type ON alert_groups(alarm_type);
@@ -618,6 +619,27 @@ const MIGRATIONS_SQL = `
 
   -- Composite index for fast unresolved alert_groups lookup
   CREATE INDEX IF NOT EXISTS idx_alert_groups_resolved_ts ON alert_groups(resolved, last_alert_ts DESC) WHERE resolved = FALSE;
+
+  -- Speed on alert_groups so telematics alerts (esp. Harsh Cornering etc.)
+  -- show speed without an extra telematics_events lookup per open/modal.
+  ALTER TABLE alert_groups ADD COLUMN IF NOT EXISTS speed DOUBLE PRECISION;
+
+  -- Open-board list: WHERE resolved=FALSE AND false_alert=FALSE ORDER BY last_alert_ts DESC
+  CREATE INDEX IF NOT EXISTS idx_ag_open_list ON alert_groups(resolved, false_alert, last_alert_ts DESC) WHERE resolved = FALSE AND false_alert = FALSE;
+  -- Detail/modal + media resolve by last alert id
+  CREATE INDEX IF NOT EXISTS idx_ag_last_alert ON alert_groups(last_alert_id);
+  -- Upsert hot path: device+type+source+resolved lookup
+  CREATE INDEX IF NOT EXISTS idx_ag_upsert ON alert_groups(device_id, alarm_type, source_type, resolved);
+  -- Telematics speed lookup by fleet + time window (getAlertById)
+  CREATE INDEX IF NOT EXISTS idx_tev_fleet_time ON telematics_events(fleet_number, event_time DESC);
+  -- Telematics device time-range scans (timeline, modal windows)
+  CREATE INDEX IF NOT EXISTS idx_tev_device_time_desc ON telematics_events(device_id, event_time DESC);
+  -- Geotab sibling expansion + ORDER BY fleet_number
+  CREATE INDEX IF NOT EXISTS idx_vs_fleet ON vehicle_status(fleet_number);
+  -- Zone entries per device+active+time
+  CREATE INDEX IF NOT EXISTS idx_hre_active ON high_risk_zone_entries(device_id, is_active, entry_time DESC);
+  -- Zone stop events per device+start
+  CREATE INDEX IF NOT EXISTS idx_zse_device_start ON zone_stop_events(device_id, stop_start);
 
   -- Index for vehicle-alerts query on unresolved alerts
   CREATE INDEX IF NOT EXISTS idx_alerts_unresolved ON alerts(device_id, alarm_ts DESC) WHERE resolved = FALSE AND false_alert = FALSE;
