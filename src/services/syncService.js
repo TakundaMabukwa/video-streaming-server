@@ -208,32 +208,16 @@ async function fetchMediaForAlerts(records, alarmTypeMap) {
 
 async function fetchMediaOnDemand(alertRecord) {
   const alertId = alertRecord.id || alertRecord.alert_id;
-  const alarmType = alertRecord.alarmType || alertRecord.alarm_type;
   const ts = alertRecord.alarmTs || alertRecord.alarm_ts;
   const rawEnd = alertRecord.alarmTsEnd || alertRecord.alarm_ts_end || ts;
   const devId = alertRecord.deviceId || alertRecord.device_id;
   const devName = alertRecord.deviceName || alertRecord.device_name || '';
 
-  const files = await fetchMediaForAlarm(alertId);
-  let storedCount = 0;
+  // Always live-fetch from skycamx — alert_media is never read or written.
+  let files = await fetchMediaForAlarm(alertId);
 
-  if (files.length > 0) {
-    const existingMedia = await db.batchMediaExists(files.map(f => ({ alertId, fileUrl: f.fileUrl })));
-    const newFiles = files.filter(f => !existingMedia[`${alertId}::${f.fileUrl}`]);
-    if (newFiles.length > 0) {
-      await db.batchInsertMedia(newFiles.map(f => ({
-        alertId,
-        fileUrl: f.fileUrl,
-        fileType: f.fileType,
-        fileSize: f.fileSize,
-        deviceName: f.deviceName,
-        alarmType,
-      })));
-      storedCount += newFiles.length;
-    }
-  }
-
-  const hasVideo = files.some(f => f.fileType === '02');
+  // No video in the alarm files: pull a fresh replay URL from skycamx.
+  const hasVideo = files.some((f) => f.fileType === '02');
   if (!hasVideo && ts && devId) {
     const tsDate = new Date(ts);
     const rawEndDate = new Date(rawEnd);
@@ -241,22 +225,21 @@ async function fetchMediaOnDemand(alertRecord) {
     const tsEnd = rawEndDate > minEnd ? rawEndDate : minEnd;
     const replayUrl = await fetchReplayUrl(devId, 1, ts, tsEnd.toISOString().replace('T', ' ').slice(0, 19));
     if (replayUrl) {
-      await db.batchInsertMedia([{
-        alertId,
-        fileUrl: replayUrl,
-        fileType: '02',
-        fileSize: 0,
-        deviceName: devName,
-        alarmType,
-      }]);
-      storedCount++;
+      files = [...files, { fileUrl: replayUrl, fileType: '02', fileSize: 0 }];
     }
   }
 
-  if (storedCount > 0) {
-    console.log(`[MEDIA] On-demand: ${storedCount} files for alert ${alertId}`);
-  }
-  return db.getMediaForAlert(alertId);
+  // Normalize skycamx camelCase rows to the snake_case shape the controllers expect.
+  return files.map((f, i) => ({
+    id: f.id || `skycam-${i}`,
+    alert_id: alertId,
+    file_url: f.fileUrl || f.file_url || '',
+    file_type: f.fileType || f.file_type || '',
+    file_size: f.fileSize || f.file_size || 0,
+    device_name: f.deviceName || f.device_name || devName,
+    created_at: f.createdAt || f.created_at || null,
+    alarm_time: f.alarmTime || f.alarm_time || null,
+  }));
 }
 
 async function fetchReplayUrl(deviceId, channelId, startTime, endTime) {

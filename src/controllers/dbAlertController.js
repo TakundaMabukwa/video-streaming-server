@@ -117,7 +117,10 @@ async function getAlertDetail(req, res) {
   try {
     const { alertId } = req.params;
     if (!alertId) return sendError(res, 'Alert ID required', 400);
-    const alert = await db.getAlertWithMedia(alertId);
+    // alert_media is never consulted — look up the raw row directly.
+    const byPk = await db.query('SELECT * FROM alerts WHERE id = $1', [alertId]);
+    let alert = byPk.rows.length > 0 ? byPk.rows[0] : null;
+    if (!alert) alert = await db.getAlertGroupByAlertId(alertId);
     if (!alert) return sendError(res, 'Alert not found', 404);
     sendSuccess(res, alert, 'Alert detail retrieved');
   } catch (error) {
@@ -203,10 +206,14 @@ async function getActiveAlerts(req, res) {
     const limit = parseLimit(req.query.limit, 2000);
     const groups = await db.getActiveAlertGroupsWithMedia({ limit });
 
-    const { deviceCC } = await batchResolveDeviceCC(groups);
+    // includeAll (resolve-all modal): keep every open group, bypassing the
+    // strict cost-center filter so no alert is invisible and unresolvable.
+    const forceAll = req.query.includeAll === '1' || req.query.includeAll === 'true';
+    const { deviceCC } = forceAll ? { deviceCC: new Map() } : await batchResolveDeviceCC(groups);
     const filter = await buildStrictAlertFilter(deviceCC);
+    const alwaysPass = { ...filter, passes: () => true };
 
-    const alerts = groupsToAlerts(groups, filter);
+    const alerts = groupsToAlerts(groups, forceAll ? alwaysPass : filter);
 
     res.json({ success: true, alerts, count: alerts.length, total: alerts.length, source: 'eps-db' });
   } catch (error) {
@@ -386,12 +393,14 @@ async function getAlertScreenshots(req, res) {
 
     const { group, alertId } = await resolveMediaAlertId(id);
 
-    let alert = await db.getAlertWithMedia(alertId);
-    if (!alert) {
-      return res.json({ success: true, screenshots: [], count: 0, source: 'eps-db' });
+    // Always live-fetch from skycamx — alert_media is never consulted.
+    const rawAlert = await loadRawAlertForSkycam(id, group, alertId);
+    if (!rawAlert) {
+      return res.json({ success: true, screenshots: [], count: 0, source: 'skycamx' });
     }
 
-    const screenshots = (alert.media || [])
+    const media = await syncService.fetchMediaOnDemand(rawAlert);
+    const screenshots = media
       .filter((m) => m.file_type === '00' || !m.file_type || m.file_type === '01')
       .map((m, i) => ({
         id: m.id || `shot-${i}`,
@@ -400,102 +409,63 @@ async function getAlertScreenshots(req, res) {
         timestamp: m.created_at || m.alarm_time,
       }));
 
-    res.json({ success: true, screenshots, count: screenshots.length, source: 'eps-db' });
+    res.json({ success: true, screenshots, count: screenshots.length, source: 'skycamx' });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
 }
 
+// Build the minimal alert record skycamx needs (alarm id + device + ts).
+// Never touches alert_media — always resolves to a raw row/group then live-fetches.
+async function loadRawAlertForSkycam(id, group, alertId) {
+  if (alertId) {
+    const byLast = await db.query('SELECT * FROM alerts WHERE id = $1', [alertId]);
+    if (byLast.rows.length > 0) return byLast.rows[0];
+  }
+  const byPk = await db.query('SELECT * FROM alerts WHERE id = $1', [id]);
+  if (byPk.rows.length > 0) return byPk.rows[0];
+  if (group) {
+    return {
+      id: alertId || id,
+      deviceId: group.device_id,
+      deviceName: group.device_name,
+      alarmType: group.alarm_type,
+      alarmTs: group.last_alert_ts,
+    };
+  }
+  return null;
+}
+
 async function getAlertMedia(req, res) {
   try {
     const { id } = req.params;
-    const ensureMedia = req.query.ensureMedia === 'true';
     if (!id) return sendError(res, 'Alert ID required', 400);
 
     const { group, alertId } = await resolveMediaAlertId(id);
 
-    let alert = await db.getAlertWithMedia(alertId);
-    const media = alert?.media || [];
-
-    // If ensureMedia and no media, fetch on-demand from skycamx API
-    if (ensureMedia && media.length === 0) {
-      console.log(`[ALERT] ensureMedia=true, no media found for alert ${id}, fetching from skycamx API...`);
-      
-      // Try to find raw alert record
-      let rawAlert = null;
-      if (group) {
-        // Use group info to construct a minimal alert record for API call
-        const byLast = await db.query('SELECT * FROM alerts WHERE id = $1', [alertId]);
-        if (byLast.rows.length > 0) {
-          rawAlert = byLast.rows[0];
-        } else {
-          // Alert not in alerts table but group exists - construct from group
-          rawAlert = {
-            id: alertId,
-            deviceId: group.device_id,
-            deviceName: group.device_name,
-            alarmType: group.alarm_type,
-            alarmTs: group.last_alert_ts,
-          };
-        }
-      } else {
-        const byPk = await db.query('SELECT * FROM alerts WHERE id = $1', [id]);
-        rawAlert = byPk.rows.length > 0 ? byPk.rows[0] : null;
-      }
-
-      if (rawAlert && (rawAlert.id || rawAlert.alert_id)) {
-        console.log(`[ALERT] Calling skycamx /alarm/file/id for alarmId=${rawAlert.id}, device=${rawAlert.deviceId}`);
-        const newMedia = await syncService.fetchMediaOnDemand(rawAlert);
-        if (newMedia.length > 0) {
-          console.log(`[ALERT] Got ${newMedia.length} media files from skycamx API`);
-          if (alert) {
-            alert.media = newMedia;
-          } else {
-            alert = { ...rawAlert, media: newMedia };
-          }
-        } else {
-          console.log(`[ALERT] No media returned from skycamx API for alarmId=${rawAlert.id}`);
-        }
-      }
+    // Always live-fetch from skycamx — alert_media is never consulted.
+    const rawAlert = await loadRawAlertForSkycam(id, group, alertId);
+    if (!rawAlert && !group) {
+      return res.status(404).json({ success: false, message: `Alert ${id} not found` });
     }
 
-    const finalMedia = alert?.media || [];
+    const finalMedia = rawAlert ? await syncService.fetchMediaOnDemand(rawAlert) : [];
     const finalImages = finalMedia.filter((m) => m.file_type === '00' || !m.file_type || m.file_type === '01');
-    let finalVideoFiles = finalMedia.filter((m) => m.file_type === '02');
-
-    // Refetch replay URLs for video files — Mettax CDN signed URLs expire after ~30 min
-    if (ensureMedia && finalVideoFiles.length > 0) {
-      const staleVideo = finalVideoFiles[0];
-      const rawAlert = alert || await db.query('SELECT * FROM alerts WHERE id = $1', [alertId]).then(r => r.rows[0]);
-      if (rawAlert) {
-        const ts = rawAlert.alarmTs || rawAlert.alarm_ts || rawAlert.timestamp;
-        const devId = rawAlert.deviceId || rawAlert.device_id;
-        if (ts && devId) {
-          const tsDate = new Date(ts);
-          const tsEnd = new Date(tsDate.getTime() + 15 * 1000);
-          const freshUrl = await syncService.fetchReplayUrl(devId, 1, ts, tsEnd.toISOString().replace('T', ' ').slice(0, 19));
-          if (freshUrl) {
-            console.log(`[ALERT] Refreshed expired replay URL for alert ${alertId}`);
-            finalVideoFiles = [{ ...staleVideo, file_url: freshUrl }];
-          }
-        }
-      }
-    }
+    const finalVideoFiles = finalMedia.filter((m) => m.file_type === '02');
 
     let severityMap = {};
-    if (alert) {
-      try {
-        const { deviceCC } = await batchResolveDeviceCC([alert]);
-        const ccId = deviceCC.get(alert.device_id);
-        const ccIds = ccId ? [ccId] : [];
-        const perCCMaps = await getPerCCSeverityMaps(ccIds);
-        severityMap = (ccId && perCCMaps[ccId]) || perCCMaps[0] || {};
-      } catch (mapErr) {
-        console.error(`[ALERT] severityMap resolution error for ${id}:`, mapErr.message);
-      }
+    const severitySubject = group || rawAlert;
+    try {
+      const { deviceCC } = await batchResolveDeviceCC([severitySubject]);
+      const ccId = deviceCC.get(severitySubject.device_id);
+      const ccIds = ccId ? [ccId] : [];
+      const perCCMaps = await getPerCCSeverityMaps(ccIds);
+      severityMap = (ccId && perCCMaps[ccId]) || perCCMaps[0] || {};
+    } catch (mapErr) {
+      console.error(`[ALERT] severityMap resolution error for ${id}:`, mapErr.message);
     }
 
-    const transformed = alert ? transformDbAlert(alert, severityMap) : null;
+    const transformed = transformDbAlert(severitySubject, severityMap);
     if (group && transformed) transformed.count = group.count;
 
     const screenshots = finalImages.map((m, i) => ({
@@ -537,7 +507,7 @@ async function getAlertMedia(req, res) {
         preRaw: primaryUrl,
         postRaw: primaryUrl,
       },
-      source: 'eps-db',
+      source: 'skycamx',
     });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });

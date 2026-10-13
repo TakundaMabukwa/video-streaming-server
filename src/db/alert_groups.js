@@ -104,30 +104,57 @@ async function batchUpsertAlertGroups(groups) {
   // and open a fresh active twin for those keys — otherwise the raw alert is
   // already in `alerts`, the sync high-water mark advances past it, and the
   // event never reaches alert_groups or the frontend.
+  //
+  // The base key is squatted by the resolved row forever, so a naive new-group
+  // per event leaves the event as a separate single-count group on every sync
+  // tick (seen live: 600+ separate "Driver Not Detected" groups for one device).
+  // First reuse an existing OPEN group for the same device+type and bump its
+  // count; only open a new twin when no open group exists at all.
   const settled = new Set(result.rows.map((r) => r.group_key));
   const twins = entries.filter((g) => !settled.has(`${g.deviceId}:${g.alarmType}`.toLowerCase()));
   if (twins.length > 0) {
-    const tParams = [];
     const stamp = Date.now().toString(36);
-    const tPlaceholders = twins.map((g, i) => {
-      const base = i * 10;
-      const suffix = `${g.alertId ? '-' + String(g.alertId).slice(-6) : ''}-${Math.random().toString(36).slice(2, 7)}`;
-      tParams.push(
-        `${g.deviceId}:${g.alarmType}`.toLowerCase() + ':' + stamp + suffix,
-        g.deviceId, g.deviceName || null, g.alarmType, g.alarmText || null,
-        g.alertId, g.alarmTs || null, g.lat || null, g.lon || null, g.severity || null
+    for (const g of twins) {
+      const existing = await query(
+        `SELECT group_key FROM alert_groups
+         WHERE device_id = $1 AND alarm_type = $2 AND source_type = $3 AND resolved = FALSE
+         ORDER BY last_alert_ts DESC NULLS LAST
+         LIMIT 1`,
+        [g.deviceId, g.alarmType, g.sourceType || 'video']
       );
-      return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, 1, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}, $${base + 10})`;
-    }).join(',');
-
-    const twinResult = await query(
-      `INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon, severity)
-       VALUES ${tPlaceholders}
-       RETURNING id, group_key, count, alarm_type`,
-      tParams
-    );
-    result.rows.push(...twinResult.rows);
-    console.log(`[ALERT-GROUPS] reopened ${twinResult.rows.length} group(s) behind a resolved twin`);
+      if (existing.rows.length > 0) {
+        const bumped = await query(
+          `UPDATE alert_groups SET
+             count = alert_groups.count + 1,
+             last_alert_id = $1,
+             last_alert_ts = $2,
+             device_name = COALESCE(NULLIF($3, ''), alert_groups.device_name),
+             lat = COALESCE($4, alert_groups.lat),
+             lon = COALESCE($5, alert_groups.lon),
+             alarm_text = COALESCE(NULLIF($6, ''), alert_groups.alarm_text),
+             severity = COALESCE(NULLIF($7, ''), alert_groups.severity),
+             updated_at = NOW()
+           WHERE group_key = $8 AND resolved = FALSE
+           RETURNING id, group_key, count, alarm_type`,
+          [g.alertId, g.alarmTs || null, g.deviceName || null, g.lat || null, g.lon || null, g.alarmText || null, g.severity || null, existing.rows[0].group_key]
+        );
+        if (bumped.rows.length > 0) {
+          result.rows.push(bumped.rows[0]);
+          continue;
+        }
+      }
+      const freshKey = `${g.deviceId}:${g.alarmType}`.toLowerCase() + ':' + stamp +
+        `${g.alertId ? '-' + String(g.alertId).slice(-6) : ''}-${Math.random().toString(36).slice(2, 7)}`;
+      const inserted = await query(
+        `INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon, source_type, severity)
+         VALUES ($1, $2, $3, $4, $5, 1, $6, $7, $8, $9, $10, $11)
+         RETURNING id, group_key, count, alarm_type`,
+        [freshKey, g.deviceId, g.deviceName || null, g.alarmType, g.alarmText || null,
+         g.alertId, g.alarmTs || null, g.lat || null, g.lon || null, g.sourceType || 'video', g.severity || null]
+      );
+      if (inserted.rows.length > 0) result.rows.push(inserted.rows[0]);
+    }
+    console.log(`[ALERT-GROUPS] resolved-key twins: ${twins.length} device+type(s) reconciled`);
   }
 
   return result.rows;
