@@ -21,6 +21,8 @@ const SPEED_85_CODE = 'aURw7fNBdxEGWY3NXil_yIg'; // Heavy Duty Max Speeding 85km
 const SPEED_90_CODE = 'aLv1Bv53LBkClq5rSQ5QPkQ'; // Heavy Duty Max Speeding 90KM/H
 const ZONE_ENTRY_CODE = 'aCmnsH92P1kqGBTWyRmdacA'; // Entering High Risk Area
 const NOGO_ENTRY_CODE = 'nsg-enter-nogo-01'; // Entering No-Go Zone
+const NO_STOP_ENTRY_CODE = 'nsg-enter-nostop-01'; // Entering No Stopping Zone
+const ZONE_APPROACHING_CODE = 'zone-approaching'; // Approaching Zone (predictive)
 const ZONE_STOP_IMMEDIATE_CODE = 'aKW3NJEDtS0OpMwwVlTHWJQ'; // Stopped High Risk area
 const ZONE_STOP_1MIN_HIGH_CODE = 'aCOAc4GcoSkKgsIS9Qnb7mA'; // Stopped > 1min High Risk
 const ZONE_STOP_1MIN_NO_CODE = 'aUg2ERYlb3UChMJWTat0fKw'; // Stopped > 1min No Stopping
@@ -34,9 +36,11 @@ const POLLER_OWNED_ALARM_NAMES = new Set([
   'heavy duty max speeding 90km/h',
   'entering high risk area',
   'entering no-go zone',
+  'entering no stopping zone',
   'stopped high risk area',
   'stopped > 1min high risk',
   'stopped > 1min no stopping',
+  'approaching zone',
   'driver fatigue 3h (low)',
   'driver fatigue 6h (medium)',
   'driver fatigue 9h (high)',
@@ -56,6 +60,8 @@ const POLLER_OWNED_SIGNAL_CODES = new Set([
   SPEED_90_CODE,
   ZONE_ENTRY_CODE,
   NOGO_ENTRY_CODE,
+  NO_STOP_ENTRY_CODE,
+  ZONE_APPROACHING_CODE,
   ZONE_STOP_IMMEDIATE_CODE,
   ZONE_STOP_1MIN_HIGH_CODE,
   ZONE_STOP_1MIN_NO_CODE,
@@ -88,6 +94,8 @@ module.exports = {
   SPEED_90_CODE,
   ZONE_ENTRY_CODE,
   NOGO_ENTRY_CODE,
+  NO_STOP_ENTRY_CODE,
+  ZONE_APPROACHING_CODE,
   ZONE_STOP_IMMEDIATE_CODE,
   ZONE_STOP_1MIN_HIGH_CODE,
   ZONE_STOP_1MIN_NO_CODE,

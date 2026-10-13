@@ -16,6 +16,8 @@ const {
   SPEED_90_CODE,
   ZONE_ENTRY_CODE,
   NOGO_ENTRY_CODE,
+  NO_STOP_ENTRY_CODE,
+  ZONE_APPROACHING_CODE,
   ZONE_STOP_IMMEDIATE_CODE,
   ZONE_STOP_1MIN_HIGH_CODE,
   ZONE_STOP_1MIN_NO_CODE,
@@ -392,6 +394,67 @@ async function processZoneForDevice(deviceId, fleetNumber, licensePlate, lat, lo
     }
   }
 
+  // ── Predictive Detection: bearing + 45s look-ahead ───────────────────
+  // Check zones the vehicle is approaching (will enter within 45s at current speed/bearing)
+  if (hasPrevPos) {
+    const prevPoint = turf.point([prevLon, prevLat]);
+    const currentPoint = turf.point([lon, lat]);
+    
+    // 1. Calculate bearing (-180 to 180, 0 = North)
+    let bearing = 0;
+    try {
+      bearing = turf.bearing(prevPoint, currentPoint);
+    } catch { bearing = 0; }
+    
+    // 2. Project forward (45 seconds at current speed, min 1 km/h)
+    const speedKms = Math.max(Number(speed) || 0, 1) / 3600; // km/s
+    const lookAheadSeconds = 45;
+    const distanceKm = speedKms * lookAheadSeconds;
+    
+    // 3. Predicted point
+    let predictedPoint = currentPoint;
+    try {
+      predictedPoint = turf.destination(currentPoint, distanceKm, bearing, { units: 'kilometers' });
+    } catch { /* fallback to current point */ }
+    
+    // 4. Trajectory vector
+    const trajectoryVector = turf.lineString([currentPoint.geometry.coordinates, predictedPoint.geometry.coordinates]);
+    
+    // 5. Check zones not currently inside and not already entered
+    for (const z of zones) {
+      if (insideZones.some(iz => iz.id === z.id)) continue; // Already inside
+      if (wasInside.has(z.id)) continue; // Was inside, exit handled separately
+      
+      try {
+        const intersections = turf.lineIntersect(trajectoryVector, z.polygon);
+        if (intersections.features.length > 0) {
+          // Vehicle will enter zone within lookAheadSeconds
+          const distanceToEntry = turf.distance(currentPoint, intersections.features[0], { units: 'kilometers' });
+          const etaSeconds = Number(speed) > 0 ? (distanceToEntry / (Number(speed) / 3600)) : Infinity;
+          
+          // Emit "Approaching Zone" alert
+          await emitDeviceStatusAlert({
+            deviceId, fleetNumber, licensePlate, 
+            signalCode: ZONE_APPROACHING_CODE,
+            alarmText: `Approaching ${z.is_no_go ? 'No-Go' : z.is_high_risk ? 'High Risk' : 'No Stopping'} Zone: ${z.name} (ETA ~${Math.round(etaSeconds)}s)`,
+            lat, lon, speed, ts: nowTs,
+            extra: { 
+              zoneName: z.name, 
+              zoneType: z.is_no_go ? 'no_go' : z.is_high_risk ? 'high_risk' : 'no_stopping',
+              etaSeconds: Math.round(etaSeconds),
+              distanceMeters: Math.round(distanceToEntry * 1000),
+              bearing: bearing.toFixed(1)
+            },
+          });
+          
+          console.log(`[ZONE-PREDICT] ${fleetNumber || deviceId} approaching ${z.name} (bearing: ${bearing.toFixed(1)}°, ETA ~${Math.round(etaSeconds)}s)`);
+        }
+      } catch (e) {
+        // Ignore prediction errors per zone
+      }
+    }
+  }
+
   // Exits FIRST and never gated by "inside anything": any open entry whose zone
   // no longer contains this fix is closed, including when the vehicle is outside
   // every watched zone. (The old early return skipped this, leaving entries open.)
@@ -427,11 +490,18 @@ async function processZoneForDevice(deviceId, fleetNumber, licensePlate, lat, lo
       speed: speed ?? null,
       entryTime: nowTs,
     });
-    if (entry && (z.is_high_risk || z.is_no_go)) {
-      const signalCode = z.is_no_go ? NOGO_ENTRY_CODE : ZONE_ENTRY_CODE;
-      const alarmText = z.is_no_go
-        ? `Entering No-Go Zone in zone ${z.name}`
-        : `Entering High Risk Area in zone ${z.name}`;
+    if (entry && (z.is_high_risk || z.is_no_go || z.is_no_stopping)) {
+      let signalCode, alarmText;
+      if (z.is_no_go) {
+        signalCode = NOGO_ENTRY_CODE;
+        alarmText = `Entering No-Go Zone in zone ${z.name}`;
+      } else if (z.is_no_stopping) {
+        signalCode = NO_STOP_ENTRY_CODE;
+        alarmText = `Entering No Stopping Zone in zone ${z.name}`;
+      } else {
+        signalCode = ZONE_ENTRY_CODE;
+        alarmText = `Entering High Risk Area in zone ${z.name}`;
+      }
       await emitDeviceStatusAlert({
         deviceId, fleetNumber, licensePlate, signalCode,
         alarmText,
