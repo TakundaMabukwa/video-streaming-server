@@ -248,6 +248,47 @@ async function getActiveAlertCountRows() {
   return result.rows;
 }
 
+// Delta polling: groups changed since a cursor. The board loads the full
+// (unbounded) list once, then polls this — single-digit rows instead of 65k.
+// `since` should overlap ~30s (client sends lastAsOf - 30s); id-keyed merge
+// dedupes the overlap. Tombstones (resolved since cursor) come from
+// getResolvedSince below.
+async function getActiveAlertChanges({ since }) {
+  const result = await query(
+    `SELECT ${BOARD_COLUMNS}
+     FROM alert_groups g
+     WHERE g.resolved = FALSE AND g.false_alert = FALSE
+       AND g.updated_at > $1::timestamptz
+     ORDER BY g.updated_at ASC`,
+    [since]
+  );
+  return result.rows;
+}
+
+// Ids resolved since a cursor — lets delta clients drop cards without a
+// full reload. Resolved groups never reappear (resolve sticks), so a
+// tombstone is final for that group id.
+async function getResolvedSince({ since }) {
+  const result = await query(
+    `SELECT id, resolved_at FROM alert_groups
+     WHERE resolved = TRUE AND COALESCE(resolved_at, updated_at) > $1::timestamptz
+     ORDER BY COALESCE(resolved_at, updated_at) ASC
+     LIMIT 5000`,
+    [since]
+  );
+  return result.rows;
+}
+
+// Compact serialization: shared column header + positional rows. Kills the
+// ~60% of list payload that is repeated JSON key names (measured 37.6MB →
+// ~15MB pre-gzip on 65k rows). Shape-preserving: unpack(columns, rows)
+// rebuilds identical objects.
+function packAlerts(alerts) {
+  if (!alerts || alerts.length === 0) return { columns: [], rows: [] };
+  const columns = Object.keys(alerts[0]);
+  return { columns, rows: alerts.map((a) => columns.map((c) => a[c] ?? null)) };
+}
+
 // Status-filtered listing backing GET /alerts (the frontend asks for
 // ?status=new / resolved / closed / active). `limit` null => no LIMIT.
 async function listAlertGroups({ status = '', limit = null, offset = 0 } = {}) {
@@ -479,6 +520,9 @@ module.exports = {
   batchUpsertAlertGroups,
   getActiveAlertGroups,
   getActiveAlertCountRows,
+  getActiveAlertChanges,
+  getResolvedSince,
+  packAlerts,
   getAlertGroupById,
   getAlertGroupByKey,
   getAlertGroupByAlertId,

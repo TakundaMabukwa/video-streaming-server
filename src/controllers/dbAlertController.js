@@ -203,18 +203,50 @@ function groupsToAlerts(groups, { passes, severityFor }, { includeCount = true }
 
 async function getActiveAlerts(req, res) {
   try {
+    const forceAll = req.query.includeAll === '1' || req.query.includeAll === 'true';
+    const compact = req.query.compact === '1' || req.query.compact === 'true';
+    const sinceRaw = req.query.since ? String(req.query.since).trim() : '';
+    const since = sinceRaw && !Number.isNaN(Date.parse(sinceRaw)) ? new Date(sinceRaw).toISOString() : null;
+
+    // Delta path: only groups changed since the cursor + tombstones for
+    // resolved ones. The board loads full once, then polls this.
+    if (since) {
+      const asOf = new Date().toISOString();
+      const [changedGroups, removed] = await Promise.all([
+        db.getActiveAlertChanges({ since }),
+        db.getResolvedSince({ since }),
+      ]);
+      if (changedGroups.length > 5000) {
+        // Window too wide (client was away too long) — tell it to full-reload.
+        return res.json({ success: true, truncated: true, asOf, source: 'eps-db' });
+      }
+      const { deviceCC } = forceAll ? { deviceCC: new Map() } : await batchResolveDeviceCC(changedGroups);
+      const filter = await buildStrictAlertFilter(deviceCC);
+      const alwaysPass = { ...filter, passes: () => true };
+      const changed = groupsToAlerts(changedGroups, forceAll ? alwaysPass : filter);
+      const removedIds = removed.map((r) => String(r.id));
+      if (compact) {
+        const packed = db.packAlerts(changed);
+        return res.json({ success: true, columns: packed.columns, changed: packed.rows, removed: removedIds, asOf, source: 'eps-db' });
+      }
+      return res.json({ success: true, changed, removed: removedIds, asOf, source: 'eps-db' });
+    }
+
     const limit = parseLimit(req.query.limit, 2000);
     const groups = await db.getActiveAlertGroupsWithMedia({ limit });
 
     // includeAll (resolve-all modal): keep every open group, bypassing the
     // strict cost-center filter so no alert is invisible and unresolvable.
-    const forceAll = req.query.includeAll === '1' || req.query.includeAll === 'true';
     const { deviceCC } = forceAll ? { deviceCC: new Map() } : await batchResolveDeviceCC(groups);
     const filter = await buildStrictAlertFilter(deviceCC);
     const alwaysPass = { ...filter, passes: () => true };
 
     const alerts = groupsToAlerts(groups, forceAll ? alwaysPass : filter);
 
+    if (compact) {
+      const packed = db.packAlerts(alerts);
+      return res.json({ success: true, columns: packed.columns, rows: packed.rows, count: alerts.length, total: alerts.length, asOf: new Date().toISOString(), source: 'eps-db' });
+    }
     res.json({ success: true, alerts, count: alerts.length, total: alerts.length, source: 'eps-db' });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });

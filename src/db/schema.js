@@ -626,6 +626,10 @@ const MIGRATIONS_SQL = `
 
   -- Open-board list: WHERE resolved=FALSE AND false_alert=FALSE ORDER BY last_alert_ts DESC
   CREATE INDEX IF NOT EXISTS idx_ag_open_list ON alert_groups(resolved, false_alert, last_alert_ts DESC) WHERE resolved = FALSE AND false_alert = FALSE;
+  -- Delta polling: changed-since cursor over the open set
+  CREATE INDEX IF NOT EXISTS idx_ag_open_updated ON alert_groups(updated_at) WHERE resolved = FALSE AND false_alert = FALSE;
+  -- Delta tombstones: resolved-since cursor
+  CREATE INDEX IF NOT EXISTS idx_ag_resolved_at ON alert_groups(resolved_at) WHERE resolved = TRUE;
   -- Detail/modal + media resolve by last alert id
   CREATE INDEX IF NOT EXISTS idx_ag_last_alert ON alert_groups(last_alert_id);
   -- Upsert hot path: device+type+source+resolved lookup
