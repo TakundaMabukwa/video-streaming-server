@@ -442,7 +442,7 @@ router.get('/vehicle-alerts', async (req, res) => {
 router.get('/vehicle-alerts/:deviceId', async (req, res) => {
   try {
     const { deviceId } = req.params;
-    const { fleet } = req.query;
+    const { fleet, includeAll } = req.query;
 
     let where = `WHERE ag.resolved = FALSE AND ag.false_alert = FALSE`;
     const params = [];
@@ -538,7 +538,9 @@ router.get('/vehicle-alerts/:deviceId', async (req, res) => {
       const { passes, severityFor } = await buildStrictAlertFilter(deviceCC);
       // Strict filter: same rules as the active-alerts list — only definitions
       // in the device's cost-center set (or active global for CC-less devices).
-      const visible = groups.filter((g) => passes(g));
+      // includeAll (resolve-all modal) skips the filter so every open group for
+      // the vehicle can be resolved — nothing is silently left behind.
+      const visible = includeAll === '1' || includeAll === 'true' ? groups : groups.filter((g) => passes(g));
       alerts = visible.map((row) => {
         const t = transformDbAlert(row, severityFor(row));
         t.lat = row.lat;
@@ -578,6 +580,22 @@ router.get('/vehicle-status-all-enriched', async (req, res) => {
        ORDER BY vs.fleet_number`
     );
     res.json({ success: true, data: statuses.rows, count: statuses.rows.length });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ── Camera Status ──
+
+router.get('/camera-status', async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT cs.*, fv.registration_number, fv.fleet_number
+       FROM camera_status cs
+       LEFT JOIN fleet_vehicles fv ON fv.fleet_number = cs.fleet_number
+       ORDER BY cs.time_logged DESC`
+    );
+    res.json({ success: true, data: result.rows, count: result.rows.length });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }

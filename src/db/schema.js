@@ -307,6 +307,7 @@ const MIGRATIONS_SQL = `
   ALTER TABLE driver_config_criteria ADD COLUMN IF NOT EXISTS cost_center_id INTEGER;
   ALTER TABLE rtms_rules ADD COLUMN IF NOT EXISTS cost_center_id INTEGER;
   ALTER TABLE fleet_vehicles ADD COLUMN IF NOT EXISTS cost_center_id INTEGER;
+  ALTER TABLE fleet_vehicles ADD COLUMN IF NOT EXISTS mettax_device_id TEXT;
 
   CREATE INDEX IF NOT EXISTS idx_alert_definitions_cc ON alert_definitions(cost_center_id);
   CREATE INDEX IF NOT EXISTS idx_alert_group_configs_cc ON alert_group_configs(cost_center_id);
@@ -318,27 +319,19 @@ const MIGRATIONS_SQL = `
   ALTER TABLE driver_scoring ADD COLUMN IF NOT EXISTS cost_center_id INTEGER;
   CREATE INDEX IF NOT EXISTS idx_driver_scoring_cc ON driver_scoring(cost_center_id);
 
-  -- Replace rtms_rules single-column UNIQUE on rule_name with composite (rule_name, cost_center_id)
-  DO $$
-  BEGIN
-    IF EXISTS (
-      SELECT 1 FROM pg_constraint
-      WHERE conname = 'rtms_rules_rule_name_key'
-      AND conrelid = 'rtms_rules'::regclass
-    ) THEN
-      ALTER TABLE rtms_rules DROP CONSTRAINT rtms_rules_rule_name_key;
-    END IF;
-  END $$;
-  DO $$
-  BEGIN
-    IF NOT EXISTS (
-      SELECT 1 FROM pg_constraint
-      WHERE conname = 'rtms_rules_cc_unique'
-      AND conrelid = 'rtms_rules'::regclass
-    ) THEN
-      ALTER TABLE rtms_rules ADD CONSTRAINT rtms_rules_cc_unique UNIQUE (rule_name, cost_center_id);
-    END IF;
-  END $$;
+  CREATE TABLE IF NOT EXISTS camera_status (
+    fleet_number TEXT PRIMARY KEY,
+    reg TEXT,
+    time_logged TIMESTAMPTZ DEFAULT NOW(),
+    status TEXT,
+    countdown INTERVAL,
+    last_screenshot TIMESTAMPTZ,
+    mettax_device_id TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  );
+  CREATE INDEX IF NOT EXISTS idx_camera_status_fleet ON camera_status(fleet_number);
+  CREATE INDEX IF NOT EXISTS idx_camera_status_time ON camera_status(time_logged DESC);
 
   -- Replace the single-column UNIQUE on driver_config_criteria.name with a composite
   -- (name, cost_center_id) so per-cost-center overrides are allowed.

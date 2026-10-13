@@ -432,25 +432,38 @@ async function upsertGeotabZones(zones) {
   for (const zone of zones) {
     const name = (zone.name || '').toUpperCase();
     const isHighRisk = name.includes('HIGH RISK');
-    // No-stopping is NOT derived from the name (it has its own explicit flag,
-    // is_no_stopping, which this sync never writes). 'NO STOP' is removed here.
-    const isNoGo = ['NO GO', 'DIESEL', 'HIJACK'].some((token) => name.includes(token));
+    // No-go tokens: NO GO, DIESEL, HIJACK, NO STOP (NO STOP also sets is_no_stopping)
+    const isNoGo = ['NO GO', 'NO STOP', 'DIESEL', 'HIJACK'].some((token) => name.includes(token));
+    const isNoStopping = name.includes('NO STOP');
+    let points = zone.points || [];
+    if (typeof points === 'string') {
+      try { points = JSON.parse(points); } catch { points = []; }
+    }
+    // Auto-close ring if needed (turf.polygon requires closed ring)
+    if (Array.isArray(points) && points.length >= 3) {
+      const first = points[0];
+      const last = points[points.length - 1];
+      if (first.x !== last.x || first.y !== last.y) {
+        points.push({ x: first.x, y: first.y });
+      }
+    }
     await query(
-      `INSERT INTO geotab_zones (id, name, points, zone_types, comment, is_high_risk, is_no_go, raw_data, last_synced)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+      `INSERT INTO geotab_zones (id, name, points, zone_types, comment, is_high_risk, is_no_go, is_no_stopping, raw_data, last_synced)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
        ON CONFLICT (id) DO UPDATE SET
          name = EXCLUDED.name, points = EXCLUDED.points, zone_types = EXCLUDED.zone_types,
-         comment = EXCLUDED.comment, is_high_risk = EXCLUDED.is_high_risk, is_no_go = EXCLUDED.is_no_go,
+         comment = EXCLUDED.comment, is_high_risk = EXCLUDED.is_high_risk, is_no_go = EXCLUDED.is_no_go, is_no_stopping = EXCLUDED.is_no_stopping,
          raw_data = EXCLUDED.raw_data, last_synced = NOW()
        WHERE geotab_zones.locally_modified IS NULL`,
       [
         zone.id,
         zone.name || null,
-        JSON.stringify(zone.points || []),
+        JSON.stringify(points),
         JSON.stringify(zone.zoneTypes || []),
         zone.comment || null,
         isHighRisk,
         isNoGo,
+        isNoStopping,
         JSON.stringify(zone),
       ]
     );
