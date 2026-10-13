@@ -1,15 +1,68 @@
+const http = require('http');
 const { WebSocketServer } = require('ws');
 const { joinAlert, leaveAlert } = require('./presence');
+const { createClient } = require('@supabase/supabase-js');
 
 let wss = null;
+let httpServer = null;
 const clients = new Set();
+let supabaseAdmin = null;
+
+function getSupabaseAdmin() {
+  if (!supabaseAdmin && process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
+    supabaseAdmin = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+  }
+  return supabaseAdmin;
+}
+
+// Every WS client must prove identity: ?token=<supabase access_token>.
+// Mirrors HTTP requireAuth (token → auth.getUser → users row). Checked on
+// HTTP upgrade, before the socket exists — rejected clients get 401 and
+// never join. (ws@8 removed the verifyClient option, hence manual upgrade.)
+async function verifyWsToken(req) {
+  const url = new URL(req.url || '/', 'http://localhost');
+  const token = (url.searchParams.get('token') || '').trim();
+  if (!token) return null;
+  const supabase = getSupabaseAdmin();
+  if (!supabase) return null;
+  try {
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+    if (error || !user) return null;
+    const { data: row, error: rowErr } = await supabase
+      .from('users')
+      .select('id')
+      .eq('id', user.id)
+      .single();
+    if (rowErr || !row) return null;
+    return { id: user.id, email: user.email || null };
+  } catch {
+    return null;
+  }
+}
 
 function startWebSocket(port = 3004) {
-  wss = new WebSocketServer({ port });
+  wss = new WebSocketServer({ noServer: true });
+  httpServer = http.createServer((req, res) => {
+    res.writeHead(404);
+    res.end();
+  });
+  httpServer.on('upgrade', async (req, socket, head) => {
+    const identity = await verifyWsToken(req);
+    if (!identity) {
+      socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      ws.wsUserId = identity.id;
+      wss.emit('connection', ws, req);
+    });
+  });
+  httpServer.listen(port);
 
   wss.on('connection', (ws) => {
     clients.add(ws);
-    console.log(`[WS] Client connected (${clients.size} total)`);
+    console.log(`[WS] Client connected (${clients.size} total)${ws.wsUserId ? ` user=${ws.wsUserId}` : ''}`);
 
     ws.isAlive = true;
     ws._presenceJoins = new Map(); // alertId -> user, to clean up on disconnect
@@ -104,6 +157,10 @@ function stopWebSocket() {
     wss.close();
     wss = null;
     clients.clear();
+  }
+  if (httpServer) {
+    httpServer.close();
+    httpServer = null;
   }
 }
 

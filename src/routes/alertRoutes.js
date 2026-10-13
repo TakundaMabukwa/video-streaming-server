@@ -1,4 +1,5 @@
 const express = require('express');
+const rateLimit = require('express-rate-limit');
 const { getAlertTypes, getAlarmPage, getAlertFeed, getAlarmFilesById, getAlarmFilesByPage, getDevices } = require('../controllers/alertController');
 const { getActiveAlerts, getActiveAlertsAll, getActiveAlertCounts, getResolvedAlerts, getResolvedAlertCount, getAlertById, getAlertScreenshots, getAlertMedia, acknowledgeAlert, resolveAlert, escalateAlert, markFalseAlert, uploadDocumentToAlert, followUpAlert, clearFollowUp, getAlertHistory, listAlerts } = require('../controllers/dbAlertController');
 const db = require('../db');
@@ -24,7 +25,15 @@ router.get('/history', getAlertHistory);
 // GET /alerts?status=new|active|resolved|closed&limit=&offset= — previously fell
 // through to the catch-all below and always answered with an empty list.
 router.get('/', listAlerts);
-router.post('/bulk-close', resolveAlertsBulk);
+// Bulk resolve is the most destructive user action — tighter than the global limiter.
+const bulkCloseLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many bulk-close requests, please try again later.' },
+});
+router.post('/bulk-close', bulkCloseLimiter, resolveAlertsBulk);
 router.get('/:id/screenshots', getAlertScreenshots);
 router.get('/:id/media', getAlertMedia);
 router.post('/:id/capture', async (req, res) => {

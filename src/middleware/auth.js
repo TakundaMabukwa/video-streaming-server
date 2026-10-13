@@ -2,7 +2,6 @@ const { createClient } = require('@supabase/supabase-js');
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const SRS_INTERNAL_KEY = process.env.SRS_INTERNAL_KEY;
 
 let supabaseAdmin = null;
 
@@ -36,15 +35,10 @@ async function getUserCostCenterIds(userId, supabase) {
 }
 
 async function requireAuth(req, res, next) {
-  // Allow internal API key from SRS server-to-server calls
-  const internalKey = req.headers['x-internal-key'];
-  if (internalKey && internalKey === SRS_INTERNAL_KEY) {
-    req.user = { id: 'srs-internal', email: 'internal@srs.local' };
-    req.userRole = 'admin';
-    req.userCostCenterIds = [];
-    return next();
-  }
-
+  // Every /api caller authenticates as a user: Supabase JWT via
+  // Authorization: Bearer <token> (preferred) or access_token cookie.
+  // There is no shared-key bypass — service-to-service callers must
+  // forward the calling user's token.
   const supabase = getSupabaseAdmin();
   if (!supabase) {
     console.error('[AUTH] Supabase not configured');
