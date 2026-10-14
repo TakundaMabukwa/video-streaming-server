@@ -87,7 +87,7 @@ const MIGRATIONS_SQL = `
   -- Only backfills alarm types that STILL EXIST as active alert_definitions;
   -- a definition deleted in Alert Config must never be resurrected here on a
   -- later boot (the legacy alerts archive still holds its old rows).
-  INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon, status, resolved, false_alert, notes, documents, created_at, updated_at)
+  INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon, status, resolved, false_alert, notes, documents, source_type, created_at, updated_at)
   SELECT
     LOWER(CONCAT(a.device_id, ':', a.alarm_type)) AS group_key,
     a.device_id,
@@ -104,6 +104,7 @@ const MIGRATIONS_SQL = `
     bool_or(a.false_alert) AS false_alert,
     NULL AS notes,
     '[]'::jsonb AS documents,
+    COALESCE(a.source_type, 'video') AS source_type,
     NOW() AS created_at,
     NOW() AS updated_at
   FROM alerts a
@@ -124,6 +125,16 @@ const MIGRATIONS_SQL = `
           AND o.is_active IS DISTINCT FROM false
       )
     )
+  WHERE NOT EXISTS (
+    -- Never resurrect a twin next to a live group: if the device+type already
+    -- has an open, genuine group, the backfill skips it (this also keeps the
+    -- one-live-group unique index satisfiable on every boot).
+    SELECT 1 FROM alert_groups g
+    WHERE g.device_id = a.device_id
+      AND lower(g.alarm_type) = lower(a.alarm_type)
+      AND COALESCE(g.source_type, 'video') = COALESCE(a.source_type, 'video')
+      AND g.resolved = FALSE AND g.false_alert = FALSE
+  )
   GROUP BY a.device_id, a.device_name, a.alarm_type, a.alarm_text
   ON CONFLICT (group_key) DO NOTHING;
 
