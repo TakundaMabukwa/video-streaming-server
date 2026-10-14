@@ -135,7 +135,7 @@ const MIGRATIONS_SQL = `
       AND COALESCE(g.source_type, 'video') = COALESCE(a.source_type, 'video')
       AND g.resolved = FALSE AND g.false_alert = FALSE
   )
-  GROUP BY a.device_id, a.device_name, a.alarm_type, a.alarm_text
+  GROUP BY a.device_id, a.device_name, a.alarm_type, a.alarm_text, a.source_type
   ON CONFLICT (group_key) DO NOTHING;
 
   -- Add resolved_at / resolved_by columns to alert_groups
