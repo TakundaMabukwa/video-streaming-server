@@ -57,6 +57,7 @@ const FATIGUE_THRESHOLDS = [
 let pollTimer = null;
 let wsBroadcast = null;
 let inFlight = false;
+let lastTrailPruneAt = 0;
 
 let cachedCredentials = null;
 let credentialsExpiry = null;
@@ -691,6 +692,8 @@ async function pollDeviceStatus() {
     let freshCount = 0;
     let staleCount = 0;
     let offlineCount = 0;
+    // Telemetry-history trail rows for this tick (device event time, not ours).
+    const trailRows = [];
 
     markStage('device-loop');
     for (const d of statuses) {
@@ -972,6 +975,41 @@ async function pollDeviceStatus() {
         if (mettaxDeviceId) {
           await checkCameraStatus(deviceId, fleetNumber, licensePlate, mettaxDeviceId);
         }
+      }
+
+      // Trail: every coordinate, keyed by the device's own event time.
+      if (lat != null && lon != null) {
+        trailRows.push([deviceId, fleetNumber || null, licensePlate || null, lat, lon, dateTime]);
+      }
+    }
+
+    // Bulk trail write (one statement) + hourly rolling 12h prune.
+    if (trailRows.length > 0) {
+      try {
+        const vals = [];
+        const params = [];
+        trailRows.forEach((r, i) => {
+          const b = i * 6;
+          params.push(...r);
+          vals.push(`($${b + 1}, $${b + 2}, $${b + 3}, $${b + 4}, $${b + 5}, $${b + 6}::timestamptz)`);
+        });
+        await db.query(
+          `INSERT INTO telemetry_history (device_id, fleet_number, registration, lat, lon, event_time)
+           VALUES ${vals.join(',')}
+           ON CONFLICT (device_id, event_time) DO NOTHING`
+          , params);
+      } catch (err) {
+        console.error('[TRAIL] write failed:', err.message);
+      }
+    }
+    if (!lastTrailPruneAt || Date.now() - lastTrailPruneAt > 3600000) {
+      lastTrailPruneAt = Date.now();
+      try {
+        const pruned = await db.query(
+          `DELETE FROM telemetry_history WHERE event_time < NOW() - INTERVAL '12 hours'`);
+        console.log(`[TRAIL] pruned ${pruned.rowCount || 0} rows older than 12h`);
+      } catch (err) {
+        console.error('[TRAIL] prune failed:', err.message);
       }
     }
 

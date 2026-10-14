@@ -397,6 +397,52 @@ router.get('/log-records/:deviceId', async (req, res) => {
   }
 });
 
+// ── Vehicle route from telemetry_history (±5min around an alert) ──
+//
+// GET /route?fleet=PD124&at=ISO — ordered trail points for the alert modal
+// map. Queried by fleet_number so camera + Geotab sibling positions come back
+// in one shot. event_time is device time on both sides of the window.
+router.get('/route', async (req, res) => {
+  try {
+    const { fleet, device_id, at } = req.query;
+    if (!at || Number.isNaN(Date.parse(String(at)))) {
+      return res.status(400).json({ success: false, message: 'at (ISO datetime) query param required' });
+    }
+    let fleetKey = String(fleet || '').trim();
+    const devId = String(device_id || '').trim();
+    if (!fleetKey && devId) {
+      try {
+        const { resolveFleetNumber } = require('../services/costCenterLookup');
+        const named = await db.query(
+          `SELECT device_name FROM alert_groups WHERE device_id = $1 ORDER BY last_alert_ts DESC NULLS LAST LIMIT 1`,
+          [devId]
+        );
+        fleetKey = await resolveFleetNumber({ vehicleRegistration: named.rows[0]?.device_name || '', deviceId: devId }) || '';
+      } catch (_) { fleetKey = ''; }
+    }
+    if (!fleetKey && !devId) {
+      return res.status(400).json({ success: false, message: 'fleet or device_id query param required' });
+    }
+    const atIso = new Date(String(at)).toISOString();
+    const where = fleetKey
+      ? `upper(fleet_number) = upper($1)`
+      : `device_id = $1`;
+    const result = await db.query(
+      `SELECT device_id, fleet_number, registration, lat, lon, event_time
+       FROM telemetry_history
+       WHERE ${where}
+         AND event_time BETWEEN $2::timestamptz - INTERVAL '5 minutes'
+                            AND $2::timestamptz + INTERVAL '5 minutes'
+       ORDER BY event_time ASC
+       LIMIT 500`,
+      [fleetKey || devId, atIso]
+    );
+    res.json({ success: true, data: result.rows, count: result.rows.length, fleet: fleetKey || null, at: atIso });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // ── Priority Zones (high-risk + no-go first) ──
 
 router.get('/zones-priority', async (req, res) => {

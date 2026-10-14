@@ -633,6 +633,25 @@ const MIGRATIONS_SQL = `
 
   CREATE INDEX IF NOT EXISTS idx_vehicle_log_records_device_time ON vehicle_log_records(device_id, record_time);
 
+  -- Telemetry history: every poller coordinate per vehicle. Written by the
+  -- 15s DeviceStatusInfo poller only; rolling 12h window pruned hourly by the
+  -- poller itself. event_time is the DEVICE event time, never storage time.
+  CREATE TABLE IF NOT EXISTS telemetry_history (
+    id SERIAL PRIMARY KEY,
+    device_id TEXT NOT NULL,
+    fleet_number TEXT,
+    registration TEXT,
+    lat DOUBLE PRECISION NOT NULL,
+    lon DOUBLE PRECISION NOT NULL,
+    event_time TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(device_id, event_time)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_telemetry_history_fleet_time ON telemetry_history(fleet_number, event_time);
+  CREATE INDEX IF NOT EXISTS idx_telemetry_history_event_time ON telemetry_history(event_time);
+  CREATE INDEX IF NOT EXISTS idx_telemetry_history_device_time ON telemetry_history(device_id, event_time);
+
   -- Composite index for fast unresolved alert_groups lookup
   CREATE INDEX IF NOT EXISTS idx_alert_groups_resolved_ts ON alert_groups(resolved, last_alert_ts DESC) WHERE resolved = FALSE;
 
