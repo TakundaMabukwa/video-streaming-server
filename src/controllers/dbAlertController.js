@@ -299,6 +299,87 @@ async function getActivePerVehicleAlerts(req, res) {
   }
 }
 
+// Alert Stats page: closed genuine alerts aggregated by cost center with top
+// vehicles/drivers nested. Closed data barely moves, so cache 60s per param
+// combo instead of re-aggregating on every card expand.
+const closedSummaryCache = new Map();
+const CLOSED_SUMMARY_TTL_MS = 60 * 1000;
+async function getClosedSummaryByCC(req, res) {
+  try {
+    const rawDays = req.query.days != null ? Number(req.query.days) : 30;
+    const days = Number.isFinite(rawDays) ? Math.min(Math.max(Math.floor(rawDays), 1), 365) : 30;
+    const st = req.query.source_type ? String(req.query.source_type).trim().toLowerCase() : null;
+    const sourceType = st === 'video' || st === 'telematics' ? st : null;
+    const key = `${days}|${sourceType || 'all'}`;
+    const hit = closedSummaryCache.get(key);
+    if (hit && Date.now() - hit.at < CLOSED_SUMMARY_TTL_MS) {
+      return res.json({ ...hit.body, cached: true });
+    }
+    const { perCC, tops } = await db.getClosedSummaryByCC({ days, sourceType });
+    const byCC = new Map();
+    for (const r of perCC) {
+      byCC.set(r.cc_id, {
+        id: r.cc_id,
+        name: r.cc_name || 'Unassigned',
+        groups: Number(r.groups) || 0,
+        alerts: Number(r.alerts) || 0,
+        vehicles: Number(r.vehicles) || 0,
+        bySeverity: {
+          critical: Number(r.critical) || 0,
+          high: Number(r.high) || 0,
+          medium: Number(r.medium) || 0,
+          low: Number(r.low) || 0,
+        },
+        lastSeen: r.last_seen || null,
+        topVehicles: [],
+        topDrivers: [],
+      });
+    }
+    const ensureBucket = (ccId) => {
+      if (!byCC.has(ccId)) {
+        byCC.set(ccId, {
+          id: ccId, name: 'Unassigned', groups: 0, alerts: 0, vehicles: 0,
+          bySeverity: { critical: 0, high: 0, medium: 0, low: 0 },
+          lastSeen: null, topVehicles: [], topDrivers: [],
+        });
+      }
+      return byCC.get(ccId);
+    };
+    for (const t of tops) {
+      const bucket = ensureBucket(t.cc_id);
+      const entry = {
+        fleet: t.fleet || 'Unknown',
+        registration: t.registration || null,
+        driver: t.driver || 'Unknown',
+        alerts: Number(t.alerts) || 0,
+        groups: Number(t.groups) || 0,
+        lastSeen: t.last_seen || null,
+      };
+      if (t.kind === 'vehicle') bucket.topVehicles.push(entry);
+      else bucket.topDrivers.push(entry);
+    }
+    const costCenters = [...byCC.values()].sort((a, b) => b.alerts - a.alerts);
+    const totals = costCenters.reduce(
+      (acc, c) => ({ alerts: acc.alerts + c.alerts, groups: acc.groups + c.groups, vehicles: acc.vehicles + c.vehicles }),
+      { alerts: 0, groups: 0, vehicles: 0 }
+    );
+    const body = {
+      success: true, days, sourceType: sourceType || 'all',
+      totals, costCenters,
+      asOf: new Date().toISOString(), source: 'eps-db',
+      note: 'Closed genuine alerts only (resolved, not false). Drivers are point-in-time.',
+    };
+    closedSummaryCache.set(key, { at: Date.now(), body });
+    if (closedSummaryCache.size > 20) {
+      const oldest = [...closedSummaryCache.keys()][0];
+      closedSummaryCache.delete(oldest);
+    }
+    res.json({ ...body, cached: false });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+}
+
 async function getResolvedAlerts(req, res) {
   try {
     // Closed history stays capped by default (12k+ rows); callers must ask
@@ -1297,6 +1378,7 @@ module.exports = {
   getActiveAlertsAll,
   getActivePerVehicleAlerts,
   getActiveAlertCounts,
+  getClosedSummaryByCC,
   getResolvedAlerts,
   listAlerts,
   getResolvedAlertCount,

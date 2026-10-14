@@ -319,6 +319,9 @@ const MIGRATIONS_SQL = `
   -- Track cost center per driver scoring / fleet vehicle
   ALTER TABLE driver_scoring ADD COLUMN IF NOT EXISTS cost_center_id INTEGER;
   CREATE INDEX IF NOT EXISTS idx_driver_scoring_cc ON driver_scoring(cost_center_id);
+  -- Alert Stats summary joins on UPPER(fleet_number)
+  CREATE INDEX IF NOT EXISTS idx_driver_scoring_fleet_upper ON driver_scoring(UPPER(fleet_number));
+  CREATE INDEX IF NOT EXISTS idx_fleet_vehicles_fleet_upper ON fleet_vehicles(UPPER(fleet_number));
 
   CREATE TABLE IF NOT EXISTS camera_status (
     fleet_number TEXT PRIMARY KEY,

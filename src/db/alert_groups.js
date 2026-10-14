@@ -433,6 +433,89 @@ async function getResolvedAlertGroupsWithMedia({ limit = 2000, from = null, to =
   }));
 }
 
+// Closed-alert summary for the Alert Stats page: genuine resolved alerts
+// (resolved=TRUE AND false_alert=FALSE) in a day window, aggregated by cost
+// center with top vehicles/drivers nested. All aggregation happens in SQL so
+// the 65k+ closed set never ships row-by-row. Fleet/CC resolution mirrors
+// costCenterLookup (first token of device_name, UPPER match) — approximate by
+// design; rows that resolve nowhere land in the Unassigned (null) bucket.
+// Driver is point-in-time from driver_scoring (no historical attribution).
+async function getClosedSummaryByCC({ days = 30, sourceType = null, topN = 8 } = {}) {
+  const d = Number.isFinite(Number(days)) ? Math.min(Math.max(Math.floor(Number(days)), 1), 365) : 30;
+  const n = Number.isFinite(Number(topN)) ? Math.min(Math.max(Math.floor(Number(topN)), 1), 50) : 8;
+  const params = [d];
+  let sourceSql = '';
+  if (sourceType === 'video' || sourceType === 'telematics') {
+    params.push(sourceType);
+    sourceSql = `AND g.source_type = $2`;
+  }
+  const base = `
+    WITH closed AS (
+      SELECT g.device_id, g.device_name, g.alarm_type, g.severity, g.count,
+             g.last_alert_ts, g.source_type,
+             UPPER(SPLIT_PART(COALESCE(NULLIF(TRIM(g.device_name), ''), g.device_id, ''), ' - ', 1)) AS fleet_guess
+      FROM alert_groups g
+      WHERE g.resolved = TRUE AND g.false_alert = FALSE
+        AND COALESCE(g.updated_at, g.last_alert_ts) > NOW() - ($1 || ' days')::INTERVAL
+        ${sourceSql}
+    ),
+    resolved AS (
+      SELECT c.*,
+             COALESCE(ds.cost_center_id, fv.cost_center_id) AS cc_id,
+             COALESCE(ds.fleet_number, fv.fleet_number, c.fleet_guess) AS fleet,
+             COALESCE(ds.registration_number, fv.registration_number) AS registration,
+             ds.driver AS driver
+      FROM closed c
+      LEFT JOIN driver_scoring ds ON UPPER(ds.fleet_number) = c.fleet_guess
+      LEFT JOIN fleet_vehicles fv ON UPPER(fv.fleet_number) = c.fleet_guess
+    )`;
+  const perCC = await query(
+    `${base}
+    SELECT r.cc_id, cc.name AS cc_name,
+           COUNT(*) AS groups, COALESCE(SUM(r.count), 0) AS alerts,
+           COUNT(DISTINCT r.fleet) AS vehicles,
+           COUNT(*) FILTER (WHERE LOWER(COALESCE(r.severity, 'medium')) = 'critical') AS critical,
+           COUNT(*) FILTER (WHERE LOWER(COALESCE(r.severity, 'medium')) = 'high') AS high,
+           COUNT(*) FILTER (WHERE LOWER(COALESCE(r.severity, 'medium')) = 'medium') AS medium,
+           COUNT(*) FILTER (WHERE LOWER(COALESCE(r.severity, 'medium')) = 'low') AS low,
+           MAX(r.last_alert_ts) AS last_seen
+    FROM resolved r
+    LEFT JOIN cost_centers cc ON cc.id = r.cc_id
+    GROUP BY r.cc_id, cc.name
+    ORDER BY alerts DESC`,
+    params
+  );
+  const tops = await query(
+    `${base},
+    ranked_vehicles AS (
+      SELECT r.cc_id, r.fleet AS fleet,
+             MAX(r.registration) AS registration, MAX(r.driver) AS driver,
+             COALESCE(SUM(r.count), 0) AS alerts, COUNT(*) AS groups,
+             MAX(r.last_alert_ts) AS last_seen,
+             ROW_NUMBER() OVER (PARTITION BY r.cc_id ORDER BY COALESCE(SUM(r.count), 0) DESC) AS rn
+      FROM resolved r
+      GROUP BY r.cc_id, r.fleet
+    ),
+    ranked_drivers AS (
+      SELECT r.cc_id, COALESCE(NULLIF(TRIM(r.driver), ''), 'Unknown') AS driver,
+             MAX(r.fleet) AS fleet, MAX(r.registration) AS registration,
+             COALESCE(SUM(r.count), 0) AS alerts, COUNT(*) AS groups,
+             MAX(r.last_alert_ts) AS last_seen,
+             ROW_NUMBER() OVER (PARTITION BY r.cc_id ORDER BY COALESCE(SUM(r.count), 0) DESC) AS rn
+      FROM resolved r
+      GROUP BY r.cc_id, COALESCE(NULLIF(TRIM(r.driver), ''), 'Unknown')
+    )
+    (SELECT 'vehicle' AS kind, cc_id, fleet, registration, driver, alerts, groups, last_seen
+     FROM ranked_vehicles WHERE rn <= ${n})
+    UNION ALL
+    (SELECT 'driver' AS kind, cc_id, fleet, registration, driver, alerts, groups, last_seen
+     FROM ranked_drivers WHERE rn <= ${n})
+    ORDER BY cc_id, kind, alerts DESC`,
+    params
+  );
+  return { perCC: perCC.rows, tops: tops.rows };
+}
+
 async function resolveAlertGroupById(id, updates) {
   const n = Number(id);
   if (!Number.isInteger(n) || n < 1) return null;
@@ -590,6 +673,7 @@ module.exports = {
   getActiveAlertGroupsWithMedia,
   getActivePerVehicleGroups,
   getActiveAlertGroupsPage,
+  getClosedSummaryByCC,
   getResolvedAlertGroupsWithMedia,
   getResolvedAlertGroupCount,
   resolveAlertGroup,
