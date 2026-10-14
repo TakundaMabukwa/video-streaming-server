@@ -7,11 +7,14 @@ async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, al
 
   const baseKey = `${deviceId}:${alarmType}`.toLowerCase();
 
-  // Reuse the current ACTIVE (unresolved) group for this device+type: bump the
-  // counter and refresh the timestamp so the group keeps showing recent time.
+  // Reuse the current LIVE group for this device+type (open AND genuine):
+  // bump the counter and refresh the timestamp so the group keeps showing
+  // recent time. A resolved or false-alerted row is dead — the event below
+  // starts a fresh group instead of resurrecting it.
   const active = await query(
     `SELECT group_key FROM alert_groups
-     WHERE device_id = $1 AND alarm_type = $2 AND source_type = $3 AND resolved = FALSE
+     WHERE device_id = $1 AND alarm_type = $2 AND source_type = $3
+       AND resolved = FALSE AND false_alert = FALSE
      ORDER BY last_alert_ts DESC NULLS LAST
      LIMIT 1`,
     [deviceId, alarmType, sourceType]
@@ -52,10 +55,24 @@ async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, al
   const result = await query(
     `INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon, speed, source_type, severity)
      VALUES ($1, $2, $3, $4, $5, 1, $6, $7, $8, $9, $10, $11, $12)
+     ON CONFLICT (group_key) DO NOTHING
      RETURNING id, group_key, count, alarm_type`,
     [groupKey, deviceId, deviceName, alarmType, alarmText, alertId, alarmTs || null, lat, lon, speed ?? null, sourceType, severity]
   );
-  return result.rows[0];
+  if (result.rows.length > 0) return result.rows[0];
+  // Base key lost a race (or is squatted by a dead row): bump-or-insert via
+  // the live-row arbiter instead of throwing. Never throws, never twins.
+  const raced = await query(
+    `INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon, speed, source_type, severity)
+     VALUES ($1, $2, $3, $4, $5, 1, $6, $7, $8, $9, $10, $11, $12)
+     ON CONFLICT (device_id, alarm_type, source_type) WHERE (resolved = FALSE AND false_alert = FALSE)
+     DO UPDATE SET count = alert_groups.count + 1, last_alert_id = EXCLUDED.last_alert_id,
+       last_alert_ts = EXCLUDED.last_alert_ts, updated_at = NOW()
+     RETURNING id, group_key, count, alarm_type`,
+    [`${baseKey}:${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+     deviceId, deviceName, alarmType, alarmText, alertId, alarmTs || null, lat, lon, speed ?? null, sourceType, severity]
+  );
+  return raced.rows[0] || null;
 }
 
 async function batchUpsertAlertGroups(groups) {
@@ -71,8 +88,36 @@ async function batchUpsertAlertGroups(groups) {
   for (const g of allowed) byKey.set(`${g.deviceId}:${g.alarmType}`.toLowerCase(), g);
   const entries = Array.from(byKey.values());
 
+  // Simple rule, live row first: bump the open+genuine row when there is one.
+  // Only rows with no live row reach the INSERT below, so it can never trip
+  // the live-row unique index — a group_key conflict means a dead base row.
+  const result = { rows: [] };
+  const pending = [];
+  for (const g of entries) {
+    const bumped = await query(
+      `UPDATE alert_groups SET
+         count = alert_groups.count + 1,
+         last_alert_id = $1, last_alert_ts = $2,
+         device_name = COALESCE(NULLIF($3, ''), alert_groups.device_name),
+         lat = COALESCE($4, alert_groups.lat), lon = COALESCE($5, alert_groups.lon),
+         speed = COALESCE($6, alert_groups.speed),
+         alarm_text = COALESCE(NULLIF($7, ''), alert_groups.alarm_text),
+         severity = COALESCE(NULLIF($8, ''), alert_groups.severity),
+         updated_at = NOW()
+       WHERE device_id = $9 AND alarm_type = $10 AND source_type = $11
+         AND resolved = FALSE AND false_alert = FALSE
+       RETURNING id, group_key, count, alarm_type`,
+      [g.alertId, g.alarmTs || null, g.deviceName || null, g.lat || null,
+       g.lon || null, g.speed ?? null, g.alarmText || null, g.severity || null,
+       g.deviceId, g.alarmType, g.sourceType || 'video']
+    );
+    if (bumped.rows.length > 0) result.rows.push(bumped.rows[0]);
+    else pending.push(g);
+  }
+  if (pending.length === 0) return result.rows;
+
   const params = [];
-  const placeholders = entries.map((g, i) => {
+  const placeholders = pending.map((g, i) => {
     const base = i * 11;
     params.push(
       `${g.deviceId}:${g.alarmType}`.toLowerCase(),
@@ -81,33 +126,45 @@ async function batchUpsertAlertGroups(groups) {
     );
     return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, 1, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}, $${base + 10}, $${base + 11})`;
   }).join(',');
-  // On conflict only bump ACTIVE groups. Resolved groups stay closed (Resolve sticks).
-  const result = await query(
-    `INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon, speed, severity)
-     VALUES ${placeholders}
-     ON CONFLICT (group_key) DO UPDATE SET
-       count = alert_groups.count + 1,
-       last_alert_id = EXCLUDED.last_alert_id,
-       last_alert_ts = EXCLUDED.last_alert_ts,
-       device_name = COALESCE(NULLIF(EXCLUDED.device_name, ''), alert_groups.device_name),
-       lat = COALESCE(EXCLUDED.lat, alert_groups.lat),
-       lon = COALESCE(EXCLUDED.lon, alert_groups.lon),
-       speed = COALESCE(EXCLUDED.speed, alert_groups.speed),
-       alarm_text = COALESCE(NULLIF(EXCLUDED.alarm_text, ''), alert_groups.alarm_text),
-       severity = COALESCE(NULLIF(EXCLUDED.severity, ''), alert_groups.severity),
-       updated_at = NOW()
-       WHERE alert_groups.resolved = FALSE
-       RETURNING id, group_key, count, alarm_type`,
-    params
-  );
+  // Base-key insert: a live row cannot exist here (bumped above), so the only
+  // possible conflict is a dead base row — killed by the WHERE, falls through.
+  // On the vanishing chance a live row lands between the bump and this
+  // insert, the live-index violation is caught below and retried via twins.
+  let inserted;
+  try {
+    inserted = await query(
+      `INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon, speed, severity)
+       VALUES ${placeholders}
+       ON CONFLICT (group_key) DO UPDATE SET
+         count = alert_groups.count + 1,
+         last_alert_id = EXCLUDED.last_alert_id,
+         last_alert_ts = EXCLUDED.last_alert_ts,
+         device_name = COALESCE(NULLIF(EXCLUDED.device_name, ''), alert_groups.device_name),
+         lat = COALESCE(EXCLUDED.lat, alert_groups.lat),
+         lon = COALESCE(EXCLUDED.lon, alert_groups.lon),
+         speed = COALESCE(EXCLUDED.speed, alert_groups.speed),
+         alarm_text = COALESCE(NULLIF(EXCLUDED.alarm_text, ''), alert_groups.alarm_text),
+         severity = COALESCE(NULLIF(EXCLUDED.severity, ''), alert_groups.severity),
+         updated_at = NOW()
+         WHERE alert_groups.resolved = FALSE AND alert_groups.false_alert = FALSE
+         RETURNING id, group_key, count, alarm_type`,
+      params
+    );
+  } catch (err) {
+    if (err?.code !== '23505') throw err;
+    inserted = { rows: [] }; // live row landed mid-flight: twin branch re-bumps
+  }
 
   // Simple rule, enforced by idx_ag_one_open (unique device/type/source while
-  // open): if an open group exists for the device+type, bump it; otherwise
-  // insert. A conflict against a RESOLVED base row returns nothing (the WHERE
-  // kills it) — fall through to the twin branch. A conflict against the open
-  // row bumps it right in the statement, so even a race converges.
+  // open and genuine): if an open, non-false group exists for the device+type,
+  // bump it; otherwise insert. A resolved OR false-alerted row is dead — a new
+  // event starts a fresh group. A conflict against a dead base row returns
+  // nothing (the WHERE kills it) — fall through to the twin branch. A conflict
+  // against the live row bumps it right in the statement, so even a race
+  // converges.
+  for (const r of inserted.rows) result.rows.push(r);
   const settled = new Set(result.rows.map((r) => r.group_key));
-  const twins = entries.filter((g) => !settled.has(`${g.deviceId}:${g.alarmType}`.toLowerCase()));
+  const twins = pending.filter((g) => !settled.has(`${g.deviceId}:${g.alarmType}`.toLowerCase()));
   if (twins.length > 0) {
     const stamp = Date.now().toString(36);
     for (const g of twins) {
@@ -121,10 +178,12 @@ async function batchUpsertAlertGroups(groups) {
         updated_at = NOW()`;
       const bumpParams = [g.alertId, g.alarmTs || null, g.deviceName || null, g.lat || null,
         g.lon || null, g.speed ?? null, g.alarmText || null, g.severity || null];
-      // 1. Bump the open row if there is one.
+      // 1. Bump the live row if there is one (open AND genuine — a resolved
+      // or false-alerted row is dead and must not absorb new events).
       const bumped = await query(
         `UPDATE alert_groups SET ${bumpCols}
-         WHERE device_id = $9 AND alarm_type = $10 AND source_type = $11 AND resolved = FALSE
+         WHERE device_id = $9 AND alarm_type = $10 AND source_type = $11
+           AND resolved = FALSE AND false_alert = FALSE
          RETURNING id, group_key, count, alarm_type`,
         [...bumpParams, g.deviceId, g.alarmType, g.sourceType || 'video']
       );
@@ -146,16 +205,25 @@ async function batchUpsertAlertGroups(groups) {
         result.rows.push(baseIns.rows[0]);
         continue;
       }
-      // 3. Base squatted by a resolved row: mint one twin. The unique open
-      // index guarantees this is the only open row — a racing installations
-      // converges via the ON CONFLICT bump instead of a second twin.
+      // 3. Base squatted by a dead row: mint one twin. The unique live index
+      // guarantees this is the only live row — a racer converges via the
+      // ON CONFLICT bump instead of a second twin. (Placeholders $13-$20
+      // carry the bump values; $1-$12 are the insert row.)
       const freshKey = `${baseKey}:${stamp}` +
         `${g.alertId ? '-' + String(g.alertId).slice(-6) : ''}-${Math.random().toString(36).slice(2, 7)}`;
+      const twinBumpCols = `count = alert_groups.count + 1,
+        last_alert_id = $13, last_alert_ts = $14,
+        device_name = COALESCE(NULLIF($15, ''), alert_groups.device_name),
+        lat = COALESCE($16, alert_groups.lat), lon = COALESCE($17, alert_groups.lon),
+        speed = COALESCE($18, alert_groups.speed),
+        alarm_text = COALESCE(NULLIF($19, ''), alert_groups.alarm_text),
+        severity = COALESCE(NULLIF($20, ''), alert_groups.severity),
+        updated_at = NOW()`;
       const twinIns = await query(
         `INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon, speed, source_type, severity)
          VALUES ($1, $2, $3, $4, $5, 1, $6, $7, $8, $9, $10, $11, $12)
-         ON CONFLICT (device_id, alarm_type, source_type) WHERE resolved = FALSE
-         DO UPDATE SET ${bumpCols}
+         ON CONFLICT (device_id, alarm_type, source_type) WHERE (resolved = FALSE AND false_alert = FALSE)
+         DO UPDATE SET ${twinBumpCols}
          RETURNING id, group_key, count, alarm_type`,
         [freshKey, g.deviceId, g.deviceName || null, g.alarmType, g.alarmText || null,
          g.alertId, g.alarmTs || null, g.lat || null, g.lon || null, g.speed ?? null, g.sourceType || 'video', g.severity || null,

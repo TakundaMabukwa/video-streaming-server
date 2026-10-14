@@ -322,11 +322,14 @@ const MIGRATIONS_SQL = `
   -- Alert Stats summary joins on UPPER(fleet_number)
   CREATE INDEX IF NOT EXISTS idx_driver_scoring_fleet_upper ON driver_scoring(UPPER(fleet_number));
   CREATE INDEX IF NOT EXISTS idx_fleet_vehicles_fleet_upper ON fleet_vehicles(UPPER(fleet_number));
-  -- One open group per device+type+source. This is what makes "bump if open,
-  -- else insert" airtight: the DB itself rejects a second open twin, so every
-  -- creation path converges instead of racing.
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_ag_one_open
-    ON alert_groups(device_id, alarm_type, source_type) WHERE resolved = FALSE;
+  -- One live group per device+type+source (open AND genuine). This is what
+  -- makes "bump if live, else insert" airtight: the DB itself rejects a second
+  -- live twin, so every creation path converges instead of racing. A resolved
+  -- or false-alerted row is dead — the next event starts a fresh group.
+  DROP INDEX IF EXISTS idx_ag_one_open;
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_ag_one_open_live
+    ON alert_groups(device_id, alarm_type, source_type)
+    WHERE (resolved = FALSE AND false_alert = FALSE);
 
   CREATE TABLE IF NOT EXISTS camera_status (
     fleet_number TEXT PRIMARY KEY,
