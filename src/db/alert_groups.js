@@ -117,14 +117,18 @@ async function batchUpsertAlertGroups(groups) {
   if (twins.length > 0) {
     const stamp = Date.now().toString(36);
     for (const g of twins) {
-      const existing = await query(
-        `SELECT group_key FROM alert_groups
-         WHERE device_id = $1 AND alarm_type = $2 AND source_type = $3 AND resolved = FALSE
-         ORDER BY last_alert_ts DESC NULLS LAST
-         LIMIT 1`,
-        [g.deviceId, g.alarmType, g.sourceType || 'video']
-      );
-      if (existing.rows.length > 0) {
+      const twinKind = async () => {
+        const chk = await query(
+          `SELECT group_key FROM alert_groups
+           WHERE device_id = $1 AND alarm_type = $2 AND source_type = $3 AND resolved = FALSE
+           ORDER BY last_alert_ts DESC NULLS LAST
+           LIMIT 1`,
+          [g.deviceId, g.alarmType, g.sourceType || 'video']
+        );
+        return chk.rows.length > 0 ? chk.rows[0].group_key : null;
+      };
+      let targetKey = await twinKind();
+      if (targetKey) {
         const bumped = await query(
           `UPDATE alert_groups SET
              count = alert_groups.count + 1,
@@ -139,15 +143,32 @@ async function batchUpsertAlertGroups(groups) {
              updated_at = NOW()
            WHERE group_key = $9 AND resolved = FALSE
            RETURNING id, group_key, count, alarm_type`,
-          [g.alertId, g.alarmTs || null, g.deviceName || null, g.lat || null, g.lon || null, g.speed ?? null, g.alarmText || null, g.severity || null, existing.rows[0].group_key]
+          [g.alertId, g.alarmTs || null, g.deviceName || null, g.lat || null, g.lon || null, g.speed ?? null, g.alarmText || null, g.severity || null, targetKey]
         );
         if (bumped.rows.length > 0) {
           result.rows.push(bumped.rows[0]);
           continue;
         }
+        // Bump raced a resolve (0 rows): re-check instead of blindly minting —
+        // the resolver may have closed it while a sibling twin stayed open.
+        targetKey = await twinKind();
+        if (targetKey) {
+          const retry = await query(
+            `UPDATE alert_groups SET count = alert_groups.count + 1, last_alert_id = $1,
+                    last_alert_ts = $2, updated_at = NOW()
+             WHERE group_key = $3 AND resolved = FALSE
+             RETURNING id, group_key, count, alarm_type`,
+            [g.alertId, g.alarmTs || null, targetKey]
+          );
+          if (retry.rows.length > 0) {
+            result.rows.push(retry.rows[0]);
+            continue;
+          }
+        }
       }
       const freshKey = `${g.deviceId}:${g.alarmType}`.toLowerCase() + ':' + stamp +
         `${g.alertId ? '-' + String(g.alertId).slice(-6) : ''}-${Math.random().toString(36).slice(2, 7)}`;
+      console.log(`[TWIN-MINT] ${g.deviceId}:${g.alarmType} (${g.sourceType || 'video'}) -> ${freshKey} (no open twin at mint)`);
       const inserted = await query(
         `INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon, speed, source_type, severity)
          VALUES ($1, $2, $3, $4, $5, 1, $6, $7, $8, $9, $10, $11, $12)
