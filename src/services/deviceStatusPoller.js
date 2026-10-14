@@ -425,7 +425,10 @@ async function processZoneForDevice(deviceId, fleetNumber, licensePlate, lat, lo
     for (const z of zones) {
       if (insideZones.some(iz => iz.id === z.id)) continue; // Already inside
       if (wasInside.has(z.id)) continue; // Was inside, exit handled separately
-      
+      // Approaching alerts are high-risk-only: no-go / no-stopping zones never
+      // emit here (their entries + stops still alert via the entry/stop paths).
+      if (!z.is_high_risk) continue;
+
       try {
         const intersections = turf.lineIntersect(trajectoryVector, z.polygon);
         if (intersections.features.length > 0) {

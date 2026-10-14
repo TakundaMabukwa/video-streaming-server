@@ -6,13 +6,21 @@ const { batchResolveDeviceCC, buildStrictAlertFilter } = require('../controllers
 
 const router = express.Router();
 
+// Light event columns: everything except raw_data (JSONB toast payload).
+// raw_data is only needed by the history id-synthesis lookup, never by list
+// views — selecting it detoasts kilobytes per row for no reason.
+const EVENT_COLUMNS = `id, device_id, vehicle_id, plate, event_type, event_code,
+  severity, latitude, longitude, speed, address, driver_name, description,
+  event_time, created_at, license_plate, fleet_number, distance,
+  duration_seconds, zone_name`;
+
 // Get all telematics events for a vehicle
 router.get('/vehicle/:deviceId', async (req, res) => {
   try {
     const { deviceId } = req.params;
     const { limit = 100, type, days = 30 } = req.query;
 
-    let query = `SELECT * FROM telematics_events WHERE device_id = $1`;
+    let query = `SELECT ${EVENT_COLUMNS} FROM telematics_events WHERE device_id = $1`;
     const params = [deviceId];
     let paramIdx = 2;
 
@@ -42,7 +50,7 @@ router.get('/events/:deviceId', async (req, res) => {
     const { deviceId } = req.params;
     const { from, to, limit = 500 } = req.query;
 
-    let query = `SELECT * FROM telematics_events WHERE device_id = $1`;
+    let query = `SELECT ${EVENT_COLUMNS} FROM telematics_events WHERE device_id = $1`;
     const params = [deviceId];
     let paramIdx = 2;
 
@@ -72,7 +80,7 @@ router.get('/events', async (req, res) => {
   try {
     const { deviceId, type, days = 30, limit = 500 } = req.query;
 
-    let query = `SELECT * FROM telematics_events WHERE 1=1`;
+    let query = `SELECT ${EVENT_COLUMNS} FROM telematics_events WHERE 1=1`;
     const params = [];
     let paramIdx = 1;
 
@@ -408,7 +416,7 @@ router.get('/events-today/:deviceId', async (req, res) => {
   try {
     const { deviceId } = req.params;
     const result = await db.query(
-      `SELECT * FROM telematics_events
+      `SELECT ${EVENT_COLUMNS} FROM telematics_events
        WHERE device_id = $1 AND event_time >= (NOW() AT TIME ZONE 'UTC')::date
        ORDER BY event_time ASC`,
       [deviceId]
@@ -440,10 +448,19 @@ router.get('/vehicle-alerts', async (req, res) => {
 // All unresolved alert groups for a specific device (used by resolve modal)
 // Returns grouped alerts (same type grouped together with count)
 // Matches video camera id AND Geotab sibling ids for the same fleet.
+// Camera and Geotab ids never overlap, so the fleet linkage below is the only
+// thing joining the two worlds — keep every clause in sync (discovery must
+// find at least what the final match accepts).
+// Uncapped by default (lane views need everything); optional keyset cursor
+// (?cursorTs=ISO&cursorId=N&limit=) pages huge vehicles without truncation.
+function normalizeVehicleName(s) {
+  return String(s || '').replace(/\//g, ' - ').replace(/\s+/g, ' ').trim();
+}
+
 router.get('/vehicle-alerts/:deviceId', async (req, res) => {
   try {
     const { deviceId } = req.params;
-    const { fleet, includeAll } = req.query;
+    const { fleet, includeAll, cursorTs, cursorId, limit } = req.query;
 
     let where = `WHERE ag.resolved = FALSE AND ag.false_alert = FALSE`;
     const params = [];
@@ -454,14 +471,14 @@ router.get('/vehicle-alerts/:deviceId', async (req, res) => {
     const fleetName = String(fleet || '').trim();
 
     // Resolve fleet from explicit query or from device_name / cost-center lookup
-    let fleetKey = fleetName;
+    let fleetKey = fleetName ? normalizeVehicleName(fleetName).split(' - ')[0].trim() || null : null;
     if (!fleetKey && deviceId && deviceId !== 'none') {
       try {
         const named = await db.query(
           `SELECT device_name FROM alert_groups WHERE device_id = $1 ORDER BY last_alert_ts DESC NULLS LAST LIMIT 1`,
           [deviceId]
         );
-        const deviceName = named.rows[0]?.device_name || '';
+        const deviceName = normalizeVehicleName(named.rows[0]?.device_name || '');
         const { resolveFleetNumber } = require('../services/costCenterLookup');
         fleetKey = await resolveFleetNumber({ vehicleRegistration: deviceName, deviceId }) || null;
         if (!fleetKey && deviceName) fleetKey = String(deviceName).split(' - ')[0].trim() || null;
@@ -491,14 +508,25 @@ router.get('/vehicle-alerts/:deviceId', async (req, res) => {
         vs.rows.forEach((r) => r.device_id && idSet.add(String(r.device_id)));
       } catch (_) { /* optional */ }
       try {
-        const byName = await db.query(
-          `SELECT DISTINCT device_id FROM alert_groups
-           WHERE split_part(coalesce(device_name, ''), ' - ', 1) ILIKE $1
-              OR split_part(coalesce(device_name, ''), ' - ', 2) ILIKE $1
-           LIMIT 500`,
-          [fleetKey]
-        );
-        byName.rows.forEach((r) => r.device_id && idSet.add(String(r.device_id)));
+        // Discovery must cover everything the final match accepts: normalized
+        // tokens 1-3 plus full-name substring (looped — no LIMIT truncation).
+        let lastSeen = null;
+        for (let page = 0; page < 40; page++) {
+          const found = await db.query(
+            `SELECT DISTINCT device_id FROM alert_groups
+             WHERE (split_part(replace(coalesce(device_name, ''), '/', ' - '), ' - ', 1) ILIKE $1
+                OR split_part(replace(coalesce(device_name, ''), '/', ' - '), ' - ', 2) ILIKE $1
+                OR split_part(replace(coalesce(device_name, ''), '/', ' - '), ' - ', 3) ILIKE $1
+                OR replace(coalesce(device_name, ''), '/', ' - ') ILIKE $2)
+               ${lastSeen ? `AND device_id > $3` : ''}
+             ORDER BY device_id LIMIT 500`,
+            lastSeen ? [fleetKey, `%${fleetKey}%`, lastSeen] : [fleetKey, `%${fleetKey}%`]
+          );
+          if (found.rows.length === 0) break;
+          found.rows.forEach((r) => r.device_id && idSet.add(String(r.device_id)));
+          lastSeen = found.rows[found.rows.length - 1].device_id;
+          if (found.rows.length < 500) break;
+        }
       } catch (_) { /* ignore */ }
     }
 
@@ -516,23 +544,52 @@ router.get('/vehicle-alerts/:deviceId', async (req, res) => {
     if (fleetKey) {
       params.push(fleetKey);
       params.push(`%${fleetKey}%`);
-      matchClauses.push(`split_part(coalesce(ag.device_name, ''), ' - ', 1) ILIKE $${idx}`);
-      matchClauses.push(`split_part(coalesce(ag.device_name, ''), ' - ', 2) ILIKE $${idx}`);
-      matchClauses.push(`ag.device_name ILIKE $${idx + 1}`);
+      const normName = `replace(coalesce(ag.device_name, ''), '/', ' - ')`;
+      matchClauses.push(`split_part(${normName}, ' - ', 1) ILIKE $${idx}`);
+      matchClauses.push(`split_part(${normName}, ' - ', 2) ILIKE $${idx}`);
+      matchClauses.push(`split_part(${normName}, ' - ', 3) ILIKE $${idx}`);
+      matchClauses.push(`${normName} ILIKE $${idx + 1}`);
       idx += 2;
     }
     where += ` AND (${matchClauses.join(' OR ')})`;
+
+    // Optional keyset cursor for huge vehicles (default uncapped — lane views
+    // page with this rather than LIMIT so nothing is ever truncated).
+    let cursorSql = '';
+    const cursorTsRaw = cursorTs ? String(cursorTs).trim() : '';
+    if (cursorTsRaw && !Number.isNaN(Date.parse(cursorTsRaw))) {
+      params.push(new Date(cursorTsRaw).toISOString());
+      const cIdx = idx++;
+      const cursorIdN = cursorId != null && cursorId !== '' && Number.isFinite(Number(cursorId)) ? Number(cursorId) : null;
+      if (cursorIdN != null) {
+        params.push(cursorIdN);
+        cursorSql = ` AND ((ag.last_alert_ts < $${cIdx}::timestamptz) OR (ag.last_alert_ts = $${cIdx}::timestamptz AND ag.id < $${idx++}))`;
+      } else {
+        cursorSql = ` AND (ag.last_alert_ts < $${cIdx}::timestamptz)`;
+      }
+    }
+    const pageLimit = limit != null && limit !== '' ? Math.min(Math.max(parseInt(limit, 10) || 10000, 1), 20000) : null;
 
     const result = await db.query(
       `SELECT ag.*, COALESCE(a.lat, ag.lat) AS lat, COALESCE(a.lon, ag.lon) AS lon
        FROM alert_groups ag
        LEFT JOIN alerts a ON a.id = ag.last_alert_id
-       ${where}
-       ORDER BY ag.last_alert_ts DESC`,
+       ${where}${cursorSql}
+       ORDER BY ag.last_alert_ts DESC NULLS LAST, ag.id DESC
+       ${pageLimit ? `LIMIT ${pageLimit + 1}` : ''}`,
       params
     );
 
-    const groups = result.rows;
+    let page = null;
+    let rows = result.rows;
+    if (pageLimit) {
+      const hasMore = rows.length > pageLimit;
+      rows = hasMore ? rows.slice(0, pageLimit) : rows;
+      const last = rows[rows.length - 1];
+      page = { hasMore, nextCursorTs: hasMore && last ? last.last_alert_ts : null, nextCursorId: hasMore && last ? last.id : null };
+    }
+
+    const groups = rows;
     let alerts = groups;
     try {
       const { deviceCC } = await batchResolveDeviceCC(groups);
@@ -553,7 +610,7 @@ router.get('/vehicle-alerts/:deviceId', async (req, res) => {
       console.error('[vehicle-alerts] transform failed:', transformError.message);
     }
 
-    res.json({ success: true, alerts, count: alerts.length, device_ids: idList, fleet: fleetKey || null });
+    res.json({ success: true, alerts, count: alerts.length, device_ids: idList, fleet: fleetKey || null, page });
   } catch (error) {
     console.error('[vehicle-alerts] Error:', error.message, error.stack);
     res.status(500).json({ success: false, message: error.message });

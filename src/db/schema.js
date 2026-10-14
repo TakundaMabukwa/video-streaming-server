@@ -467,6 +467,11 @@ const MIGRATIONS_SQL = `
   ALTER TABLE telematics_events ADD COLUMN IF NOT EXISTS duration_seconds INTEGER;
   ALTER TABLE telematics_events ADD COLUMN IF NOT EXISTS zone_name TEXT;
   CREATE INDEX IF NOT EXISTS idx_telematics_events_device_time ON telematics_events(device_id, event_time);
+  -- History id-synthesis reads raw_data->>'id': expression index avoids heap
+  -- scans on that lookup. raw_data uses LZ4 (PG14+) for faster detoast of the
+  -- Toast payload on the list endpoints that still select it.
+  CREATE INDEX IF NOT EXISTS idx_telematics_events_raw_id ON telematics_events((raw_data ->> 'id'));
+  ALTER TABLE telematics_events ALTER COLUMN raw_data SET COMPRESSION lz4;
 
   -- Add source_type to alerts and alert_groups (video vs telematics)
   ALTER TABLE alerts ADD COLUMN IF NOT EXISTS source_type TEXT DEFAULT 'video';
