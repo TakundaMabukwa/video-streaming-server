@@ -327,6 +327,9 @@ const MIGRATIONS_SQL = `
   -- live twin, so every creation path converges instead of racing. A resolved
   -- or false-alerted row is dead — the next event starts a fresh group.
   DROP INDEX IF EXISTS idx_ag_one_open;
+  -- A previous deploy created this name with the resolved-only predicate;
+  -- drop first so the false_alert-aware predicate below always applies.
+  DROP INDEX IF EXISTS idx_ag_one_open_live;
   CREATE UNIQUE INDEX IF NOT EXISTS idx_ag_one_open_live
     ON alert_groups(device_id, alarm_type, source_type)
     WHERE (resolved = FALSE AND false_alert = FALSE);
