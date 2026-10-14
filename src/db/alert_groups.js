@@ -101,84 +101,68 @@ async function batchUpsertAlertGroups(groups) {
     params
   );
 
-  // A conflict against a RESOLVED group satisfies neither the INSERT nor the
-  // DO UPDATE (the WHERE kills it), so no row comes back. Mirror upsertAlertGroup()
-  // and open a fresh active twin for those keys — otherwise the raw alert is
-  // already in `alerts`, the sync high-water mark advances past it, and the
-  // event never reaches alert_groups or the frontend.
-  //
-  // The base key is squatted by the resolved row forever, so a naive new-group
-  // per event leaves the event as a separate single-count group on every sync
-  // tick (seen live: 600+ separate "Driver Not Detected" groups for one device).
-  // First reuse an existing OPEN group for the same device+type and bump its
-  // count; only open a new twin when no open group exists at all.
+  // Simple rule, enforced by idx_ag_one_open (unique device/type/source while
+  // open): if an open group exists for the device+type, bump it; otherwise
+  // insert. A conflict against a RESOLVED base row returns nothing (the WHERE
+  // kills it) — fall through to the twin branch. A conflict against the open
+  // row bumps it right in the statement, so even a race converges.
   const settled = new Set(result.rows.map((r) => r.group_key));
   const twins = entries.filter((g) => !settled.has(`${g.deviceId}:${g.alarmType}`.toLowerCase()));
   if (twins.length > 0) {
     const stamp = Date.now().toString(36);
     for (const g of twins) {
-      const twinKind = async () => {
-        const chk = await query(
-          `SELECT group_key FROM alert_groups
-           WHERE device_id = $1 AND alarm_type = $2 AND source_type = $3 AND resolved = FALSE
-           ORDER BY last_alert_ts DESC NULLS LAST
-           LIMIT 1`,
-          [g.deviceId, g.alarmType, g.sourceType || 'video']
-        );
-        return chk.rows.length > 0 ? chk.rows[0].group_key : null;
-      };
-      let targetKey = await twinKind();
-      if (targetKey) {
-        const bumped = await query(
-          `UPDATE alert_groups SET
-             count = alert_groups.count + 1,
-             last_alert_id = $1,
-             last_alert_ts = $2,
-             device_name = COALESCE(NULLIF($3, ''), alert_groups.device_name),
-             lat = COALESCE($4, alert_groups.lat),
-             lon = COALESCE($5, alert_groups.lon),
-             speed = COALESCE($6, alert_groups.speed),
-             alarm_text = COALESCE(NULLIF($7, ''), alert_groups.alarm_text),
-             severity = COALESCE(NULLIF($8, ''), alert_groups.severity),
-             updated_at = NOW()
-           WHERE group_key = $9 AND resolved = FALSE
-           RETURNING id, group_key, count, alarm_type`,
-          [g.alertId, g.alarmTs || null, g.deviceName || null, g.lat || null, g.lon || null, g.speed ?? null, g.alarmText || null, g.severity || null, targetKey]
-        );
-        if (bumped.rows.length > 0) {
-          result.rows.push(bumped.rows[0]);
-          continue;
-        }
-        // Bump raced a resolve (0 rows): re-check instead of blindly minting —
-        // the resolver may have closed it while a sibling twin stayed open.
-        targetKey = await twinKind();
-        if (targetKey) {
-          const retry = await query(
-            `UPDATE alert_groups SET count = alert_groups.count + 1, last_alert_id = $1,
-                    last_alert_ts = $2, updated_at = NOW()
-             WHERE group_key = $3 AND resolved = FALSE
-             RETURNING id, group_key, count, alarm_type`,
-            [g.alertId, g.alarmTs || null, targetKey]
-          );
-          if (retry.rows.length > 0) {
-            result.rows.push(retry.rows[0]);
-            continue;
-          }
-        }
+      const bumpCols = `count = alert_groups.count + 1,
+        last_alert_id = $1, last_alert_ts = $2,
+        device_name = COALESCE(NULLIF($3, ''), alert_groups.device_name),
+        lat = COALESCE($4, alert_groups.lat), lon = COALESCE($5, alert_groups.lon),
+        speed = COALESCE($6, alert_groups.speed),
+        alarm_text = COALESCE(NULLIF($7, ''), alert_groups.alarm_text),
+        severity = COALESCE(NULLIF($8, ''), alert_groups.severity),
+        updated_at = NOW()`;
+      const bumpParams = [g.alertId, g.alarmTs || null, g.deviceName || null, g.lat || null,
+        g.lon || null, g.speed ?? null, g.alarmText || null, g.severity || null];
+      // 1. Bump the open row if there is one.
+      const bumped = await query(
+        `UPDATE alert_groups SET ${bumpCols}
+         WHERE device_id = $9 AND alarm_type = $10 AND source_type = $11 AND resolved = FALSE
+         RETURNING id, group_key, count, alarm_type`,
+        [...bumpParams, g.deviceId, g.alarmType, g.sourceType || 'video']
+      );
+      if (bumped.rows.length > 0) {
+        result.rows.push(bumped.rows[0]);
+        continue;
       }
-      const freshKey = `${g.deviceId}:${g.alarmType}`.toLowerCase() + ':' + stamp +
-        `${g.alertId ? '-' + String(g.alertId).slice(-6) : ''}-${Math.random().toString(36).slice(2, 7)}`;
-      console.log(`[TWIN-MINT] ${g.deviceId}:${g.alarmType} (${g.sourceType || 'video'}) -> ${freshKey} (no open twin at mint)`);
-      const inserted = await query(
+      // 2. No open row: insert. Base key first (reclaims it when free)...
+      const baseKey = `${g.deviceId}:${g.alarmType}`.toLowerCase();
+      const baseIns = await query(
         `INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon, speed, source_type, severity)
          VALUES ($1, $2, $3, $4, $5, 1, $6, $7, $8, $9, $10, $11, $12)
+         ON CONFLICT (group_key) DO NOTHING
          RETURNING id, group_key, count, alarm_type`,
-        [freshKey, g.deviceId, g.deviceName || null, g.alarmType, g.alarmText || null,
+        [baseKey, g.deviceId, g.deviceName || null, g.alarmType, g.alarmText || null,
          g.alertId, g.alarmTs || null, g.lat || null, g.lon || null, g.speed ?? null, g.sourceType || 'video', g.severity || null]
       );
-      if (inserted.rows.length > 0) result.rows.push(inserted.rows[0]);
+      if (baseIns.rows.length > 0) {
+        result.rows.push(baseIns.rows[0]);
+        continue;
+      }
+      // 3. Base squatted by a resolved row: mint one twin. The unique open
+      // index guarantees this is the only open row — a racing installations
+      // converges via the ON CONFLICT bump instead of a second twin.
+      const freshKey = `${baseKey}:${stamp}` +
+        `${g.alertId ? '-' + String(g.alertId).slice(-6) : ''}-${Math.random().toString(36).slice(2, 7)}`;
+      const twinIns = await query(
+        `INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon, speed, source_type, severity)
+         VALUES ($1, $2, $3, $4, $5, 1, $6, $7, $8, $9, $10, $11, $12)
+         ON CONFLICT (device_id, alarm_type, source_type) WHERE resolved = FALSE
+         DO UPDATE SET ${bumpCols}
+         RETURNING id, group_key, count, alarm_type`,
+        [freshKey, g.deviceId, g.deviceName || null, g.alarmType, g.alarmText || null,
+         g.alertId, g.alarmTs || null, g.lat || null, g.lon || null, g.speed ?? null, g.sourceType || 'video', g.severity || null,
+         ...bumpParams]
+      );
+      if (twinIns.rows.length > 0) result.rows.push(twinIns.rows[0]);
     }
-    console.log(`[ALERT-GROUPS] resolved-key twins: ${twins.length} device+type(s) reconciled`);
   }
 
   return result.rows;
