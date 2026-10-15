@@ -44,6 +44,29 @@ function invalidateVehicleCostCenter(fleetNumber) {
   if (fleetNumber) lookupCache.delete(String(fleetNumber).toUpperCase());
 }
 
+// DB-backed fleet check: is this token a real fleet (driver_scoring /
+// fleet_vehicles, case-insensitive)? Catches single-letter (B27, M10) and
+// numeric (230, 231) fleets the regexes reject. Cached 5 min.
+const fleetTokenCache = new Map();
+async function fleetTokenExists(token) {
+  const key = String(token || '').trim().toUpperCase();
+  if (!key || key.length > 24) return null;
+  const cached = fleetTokenCache.get(key);
+  if (cached && Date.now() - cached.ts < LOOKUP_CACHE_TTL) return cached.value;
+  let value = null;
+  try {
+    const r = await query(
+      `SELECT fleet_number FROM driver_scoring WHERE UPPER(fleet_number) = $1
+       UNION SELECT fleet_number FROM fleet_vehicles WHERE UPPER(fleet_number) = $1
+       LIMIT 1`,
+      [key]
+    );
+    if (r.rows.length > 0) value = r.rows[0].fleet_number;
+  } catch (_) { value = null; }
+  fleetTokenCache.set(key, { value, ts: Date.now() });
+  return value;
+}
+
 // Device-code -> fleet-number resolution cache (5-min TTL)
 const fleetCache = new Map();
 const FLEET_CACHE_TTL = 5 * 60 * 1000;
@@ -58,8 +81,19 @@ function looksLikeFleetCode(value) {
 
 // Extract the fleet prefix from registration/plate strings like "PB29 - JHD716FS"
 // or "32 - EX55 - LCL660MP" (numeric prefix + fleet code + plate).
-function fleetFromRegistration(value) {
-  const s = String(value || '').trim();
+// Normalizes the same way as the frontend fleetKeyOf(): parenthetical suffixes
+// ("FM13 (RAPID)" -> "FM13") and slashes ("VT11/PD124") are stripped first, so
+// camera and Geotab names resolve to one fleet key.
+function normalizeFleetString(value) {
+  return String(value || '')
+    .replace(/\([^)]*\)/g, ' ')
+    .replace(/\//g, ' - ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+async function fleetFromRegistration(value) {
+  const s = normalizeFleetString(value);
   if (!s) return null;
   const parts = s.split(' - ').map((p) => p.trim()).filter(Boolean);
   if (parts.length === 0) return null;
@@ -73,6 +107,16 @@ function fleetFromRegistration(value) {
   const first = parts[0];
   if (first && looksLikeFleetCode(first.split(/\s+/)[0])) return first.split(/\s+/)[0];
   if (looksLikeFleetCode(first)) return first;
+
+  // DB-backed last resort: single-letter (B27, M10) and short numeric (230,
+  // 231) fleets fail the regexes but live in the fleet tables. Exact match
+  // only — shared depot prefixes never equal a fleet row, so no false merges.
+  for (const p of parts) {
+    const t = p.toUpperCase();
+    if (!/^[A-Z]\d+$/.test(t) && !/^\d{2,3}$/.test(t)) continue;
+    const hit = await fleetTokenExists(t);
+    if (hit) return hit;
+  }
   return null;
 }
 
@@ -81,8 +125,12 @@ function fleetFromRegistration(value) {
 // (e.g. 'EX41') using the local Geotab/telematics indexes.
 async function resolveFleetNumber({ deviceId, vehicleRegistration, fleetNumber } = {}) {
   if (fleetNumber && looksLikeFleetCode(fleetNumber)) return String(fleetNumber).trim();
+  if (fleetNumber) {
+    const known = await fleetTokenExists(fleetNumber);
+    if (known) return known;
+  }
 
-  const regFleet = fleetFromRegistration(vehicleRegistration);
+  const regFleet = await fleetFromRegistration(vehicleRegistration);
   if (regFleet) return regFleet;
 
   const dev = String(deviceId || '').trim();
@@ -104,7 +152,7 @@ async function resolveFleetNumber({ deviceId, vehicleRegistration, fleetNumber }
       // fleet code - only accept values that actually look like a fleet number.
       value = g.rows[0].fleet_number && looksLikeFleetCode(g.rows[0].fleet_number)
         ? g.rows[0].fleet_number
-        : (fleetFromRegistration(g.rows[0].license_plate) || fleetFromRegistration(g.rows[0].name));
+        : (await fleetFromRegistration(g.rows[0].license_plate) || await fleetFromRegistration(g.rows[0].name));
     }
 
     if (!value) {
@@ -114,7 +162,7 @@ async function resolveFleetNumber({ deviceId, vehicleRegistration, fleetNumber }
       );
       if (vs.rows.length > 0) {
         value = vs.rows[0].fleet_number
-          || fleetFromRegistration(vs.rows[0].plate);
+          || await fleetFromRegistration(vs.rows[0].plate);
       }
     }
 
@@ -126,12 +174,17 @@ async function resolveFleetNumber({ deviceId, vehicleRegistration, fleetNumber }
       );
       if (te.rows.length > 0) {
         value = te.rows[0].fleet_number
-          || fleetFromRegistration(te.rows[0].plate)
-          || fleetFromRegistration(te.rows[0].license_plate);
+          || await fleetFromRegistration(te.rows[0].plate)
+          || await fleetFromRegistration(te.rows[0].license_plate);
       }
     }
 
     if (!value && looksLikeFleetCode(dev)) value = dev;
+    if (!value) {
+      // Fleet-as-device-id (B27, NCR rows) that fails the regexes.
+      const known = await fleetTokenExists(dev);
+      if (known) value = known;
+    }
   } catch (err) {
     console.error('[costCenterLookup] resolveFleetNumber error:', err.message);
     value = null;
@@ -144,4 +197,16 @@ async function resolveFleetNumber({ deviceId, vehicleRegistration, fleetNumber }
   return value == null ? null : value;
 }
 
-module.exports = { findVehicleCostCenterId, invalidateVehicleCostCenter, resolveFleetNumber };
+// Canonical fleet token from any name string. Mirrors the frontend
+// fleetKeyOf() preference order: real 2+-letter codes, then single-letter +
+// digits (B27), then short numerics (230) — a lone depot prefix never wins
+// while a better token exists.
+function fleetTokenFromName(value) {
+  const cleaned = normalizeFleetString(value);
+  if (!cleaned) return '';
+  const tokens = cleaned.split(' - ').map((p) => p.trim().toUpperCase()).filter(Boolean);
+  const byShape = (re) => tokens.find((t) => re.test(t) && t.length <= 24);
+  return byShape(/^[A-Z]{2,}[\d-]*$/) || byShape(/^[A-Z]\d+$/) || byShape(/^\d{2,3}$/) || '';
+}
+
+module.exports = { findVehicleCostCenterId, invalidateVehicleCostCenter, resolveFleetNumber, normalizeFleetString, fleetFromRegistration, looksLikeFleetCode, fleetTokenExists, fleetTokenFromName };

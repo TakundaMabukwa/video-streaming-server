@@ -14,15 +14,77 @@ const EVENT_COLUMNS = `id, device_id, vehicle_id, plate, event_type, event_code,
   event_time, created_at, license_plate, fleet_number, distance,
   duration_seconds, zone_name`;
 
-// Get all telematics events for a vehicle
+// Sibling device ids for a fleet (camera + Geotab worlds). Same canonical
+// normalization everywhere: parens stripped, slashes split, case-insensitive.
+// Callers query device_id = ANY(ids) so one fleet param covers all siblings.
+async function expandFleetDeviceIds(fleetKey) {
+  const ids = new Set();
+  if (!fleetKey) return [];
+  const norm = `regexp_replace(replace(coalesce(device_name, ''), '/', ' - '), '\\([^)]*\\)', ' ', 'g')`;
+  const like = `%${fleetKey}%`;
+  try {
+    const g = await db.query(
+      `SELECT id FROM geotab_devices WHERE upper(trim(fleet_number)) = upper($1)`, [fleetKey]);
+    g.rows.forEach((r) => r.id && ids.add(String(r.id)));
+  } catch (_) {}
+  try {
+    const vs = await db.query(
+      `SELECT device_id FROM vehicle_status WHERE upper(trim(fleet_number)) = upper($1)`, [fleetKey]);
+    vs.rows.forEach((r) => r.device_id && ids.add(String(r.device_id)));
+  } catch (_) {}
+  try {
+    let lastSeen = null;
+    for (let page = 0; page < 40; page++) {
+      const found = await db.query(
+        `SELECT DISTINCT device_id FROM alert_groups
+         WHERE (split_part(${norm}, ' - ', 1) ILIKE $1
+            OR split_part(${norm}, ' - ', 2) ILIKE $1
+            OR split_part(${norm}, ' - ', 3) ILIKE $1
+            OR ${norm} ILIKE $2)
+           ${lastSeen ? `AND device_id > $3` : ''}
+         ORDER BY device_id LIMIT 500`,
+        lastSeen ? [fleetKey, like, lastSeen] : [fleetKey, like]
+      );
+      if (found.rows.length === 0) break;
+      found.rows.forEach((r) => r.device_id && ids.add(String(r.device_id)));
+      lastSeen = found.rows[found.rows.length - 1].device_id;
+      if (found.rows.length < 500) break;
+    }
+  } catch (_) {}
+  try {
+    const te = await db.query(
+      `SELECT DISTINCT device_id FROM telematics_events WHERE upper(trim(fleet_number)) = upper($1) LIMIT 500`,
+      [fleetKey]);
+    te.rows.forEach((r) => r.device_id && ids.add(String(r.device_id)));
+  } catch (_) {}
+  return [...ids];
+}
+
+// Get all telematics events for a vehicle. fleet= expands to all sibling
+// device ids (camera + Geotab) so no world is missed; device-only callers
+// keep exact single-device behavior.
 router.get('/vehicle/:deviceId', async (req, res) => {
   try {
     const { deviceId } = req.params;
-    const { limit = 100, type, days = 30 } = req.query;
+    const { limit = 100, type, days = 30, fleet } = req.query;
 
-    let query = `SELECT ${EVENT_COLUMNS} FROM telematics_events WHERE device_id = $1`;
-    const params = [deviceId];
-    let paramIdx = 2;
+    const { fleetTokenFromName: ftf } = require('../services/costCenterLookup');
+    const fleetKey = ftf(fleet) || null;
+    const siblings = fleetKey ? await expandFleetDeviceIds(fleetKey) : [];
+    if (fleetKey && siblings.length === 0) siblings.push(String(deviceId));
+
+    let query;
+    const params = [];
+    let paramIdx = 1;
+    if (siblings.length > 0) {
+      query = `SELECT ${EVENT_COLUMNS} FROM telematics_events WHERE device_id = ANY($${paramIdx}::text[])`;
+      params.push(siblings);
+      paramIdx++;
+    } else {
+      query = `SELECT ${EVENT_COLUMNS} FROM telematics_events WHERE device_id = $${paramIdx}`;
+      params.push(deviceId);
+      paramIdx++;
+    }
 
     if (type) {
       query += ` AND event_type = $${paramIdx}`;
@@ -44,15 +106,29 @@ router.get('/vehicle/:deviceId', async (req, res) => {
   }
 });
 
-// Get telematics events in time window
+// Get telematics events in time window (fleet= covers all sibling ids).
 router.get('/events/:deviceId', async (req, res) => {
   try {
     const { deviceId } = req.params;
-    const { from, to, limit = 500 } = req.query;
+    const { from, to, limit = 500, fleet } = req.query;
 
-    let query = `SELECT ${EVENT_COLUMNS} FROM telematics_events WHERE device_id = $1`;
-    const params = [deviceId];
-    let paramIdx = 2;
+    const { fleetTokenFromName: ftf2 } = require('../services/costCenterLookup');
+    const fleetKey = ftf2(fleet) || null;
+    const siblings = fleetKey ? await expandFleetDeviceIds(fleetKey) : [];
+    if (fleetKey && siblings.length === 0) siblings.push(String(deviceId));
+
+    let query;
+    const params = [];
+    let paramIdx = 1;
+    if (siblings.length > 0) {
+      query = `SELECT ${EVENT_COLUMNS} FROM telematics_events WHERE device_id = ANY($${paramIdx}::text[])`;
+      params.push(siblings);
+      paramIdx++;
+    } else {
+      query = `SELECT ${EVENT_COLUMNS} FROM telematics_events WHERE device_id = $${paramIdx}`;
+      params.push(deviceId);
+      paramIdx++;
+    }
 
     if (from) {
       query += ` AND event_time >= $${paramIdx}`;
@@ -78,13 +154,23 @@ router.get('/events/:deviceId', async (req, res) => {
 // Get all telematics events
 router.get('/events', async (req, res) => {
   try {
-    const { deviceId, type, days = 30, limit = 500 } = req.query;
+    const { deviceId, type, days = 30, limit = 500, fleet } = req.query;
 
     let query = `SELECT ${EVENT_COLUMNS} FROM telematics_events WHERE 1=1`;
     const params = [];
     let paramIdx = 1;
 
-    if (deviceId) {
+    const { fleetTokenFromName: ftf4 } = require('../services/costCenterLookup');
+    const fleetKey = ftf4(fleet) || null;
+    if (fleetKey) {
+      const siblings = await expandFleetDeviceIds(fleetKey);
+      if (deviceId) siblings.push(String(deviceId));
+      if (siblings.length > 0) {
+        query += ` AND device_id = ANY($${paramIdx}::text[])`;
+        params.push(siblings);
+        paramIdx++;
+      }
+    } else if (deviceId) {
       query += ` AND device_id = $${paramIdx}`;
       params.push(deviceId);
       paramIdx++;
@@ -411,7 +497,8 @@ router.get('/route', async (req, res) => {
     if (!anchorRaw || Number.isNaN(Date.parse(String(anchorRaw)))) {
       return res.status(400).json({ success: false, message: 'at or before (ISO datetime) query param required' });
     }
-    let fleetKey = String(fleet || '').trim();
+    const { fleetTokenFromName: fleetToken } = require('../services/costCenterLookup');
+    let fleetKey = fleetToken(fleet);
     const devId = String(device_id || '').trim();
     if (!fleetKey && devId) {
       try {
@@ -420,8 +507,8 @@ router.get('/route', async (req, res) => {
           `SELECT device_name FROM alert_groups WHERE device_id = $1 ORDER BY last_alert_ts DESC NULLS LAST LIMIT 1`,
           [devId]
         );
-        fleetKey = await resolveFleetNumber({ vehicleRegistration: named.rows[0]?.device_name || '', deviceId: devId }) || '';
-      } catch (_) { fleetKey = ''; }
+        fleetKey = await resolveFleetNumber({ vehicleRegistration: named.rows[0]?.device_name || '', deviceId: devId }) || fleetToken(devId);
+      } catch (_) { fleetKey = fleetToken(devId); }
     }
     if (!fleetKey && !devId) {
       return res.status(400).json({ success: false, message: 'fleet or device_id query param required' });
@@ -477,12 +564,23 @@ router.get('/zones-priority', async (req, res) => {
 router.get('/events-today/:deviceId', async (req, res) => {
   try {
     const { deviceId } = req.params;
-    const result = await db.query(
-      `SELECT ${EVENT_COLUMNS} FROM telematics_events
-       WHERE device_id = $1 AND event_time >= (NOW() AT TIME ZONE 'UTC')::date
-       ORDER BY event_time ASC`,
-      [deviceId]
-    );
+    const { fleetTokenFromName: ftf3 } = require('../services/costCenterLookup');
+    const fleetKey = ftf3(req.query.fleet) || null;
+    const siblings = fleetKey ? await expandFleetDeviceIds(fleetKey) : [];
+    if (fleetKey && siblings.length === 0) siblings.push(String(deviceId));
+    const result = siblings.length > 0
+      ? await db.query(
+        `SELECT ${EVENT_COLUMNS} FROM telematics_events
+         WHERE device_id = ANY($1::text[]) AND event_time >= (NOW() AT TIME ZONE 'UTC')::date
+         ORDER BY event_time ASC`,
+        [siblings]
+      )
+      : await db.query(
+        `SELECT ${EVENT_COLUMNS} FROM telematics_events
+         WHERE device_id = $1 AND event_time >= (NOW() AT TIME ZONE 'UTC')::date
+         ORDER BY event_time ASC`,
+        [deviceId]
+      );
     res.json({ success: true, data: result.rows, count: result.rows.length });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
@@ -532,8 +630,14 @@ router.get('/vehicle-alerts/:deviceId', async (req, res) => {
     if (deviceId && deviceId !== 'none') idSet.add(String(deviceId).trim());
     const fleetName = String(fleet || '').trim();
 
-    // Resolve fleet from explicit query or from device_name / cost-center lookup
-    let fleetKey = fleetName ? normalizeVehicleName(fleetName).split(' - ')[0].trim() || null : null;
+    // Resolve fleet from explicit query or from device_name / cost-center lookup.
+    // Normalized the same canonical way everywhere (parens/slashes/case), so
+    // "FM13 (RAPID)" and "FM13" resolve to one fleet key.
+    const { normalizeFleetString } = require('../services/costCenterLookup');
+    const { fleetTokenFromName } = require('../services/costCenterLookup');
+    let fleetKey = fleetName
+      ? fleetTokenFromName(fleetName) || null
+      : null;
     if (!fleetKey && deviceId && deviceId !== 'none') {
       try {
         const named = await db.query(
@@ -574,12 +678,13 @@ router.get('/vehicle-alerts/:deviceId', async (req, res) => {
         // tokens 1-3 plus full-name substring (looped — no LIMIT truncation).
         let lastSeen = null;
         for (let page = 0; page < 40; page++) {
+          const normD = `regexp_replace(replace(coalesce(device_name, ''), '/', ' - '), '\\([^)]*\\)', ' ', 'g')`;
           const found = await db.query(
             `SELECT DISTINCT device_id FROM alert_groups
-             WHERE (split_part(replace(coalesce(device_name, ''), '/', ' - '), ' - ', 1) ILIKE $1
-                OR split_part(replace(coalesce(device_name, ''), '/', ' - '), ' - ', 2) ILIKE $1
-                OR split_part(replace(coalesce(device_name, ''), '/', ' - '), ' - ', 3) ILIKE $1
-                OR replace(coalesce(device_name, ''), '/', ' - ') ILIKE $2)
+             WHERE (split_part(${normD}, ' - ', 1) ILIKE $1
+                OR split_part(${normD}, ' - ', 2) ILIKE $1
+                OR split_part(${normD}, ' - ', 3) ILIKE $1
+                OR ${normD} ILIKE $2)
                ${lastSeen ? `AND device_id > $3` : ''}
              ORDER BY device_id LIMIT 500`,
             lastSeen ? [fleetKey, `%${fleetKey}%`, lastSeen] : [fleetKey, `%${fleetKey}%`]
@@ -606,7 +711,9 @@ router.get('/vehicle-alerts/:deviceId', async (req, res) => {
     if (fleetKey) {
       params.push(fleetKey);
       params.push(`%${fleetKey}%`);
-      const normName = `replace(coalesce(ag.device_name, ''), '/', ' - ')`;
+      // Same normalization as normalizeFleetString(): slashes -> separators,
+      // parentheticals stripped, so "FM13 (RAPID) - ..." matches fleet FM13.
+      const normName = `regexp_replace(replace(coalesce(ag.device_name, ''), '/', ' - '), '\\([^)]*\\)', ' ', 'g')`;
       matchClauses.push(`split_part(${normName}, ' - ', 1) ILIKE $${idx}`);
       matchClauses.push(`split_part(${normName}, ' - ', 2) ILIKE $${idx}`);
       matchClauses.push(`split_part(${normName}, ' - ', 3) ILIKE $${idx}`);

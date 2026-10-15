@@ -720,7 +720,8 @@ async function resolveHistoryDeviceIds(deviceId, fleetNumber) {
   const ids = new Set();
   if (deviceId) ids.add(deviceId);
 
-  let fleet = String(fleetNumber || '').trim() || null;
+  const { fleetTokenFromName } = require('../services/costCenterLookup');
+  let fleet = fleetTokenFromName(fleetNumber) || null;
   if (!fleet && deviceId) {
     fleet = await resolveFleetNumber({ deviceId }).catch(() => null);
   }
@@ -751,14 +752,26 @@ async function resolveHistoryDeviceIds(deviceId, fleetNumber) {
   } catch (_) { /* optional table */ }
 
   try {
-    const byName = await db.query(
-      `SELECT DISTINCT device_id FROM alert_groups
-       WHERE split_part(coalesce(device_name, ''), ' - ', 1) ILIKE $1
-          OR split_part(coalesce(device_name, ''), ' - ', 2) ILIKE $1
-       LIMIT 500`,
-      [fleet]
-    );
-    byName.rows.forEach((r) => r.device_id && ids.add(r.device_id));
+    // Same canonical normalization as vehicle-alerts: parens stripped,
+    // slashes split, 3 tokens + full-name substring, looped past 500.
+    const normD = `regexp_replace(replace(coalesce(device_name, ''), '/', ' - '), '\\([^)]*\\)', ' ', 'g')`;
+    let lastSeen = null;
+    for (let page = 0; page < 40; page++) {
+      const found = await db.query(
+        `SELECT DISTINCT device_id FROM alert_groups
+         WHERE (split_part(${normD}, ' - ', 1) ILIKE $1
+            OR split_part(${normD}, ' - ', 2) ILIKE $1
+            OR split_part(${normD}, ' - ', 3) ILIKE $1
+            OR ${normD} ILIKE $2)
+           ${lastSeen ? `AND device_id > $3` : ''}
+         ORDER BY device_id LIMIT 500`,
+        lastSeen ? [fleet, `%${fleet}%`, lastSeen] : [fleet, `%${fleet}%`]
+      );
+      if (found.rows.length === 0) break;
+      found.rows.forEach((r) => r.device_id && ids.add(String(r.device_id)));
+      lastSeen = found.rows[found.rows.length - 1].device_id;
+      if (found.rows.length < 500) break;
+    }
   } catch (_) { /* ignore */ }
 
   return { deviceIds: [...ids], fleet };
