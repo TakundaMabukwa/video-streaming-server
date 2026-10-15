@@ -12,7 +12,9 @@ const POLICE_STATIONS = [
   { name: "Benoni Police Station", lat: -26.1884, lon: 28.3213 },
   { name: "Boksburg Police Station", lat: -26.2126, lon: 28.2495 },
   { name: "Kempton Park Police Station", lat: -26.1011, lon: 28.2334 },
-  { name: " Germiston Police Station", lat: -26.2171, lon: 28.1685 },
+  { name: "Germiston Police Station", lat: -26.2171, lon: 28.1685 },
+  { name: "Alexandra Police Station", lat: -26.1034, lon: 28.0885 },
+  { name: "Brooklyn Police Station", lat: -25.7712, lon: 28.2389 },
   { name: "Alberton Police Station", lat: -26.2621, lon: 28.1202 },
   { name: "Vereeniging Police Station", lat: -26.6733, lon: 27.9264 },
   { name: "Vanderbijlpark Police Station", lat: -26.7117, lon: 27.7993 },
@@ -53,6 +55,16 @@ const POLICE_STATIONS = [
   { name: "Secunda Police Station", lat: -26.5211, lon: 29.1676 },
   { name: "Bethlehem Police Station", lat: -28.2308, lon: 28.3073 },
   { name: "Harrismith Police Station", lat: -28.2717, lon: 29.1270 },
+  { name: "Cape Town Central Police Station", lat: -33.9258, lon: 18.4232 },
+  { name: "Bellville Police Station", lat: -33.8997, lon: 18.6292 },
+  { name: "Stellenbosch Police Station", lat: -33.9357, lon: 18.8602 },
+  { name: "Paarl Police Station", lat: -33.7342, lon: 18.9759 },
+  { name: "Somerset West Police Station", lat: -34.0778, lon: 18.8453 },
+  { name: "Mitchells Plain Police Station", lat: -34.0482, lon: 18.6274 },
+  { name: "Khayelitsha Police Station", lat: -34.0357, lon: 18.6772 },
+  { name: "Wynberg Police Station", lat: -34.0045, lon: 18.4707 },
+  { name: "Kariega Police Station", lat: -33.7575, lon: 25.3983 },
+  { name: "Pinetown Police Station", lat: -29.8217, lon: 30.8511 },
 ];
 
 function haversineDistance(lat1, lon1, lat2, lon2) {

@@ -397,16 +397,19 @@ router.get('/log-records/:deviceId', async (req, res) => {
   }
 });
 
-// ── Vehicle route from telemetry_history (±5min around an alert) ──
+// ── Vehicle route from telemetry_history ──
 //
-// GET /route?fleet=PD124&at=ISO — ordered trail points for the alert modal
-// map. Queried by fleet_number so camera + Geotab sibling positions come back
-// in one shot. event_time is device time on both sides of the window.
+// GET /route?fleet=PD124&at=ISO — ordered trail points ±5min around an alert
+// for the modal map. GET /route?fleet=PD124&before=ISO&limit=5 — the last N
+// trail points at/before a time (telematics alert route lead-up).
+// Queried by fleet_number so camera + Geotab sibling positions come back in
+// one shot. event_time is device time on both sides of the window.
 router.get('/route', async (req, res) => {
   try {
-    const { fleet, device_id, at } = req.query;
-    if (!at || Number.isNaN(Date.parse(String(at)))) {
-      return res.status(400).json({ success: false, message: 'at (ISO datetime) query param required' });
+    const { fleet, device_id, at, before, limit } = req.query;
+    const anchorRaw = before != null && before !== '' ? before : at;
+    if (!anchorRaw || Number.isNaN(Date.parse(String(anchorRaw)))) {
+      return res.status(400).json({ success: false, message: 'at or before (ISO datetime) query param required' });
     }
     let fleetKey = String(fleet || '').trim();
     const devId = String(device_id || '').trim();
@@ -423,21 +426,34 @@ router.get('/route', async (req, res) => {
     if (!fleetKey && !devId) {
       return res.status(400).json({ success: false, message: 'fleet or device_id query param required' });
     }
-    const atIso = new Date(String(at)).toISOString();
+    const atIso = new Date(String(anchorRaw)).toISOString();
     const where = fleetKey
       ? `upper(fleet_number) = upper($1)`
       : `device_id = $1`;
-    const result = await db.query(
-      `SELECT device_id, fleet_number, registration, lat, lon, event_time
-       FROM telemetry_history
-       WHERE ${where}
-         AND event_time BETWEEN $2::timestamptz - INTERVAL '5 minutes'
-                            AND $2::timestamptz + INTERVAL '5 minutes'
-       ORDER BY event_time ASC
-       LIMIT 500`,
-      [fleetKey || devId, atIso]
-    );
-    res.json({ success: true, data: result.rows, count: result.rows.length, fleet: fleetKey || null, at: atIso });
+    const n = limit != null && limit !== ''
+      ? Math.min(Math.max(parseInt(String(limit), 10) || 5, 1), 500)
+      : 500;
+    const result = before != null && before !== ''
+      ? await db.query(
+        `SELECT device_id, fleet_number, registration, lat, lon, event_time
+         FROM telemetry_history
+         WHERE ${where} AND event_time <= $2::timestamptz
+         ORDER BY event_time DESC
+         LIMIT ${n}`,
+        [fleetKey || devId, atIso]
+      )
+      : await db.query(
+        `SELECT device_id, fleet_number, registration, lat, lon, event_time
+         FROM telemetry_history
+         WHERE ${where}
+           AND event_time BETWEEN $2::timestamptz - INTERVAL '5 minutes'
+                              AND $2::timestamptz + INTERVAL '5 minutes'
+         ORDER BY event_time ASC
+         LIMIT ${n}`,
+        [fleetKey || devId, atIso]
+      );
+    const rows = before != null && before !== '' ? [...result.rows].reverse() : result.rows;
+    res.json({ success: true, data: rows, count: rows.length, fleet: fleetKey || null, at: atIso });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
