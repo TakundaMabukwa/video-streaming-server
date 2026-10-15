@@ -120,9 +120,54 @@ async function fleetFromRegistration(value) {
   return null;
 }
 
-// Build the human vehicle fleet number for an alert. EPS/Geotab alerts carry raw
-// device codes (e.g. '221085903184'); map them to the fleet number we display
-// (e.g. 'EX41') using the local Geotab/telematics indexes.
+// Exact fleet resolution: registry values only, never name parsing. Returns
+// the fleet code when the device/fleet is known EXACTLY (fleet tables,
+// geotab_devices, vehicle_status, or the id itself being a fleet code), else
+// null. This is what gets STORED on alert_groups.fleet_number and what every
+// read path joins on — 100% match accuracy, zero guessing.
+async function resolveFleetExact({ deviceId, fleetNumber } = {}) {
+  const norm = (v) => String(v || '').trim();
+  const fn = norm(fleetNumber);
+  // Explicit fleet param wins if it is a real fleet (regex or fleet table).
+  if (fn) {
+    if (looksLikeFleetCode(fn)) return fn;
+    const known = await fleetTokenExists(fn);
+    if (known) return known;
+  }
+  const dev = norm(deviceId);
+  if (!dev) return null;
+  const key = `fleetexact:${dev}`;
+  const cached = fleetCache.get(key);
+  if (cached && Date.now() - cached.ts < FLEET_CACHE_TTL) return cached.value;
+  let value = null;
+  try {
+    // Device id IS the fleet code (NCR rows, PD126-style devices).
+    const selfHit = await fleetTokenExists(dev);
+    if (selfHit) value = selfHit;
+    if (!value) {
+      const g = await query(
+        `SELECT fleet_number FROM geotab_devices
+         WHERE id = $1 OR serial_number = $1 LIMIT 1`,
+        [dev]
+      );
+      const gf = norm(g.rows[0]?.fleet_number);
+      if (gf && (looksLikeFleetCode(gf) || await fleetTokenExists(gf))) value = gf;
+    }
+    if (!value) {
+      const vs = await query(
+        `SELECT fleet_number FROM vehicle_status WHERE device_id = $1 LIMIT 1`,
+        [dev]
+      );
+      const vf = norm(vs.rows[0]?.fleet_number);
+      if (vf && (looksLikeFleetCode(vf) || await fleetTokenExists(vf))) value = vf;
+    }
+  } catch (err) {
+    console.error('[costCenterLookup] resolveFleetExact error:', err.message);
+    value = null;
+  }
+  fleetCache.set(key, { value, ts: Date.now() });
+  return value;
+}
 async function resolveFleetNumber({ deviceId, vehicleRegistration, fleetNumber } = {}) {
   if (fleetNumber && looksLikeFleetCode(fleetNumber)) return String(fleetNumber).trim();
   if (fleetNumber) {
@@ -209,4 +254,4 @@ function fleetTokenFromName(value) {
   return byShape(/^[A-Z]{2,}[\d-]*$/) || byShape(/^[A-Z]\d+$/) || byShape(/^\d{2,3}$/) || '';
 }
 
-module.exports = { findVehicleCostCenterId, invalidateVehicleCostCenter, resolveFleetNumber, normalizeFleetString, fleetFromRegistration, looksLikeFleetCode, fleetTokenExists, fleetTokenFromName };
+module.exports = { findVehicleCostCenterId, invalidateVehicleCostCenter, resolveFleetNumber, resolveFleetExact, normalizeFleetString, fleetFromRegistration, looksLikeFleetCode, fleetTokenExists, fleetTokenFromName };

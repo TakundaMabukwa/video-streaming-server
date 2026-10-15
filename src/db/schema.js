@@ -345,6 +345,12 @@ const MIGRATIONS_SQL = `
     ON alert_groups(device_id, alarm_type, source_type)
     WHERE (resolved = FALSE AND false_alert = FALSE);
 
+  -- Authoritative fleet per group: EXACT registry values only, never parsed
+  -- from names. All read paths join on this column (exact, case-insensitive)
+  -- or on exact device ids — no ILIKE, no token splitting, no guessing.
+  ALTER TABLE alert_groups ADD COLUMN IF NOT EXISTS fleet_number TEXT;
+  CREATE INDEX IF NOT EXISTS idx_ag_fleet ON alert_groups(fleet_number);
+
   -- Alert watching presence: who has an alert open right now. Heartbeat rows
   -- go stale after 90s (swept lazily on read + every 5 min from the server).
   CREATE TABLE IF NOT EXISTS alert_watchers (

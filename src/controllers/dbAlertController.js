@@ -720,8 +720,9 @@ async function resolveHistoryDeviceIds(deviceId, fleetNumber) {
   const ids = new Set();
   if (deviceId) ids.add(deviceId);
 
-  const { fleetTokenFromName } = require('../services/costCenterLookup');
-  let fleet = fleetTokenFromName(fleetNumber) || null;
+  // Exact: fleet params are verbatim values (case-insensitive); the device
+  // fallback below resolves exactly through registries. Nothing is parsed.
+  let fleet = String(fleetNumber || '').trim().toUpperCase() || null;
   if (!fleet && deviceId) {
     fleet = await resolveFleetNumber({ deviceId }).catch(() => null);
   }
@@ -752,19 +753,12 @@ async function resolveHistoryDeviceIds(deviceId, fleetNumber) {
   } catch (_) { /* optional table */ }
 
   try {
-    // Same canonical normalization as vehicle-alerts: parens stripped,
-    // slashes split, token boundaries only (PB27 must not match B27),
-    // looped past 500.
-    const normD = `regexp_replace(replace(coalesce(device_name, ''), '/', ' - '), '\\([^)]*\\)', ' ', 'g')`;
+    // Exact fleet-column match (authoritative). No name parsing, no ILIKE.
     let lastSeen = null;
     for (let page = 0; page < 40; page++) {
       const found = await db.query(
         `SELECT DISTINCT device_id FROM alert_groups
-         WHERE (split_part(${normD}, ' - ', 1) ILIKE $1
-            OR split_part(${normD}, ' - ', 2) ILIKE $1
-            OR split_part(${normD}, ' - ', 3) ILIKE $1
-            OR split_part(${normD}, ' - ', 4) ILIKE $1
-            OR upper(trim(${normD})) = upper($1))
+         WHERE upper(trim(coalesce(fleet_number, ''))) = upper($1)
            ${lastSeen ? `AND device_id > $2` : ''}
          ORDER BY device_id LIMIT 500`,
         lastSeen ? [fleet, lastSeen] : [fleet]

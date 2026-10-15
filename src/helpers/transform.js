@@ -132,7 +132,9 @@ function transformDbAlert(record, severityMap) {
     device_id: deviceId,
     vehicleId: deviceId,
     vehicle_registration: record.device_name || null,
-    fleet_number: fleetFromDeviceName(record.device_name) || record.fleet_number || null,
+    // Stored authoritative fleet first (exact registries at creation);
+    // parsed name fallback is display-only, never used for matching.
+    fleet_number: record.fleet_number || fleetFromDeviceName(record.device_name) || null,
     driver_name: null,
     timestamp: ts ? new Date(ts).toISOString() : new Date().toISOString(),
     created_at: record.created_at ? new Date(record.created_at).toISOString() : null,

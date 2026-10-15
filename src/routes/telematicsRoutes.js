@@ -20,8 +20,6 @@ const EVENT_COLUMNS = `id, device_id, vehicle_id, plate, event_type, event_code,
 async function expandFleetDeviceIds(fleetKey) {
   const ids = new Set();
   if (!fleetKey) return [];
-  const norm = `regexp_replace(replace(coalesce(device_name, ''), '/', ' - '), '\\([^)]*\\)', ' ', 'g')`;
-  const like = `%${fleetKey}%`;
   try {
     const g = await db.query(
       `SELECT id FROM geotab_devices WHERE upper(trim(fleet_number)) = upper($1)`, [fleetKey]);
@@ -32,22 +30,18 @@ async function expandFleetDeviceIds(fleetKey) {
       `SELECT device_id FROM vehicle_status WHERE upper(trim(fleet_number)) = upper($1)`, [fleetKey]);
     vs.rows.forEach((r) => r.device_id && ids.add(String(r.device_id)));
   } catch (_) {}
+  // Exact fleet-column match on alert_groups (authoritative, written at
+  // creation). No name parsing, no substrings — PB27 never leaks into B27.
   try {
     let lastSeen = null;
     for (let page = 0; page < 40; page++) {
-          // Token-boundary matching only: a bare substring (LIKE %B27%) would
-          // also match PB27. Split tokens 1-4 plus full-string exact.
-          const found = await db.query(
-            `SELECT DISTINCT device_id FROM alert_groups
-             WHERE (split_part(${norm}, ' - ', 1) ILIKE $1
-                OR split_part(${norm}, ' - ', 2) ILIKE $1
-                OR split_part(${norm}, ' - ', 3) ILIKE $1
-                OR split_part(${norm}, ' - ', 4) ILIKE $1
-                OR upper(trim(${norm})) = upper($1))
-               ${lastSeen ? `AND device_id > $2` : ''}
-             ORDER BY device_id LIMIT 500`,
-            lastSeen ? [fleetKey, lastSeen] : [fleetKey]
-          );
+      const found = await db.query(
+        `SELECT DISTINCT device_id FROM alert_groups
+         WHERE upper(trim(coalesce(fleet_number, ''))) = upper($1)
+           ${lastSeen ? `AND device_id > $2` : ''}
+         ORDER BY device_id LIMIT 500`,
+        lastSeen ? [fleetKey, lastSeen] : [fleetKey]
+      );
       if (found.rows.length === 0) break;
       found.rows.forEach((r) => r.device_id && ids.add(String(r.device_id)));
       lastSeen = found.rows[found.rows.length - 1].device_id;
@@ -71,8 +65,8 @@ router.get('/vehicle/:deviceId', async (req, res) => {
     const { deviceId } = req.params;
     const { limit = 100, type, days = 30, fleet } = req.query;
 
-    const { fleetTokenFromName: ftf } = require('../services/costCenterLookup');
-    const fleetKey = ftf(fleet) || null;
+    // Exact: fleet param verbatim (upper-trimmed); unresolvable matches nothing.
+    const fleetKey = String(fleet || '').trim().toUpperCase() || null;
     const siblings = fleetKey ? await expandFleetDeviceIds(fleetKey) : [];
     if (fleetKey && siblings.length === 0) siblings.push(String(deviceId));
 
@@ -115,8 +109,7 @@ router.get('/events/:deviceId', async (req, res) => {
     const { deviceId } = req.params;
     const { from, to, limit = 500, fleet } = req.query;
 
-    const { fleetTokenFromName: ftf2 } = require('../services/costCenterLookup');
-    const fleetKey = ftf2(fleet) || null;
+    const fleetKey = String(fleet || '').trim().toUpperCase() || null;
     const siblings = fleetKey ? await expandFleetDeviceIds(fleetKey) : [];
     if (fleetKey && siblings.length === 0) siblings.push(String(deviceId));
 
@@ -163,8 +156,7 @@ router.get('/events', async (req, res) => {
     const params = [];
     let paramIdx = 1;
 
-    const { fleetTokenFromName: ftf4 } = require('../services/costCenterLookup');
-    const fleetKey = ftf4(fleet) || null;
+    const fleetKey = String(fleet || '').trim().toUpperCase() || null;
     if (fleetKey) {
       const siblings = await expandFleetDeviceIds(fleetKey);
       if (deviceId) siblings.push(String(deviceId));
@@ -500,8 +492,7 @@ router.get('/route', async (req, res) => {
     if (!anchorRaw || Number.isNaN(Date.parse(String(anchorRaw)))) {
       return res.status(400).json({ success: false, message: 'at or before (ISO datetime) query param required' });
     }
-    const { fleetTokenFromName: fleetToken } = require('../services/costCenterLookup');
-    let fleetKey = fleetToken(fleet);
+    let fleetKey = String(fleet || '').trim().toUpperCase() || null;
     const devId = String(device_id || '').trim();
     if (!fleetKey && devId) {
       try {
@@ -567,8 +558,7 @@ router.get('/zones-priority', async (req, res) => {
 router.get('/events-today/:deviceId', async (req, res) => {
   try {
     const { deviceId } = req.params;
-    const { fleetTokenFromName: ftf3 } = require('../services/costCenterLookup');
-    const fleetKey = ftf3(req.query.fleet) || null;
+    const fleetKey = String(req.query.fleet || '').trim().toUpperCase() || null;
     const siblings = fleetKey ? await expandFleetDeviceIds(fleetKey) : [];
     if (fleetKey && siblings.length === 0) siblings.push(String(deviceId));
     const result = siblings.length > 0
@@ -612,14 +602,9 @@ router.get('/vehicle-alerts', async (req, res) => {
 // Returns grouped alerts (same type grouped together with count)
 // Matches video camera id AND Geotab sibling ids for the same fleet.
 // Camera and Geotab ids never overlap, so the fleet linkage below is the only
-// thing joining the two worlds — keep every clause in sync (discovery must
-// find at least what the final match accepts).
+// thing joining the two worlds — exact fleet column plus exact device ids.
 // Uncapped by default (lane views need everything); optional keyset cursor
 // (?cursorTs=ISO&cursorId=N&limit=) pages huge vehicles without truncation.
-function normalizeVehicleName(s) {
-  return String(s || '').replace(/\//g, ' - ').replace(/\s+/g, ' ').trim();
-}
-
 router.get('/vehicle-alerts/:deviceId', async (req, res) => {
   try {
     const { deviceId } = req.params;
@@ -629,35 +614,19 @@ router.get('/vehicle-alerts/:deviceId', async (req, res) => {
     const params = [];
     let idx = 1;
 
+    // EXACT matching only: the stored fleet_number column (authoritative,
+    // written at creation from registries) plus exact device ids. No ILIKE,
+    // no token splitting, no name parsing — 100% match accuracy.
+    const { resolveFleetExact } = require('../services/costCenterLookup');
     const idSet = new Set();
     if (deviceId && deviceId !== 'none') idSet.add(String(deviceId).trim());
-    const fleetName = String(fleet || '').trim();
 
-    // Resolve fleet from explicit query or from device_name / cost-center lookup.
-    // Normalized the same canonical way everywhere (parens/slashes/case), so
-    // "FM13 (RAPID)" and "FM13" resolve to one fleet key.
-    const { normalizeFleetString } = require('../services/costCenterLookup');
-    const { fleetTokenFromName } = require('../services/costCenterLookup');
-    let fleetKey = fleetName
-      ? fleetTokenFromName(fleetName) || null
-      : null;
+    // Fleet param is verbatim (case-insensitive); unresolvable values match
+    // nothing instead of guessing. Device resolution is exact registries.
+    let fleetKey = String(fleet || '').trim().toUpperCase() || null;
     if (!fleetKey && deviceId && deviceId !== 'none') {
       try {
-        const named = await db.query(
-          `SELECT device_name FROM alert_groups WHERE device_id = $1 ORDER BY last_alert_ts DESC NULLS LAST LIMIT 1`,
-          [deviceId]
-        );
-        const deviceName = normalizeVehicleName(named.rows[0]?.device_name || '');
-        const { resolveFleetNumber } = require('../services/costCenterLookup');
-        fleetKey = await resolveFleetNumber({ vehicleRegistration: deviceName, deviceId }) || null;
-        if (!fleetKey && deviceName) fleetKey = String(deviceName).split(' - ')[0].trim() || null;
-        // Device id itself is often the fleet code (PD126, EX67) when device_name is empty.
-        if (!fleetKey) {
-          fleetKey = await resolveFleetNumber({ fleetNumber: deviceId }).catch(() => null) || null;
-          if (!fleetKey && /^[A-Za-z]{2,}[\d-]*$/.test(String(deviceId).trim())) {
-            fleetKey = String(deviceId).trim();
-          }
-        }
+        fleetKey = await resolveFleetExact({ deviceId }) || null;
       } catch (_) { fleetKey = null; }
     }
 
@@ -676,30 +645,6 @@ router.get('/vehicle-alerts/:deviceId', async (req, res) => {
         );
         vs.rows.forEach((r) => r.device_id && idSet.add(String(r.device_id)));
       } catch (_) { /* optional */ }
-      try {
-        // Discovery must cover everything the final match accepts (token
-        // boundaries only — never a bare substring, which would match PB27
-        // for fleet B27). Looped — no LIMIT truncation.
-        let lastSeen = null;
-        for (let page = 0; page < 40; page++) {
-          const normD = `regexp_replace(replace(coalesce(device_name, ''), '/', ' - '), '\\([^)]*\\)', ' ', 'g')`;
-          const found = await db.query(
-            `SELECT DISTINCT device_id FROM alert_groups
-             WHERE (split_part(${normD}, ' - ', 1) ILIKE $1
-                OR split_part(${normD}, ' - ', 2) ILIKE $1
-                OR split_part(${normD}, ' - ', 3) ILIKE $1
-                OR split_part(${normD}, ' - ', 4) ILIKE $1
-                OR upper(trim(${normD})) = upper($1))
-               ${lastSeen ? `AND device_id > $2` : ''}
-             ORDER BY device_id LIMIT 500`,
-            lastSeen ? [fleetKey, lastSeen] : [fleetKey]
-          );
-          if (found.rows.length === 0) break;
-          found.rows.forEach((r) => r.device_id && idSet.add(String(r.device_id)));
-          lastSeen = found.rows[found.rows.length - 1].device_id;
-          if (found.rows.length < 500) break;
-        }
-      } catch (_) { /* ignore */ }
     }
 
     const idList = [...idSet];
@@ -715,15 +660,7 @@ router.get('/vehicle-alerts/:deviceId', async (req, res) => {
     }
     if (fleetKey) {
       params.push(fleetKey);
-      // Same normalization as normalizeFleetString(): slashes -> separators,
-      // parentheticals stripped, so "FM13 (RAPID) - ..." matches fleet FM13.
-      // Token boundaries only (never bare substring: PB27 must not match B27).
-      const normName = `regexp_replace(replace(coalesce(ag.device_name, ''), '/', ' - '), '\\([^)]*\\)', ' ', 'g')`;
-      matchClauses.push(`split_part(${normName}, ' - ', 1) ILIKE $${idx}`);
-      matchClauses.push(`split_part(${normName}, ' - ', 2) ILIKE $${idx}`);
-      matchClauses.push(`split_part(${normName}, ' - ', 3) ILIKE $${idx}`);
-      matchClauses.push(`split_part(${normName}, ' - ', 4) ILIKE $${idx}`);
-      matchClauses.push(`upper(trim(${normName})) = upper($${idx})`);
+      matchClauses.push(`upper(trim(coalesce(ag.fleet_number, ''))) = upper($${idx})`);
       idx++;
     }
     where += ` AND (${matchClauses.join(' OR ')})`;
