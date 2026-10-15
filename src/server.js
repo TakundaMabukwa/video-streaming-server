@@ -121,6 +121,14 @@ async function start() {
       console.error(`[DriverScoring] Init failed: ${err.message}`);
     }
 
+    // Sweep stale alert-watch heartbeats every 5 minutes (90s TTL).
+    try {
+      const dbAlertController = require('./controllers/dbAlertController');
+      setInterval(() => { dbAlertController.sweepStaleWatchers(); }, 5 * 60 * 1000).unref?.();
+    } catch (err) {
+      console.error(`[WATCH] Sweep init failed: ${err.message}`);
+    }
+
     // Start RTMS driving time monitoring
     try {
       const rtmsService = require('./services/rtmsService');

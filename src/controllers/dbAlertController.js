@@ -1367,6 +1367,115 @@ async function getResolvedAlertCount(req, res) {
   }
 }
 
+// Watching presence: which operators currently have an alert open. Heartbeat
+// rows older than 90s are treated as gone (closed tab, crashed session).
+const WATCH_STALE_MS = 90 * 1000;
+
+async function sweepStaleWatchers() {
+  try {
+    await db.query(`DELETE FROM alert_watchers WHERE heartbeat_at < NOW() - INTERVAL '90 seconds'`);
+  } catch (_) { /* never block onpresence cleanup */ }
+}
+
+function watcherIds(value) {
+  if (Array.isArray(value)) return value.map((v) => Number(v)).filter((n) => Number.isInteger(n) && n >= 1);
+  const n = Number(value);
+  return Number.isInteger(n) && n >= 1 ? [n] : [];
+}
+
+async function broadcastWatchers(alertGroupIds) {
+  if (!wsBroadcast || !alertGroupIds.length) return;
+  try {
+    const rows = await db.query(
+      `SELECT alert_group_id, user_email FROM alert_watchers
+       WHERE alert_group_id = ANY($1::int[]) AND heartbeat_at > NOW() - INTERVAL '90 seconds'`,
+      [alertGroupIds]
+    );
+    const byAlert = {};
+    for (const r of rows.rows) {
+      const k = String(r.alert_group_id);
+      (byAlert[k] = byAlert[k] || []).push(r.user_email);
+    }
+    for (const id of alertGroupIds) {
+      wsBroadcast('alert-watching', { alertId: String(id), viewers: byAlert[String(id)] || [] });
+    }
+  } catch (_) { /* broadcast is best-effort */ }
+}
+
+async function watchAlert(req, res) {
+  try {
+    const ids = watcherIds(req.params.id);
+    const user = String(req.body?.user || '').trim().slice(0, 120) || 'unknown';
+    if (ids.length === 0) return sendError(res, 'Alert ID required', 400);
+    for (const id of ids) {
+      await db.query(
+        `INSERT INTO alert_watchers (alert_group_id, user_email, heartbeat_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (alert_group_id, user_email)
+         DO UPDATE SET heartbeat_at = NOW()`,
+        [id, user]
+      );
+    }
+    res.json({ success: true, watching: ids.map(String) });
+    broadcastWatchers(ids);
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+}
+
+async function unwatchAlert(req, res) {
+  try {
+    const ids = watcherIds(req.params.id);
+    const user = String(req.body?.user || req.query?.user || '').trim().slice(0, 120);
+    if (ids.length === 0) return sendError(res, 'Alert ID required', 400);
+    if (user) {
+      await db.query(`DELETE FROM alert_watchers WHERE alert_group_id = ANY($1::int[]) AND user_email = $2`, [ids, user]);
+    } else {
+      await db.query(`DELETE FROM alert_watchers WHERE alert_group_id = ANY($1::int[])`, [ids]);
+    }
+    res.json({ success: true });
+    broadcastWatchers(ids);
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+}
+
+async function getAlertWatchers(req, res) {
+  try {
+    const ids = watcherIds(req.params.id);
+    if (ids.length === 0) return sendError(res, 'Alert ID required', 400);
+    await sweepStaleWatchers();
+    const rows = await db.query(
+      `SELECT alert_group_id, user_email, heartbeat_at FROM alert_watchers
+       WHERE alert_group_id = ANY($1::int[]) AND heartbeat_at > NOW() - INTERVAL '90 seconds'
+       ORDER BY heartbeat_at DESC`,
+      [ids]
+    );
+    res.json({ success: true, watchers: rows.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+}
+
+async function getAllWatchers(req, res) {
+  try {
+    await sweepStaleWatchers();
+    const rows = await db.query(
+      `SELECT alert_group_id, user_email, heartbeat_at FROM alert_watchers
+       WHERE heartbeat_at > NOW() - INTERVAL '90 seconds'
+       ORDER BY heartbeat_at DESC LIMIT 500`
+    );
+    const byAlert = {};
+    for (const r of rows.rows) {
+      const k = String(r.alert_group_id);
+      (byAlert[k] = byAlert[k] || []).push(r.user_email);
+    }
+    res.json({ success: true, watching: byAlert, count: rows.rows.length });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+}
+
 module.exports = {
   getAlertsList,
   getAlertDetail,
@@ -1389,6 +1498,11 @@ module.exports = {
   acknowledgeAlert,
   resolveAlert,
   resolveAlertsBulk,
+  watchAlert,
+  unwatchAlert,
+  getAlertWatchers,
+  getAllWatchers,
+  sweepStaleWatchers,
   escalateAlert,
   markFalseAlert,
   uploadDocumentToAlert,

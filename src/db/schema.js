@@ -345,6 +345,17 @@ const MIGRATIONS_SQL = `
     ON alert_groups(device_id, alarm_type, source_type)
     WHERE (resolved = FALSE AND false_alert = FALSE);
 
+  -- Alert watching presence: who has an alert open right now. Heartbeat rows
+  -- go stale after 90s (swept lazily on read + every 5 min from the server).
+  CREATE TABLE IF NOT EXISTS alert_watchers (
+    alert_group_id INTEGER NOT NULL,
+    user_email TEXT NOT NULL,
+    heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (alert_group_id, user_email)
+  );
+  CREATE INDEX IF NOT EXISTS idx_alert_watchers_heartbeat ON alert_watchers(heartbeat_at);
+
   CREATE TABLE IF NOT EXISTS camera_status (
     fleet_number TEXT PRIMARY KEY,
     reg TEXT,

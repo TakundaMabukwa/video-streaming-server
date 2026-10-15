@@ -1,7 +1,7 @@
 const express = require('express');
 const rateLimit = require('express-rate-limit');
 const { getAlertTypes, getAlarmPage, getAlertFeed, getAlarmFilesById, getAlarmFilesByPage, getDevices } = require('../controllers/alertController');
-const { getActiveAlerts, getActiveAlertsAll, getActivePerVehicleAlerts, getActiveAlertCounts, getClosedSummaryByCC, getResolvedAlerts, getResolvedAlertCount, getAlertById, getAlertScreenshots, getAlertMedia, acknowledgeAlert, resolveAlert, escalateAlert, markFalseAlert, uploadDocumentToAlert, followUpAlert, clearFollowUp, getAlertHistory, listAlerts } = require('../controllers/dbAlertController');
+const { getActiveAlerts, getActiveAlertsAll, getActivePerVehicleAlerts, getActiveAlertCounts, getClosedSummaryByCC, getResolvedAlerts, getResolvedAlertCount, getAlertById, getAlertScreenshots, getAlertMedia, acknowledgeAlert, resolveAlert, escalateAlert, markFalseAlert, uploadDocumentToAlert, followUpAlert, clearFollowUp, getAlertHistory, listAlerts, watchAlert, unwatchAlert, getAlertWatchers, getAllWatchers } = require('../controllers/dbAlertController');
 const db = require('../db');
 const apiClient = require('../helpers/apiClient');
 
@@ -68,6 +68,10 @@ router.post('/:id/capture', async (req, res) => {
     res.status(500).json({ success: false, message: error.message });
   }
 });
+router.get('/watchers', getAllWatchers);
+router.post('/:id/watch', watchAlert);
+router.delete('/:id/watch', unwatchAlert);
+router.get('/:id/watchers', getAlertWatchers);
 router.post('/:id/acknowledge', acknowledgeAlert);
 router.post('/:id/close', resolveAlert);
 router.post('/:id/escalate', escalateAlert);
