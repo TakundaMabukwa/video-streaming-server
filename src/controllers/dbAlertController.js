@@ -753,7 +753,8 @@ async function resolveHistoryDeviceIds(deviceId, fleetNumber) {
 
   try {
     // Same canonical normalization as vehicle-alerts: parens stripped,
-    // slashes split, 3 tokens + full-name substring, looped past 500.
+    // slashes split, token boundaries only (PB27 must not match B27),
+    // looped past 500.
     const normD = `regexp_replace(replace(coalesce(device_name, ''), '/', ' - '), '\\([^)]*\\)', ' ', 'g')`;
     let lastSeen = null;
     for (let page = 0; page < 40; page++) {
@@ -762,10 +763,11 @@ async function resolveHistoryDeviceIds(deviceId, fleetNumber) {
          WHERE (split_part(${normD}, ' - ', 1) ILIKE $1
             OR split_part(${normD}, ' - ', 2) ILIKE $1
             OR split_part(${normD}, ' - ', 3) ILIKE $1
-            OR ${normD} ILIKE $2)
-           ${lastSeen ? `AND device_id > $3` : ''}
+            OR split_part(${normD}, ' - ', 4) ILIKE $1
+            OR upper(trim(${normD})) = upper($1))
+           ${lastSeen ? `AND device_id > $2` : ''}
          ORDER BY device_id LIMIT 500`,
-        lastSeen ? [fleet, `%${fleet}%`, lastSeen] : [fleet, `%${fleet}%`]
+        lastSeen ? [fleet, lastSeen] : [fleet]
       );
       if (found.rows.length === 0) break;
       found.rows.forEach((r) => r.device_id && ids.add(String(r.device_id)));

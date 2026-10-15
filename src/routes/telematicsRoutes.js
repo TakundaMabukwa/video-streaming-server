@@ -35,16 +35,19 @@ async function expandFleetDeviceIds(fleetKey) {
   try {
     let lastSeen = null;
     for (let page = 0; page < 40; page++) {
-      const found = await db.query(
-        `SELECT DISTINCT device_id FROM alert_groups
-         WHERE (split_part(${norm}, ' - ', 1) ILIKE $1
-            OR split_part(${norm}, ' - ', 2) ILIKE $1
-            OR split_part(${norm}, ' - ', 3) ILIKE $1
-            OR ${norm} ILIKE $2)
-           ${lastSeen ? `AND device_id > $3` : ''}
-         ORDER BY device_id LIMIT 500`,
-        lastSeen ? [fleetKey, like, lastSeen] : [fleetKey, like]
-      );
+          // Token-boundary matching only: a bare substring (LIKE %B27%) would
+          // also match PB27. Split tokens 1-4 plus full-string exact.
+          const found = await db.query(
+            `SELECT DISTINCT device_id FROM alert_groups
+             WHERE (split_part(${norm}, ' - ', 1) ILIKE $1
+                OR split_part(${norm}, ' - ', 2) ILIKE $1
+                OR split_part(${norm}, ' - ', 3) ILIKE $1
+                OR split_part(${norm}, ' - ', 4) ILIKE $1
+                OR upper(trim(${norm})) = upper($1))
+               ${lastSeen ? `AND device_id > $2` : ''}
+             ORDER BY device_id LIMIT 500`,
+            lastSeen ? [fleetKey, lastSeen] : [fleetKey]
+          );
       if (found.rows.length === 0) break;
       found.rows.forEach((r) => r.device_id && ids.add(String(r.device_id)));
       lastSeen = found.rows[found.rows.length - 1].device_id;
@@ -674,8 +677,9 @@ router.get('/vehicle-alerts/:deviceId', async (req, res) => {
         vs.rows.forEach((r) => r.device_id && idSet.add(String(r.device_id)));
       } catch (_) { /* optional */ }
       try {
-        // Discovery must cover everything the final match accepts: normalized
-        // tokens 1-3 plus full-name substring (looped — no LIMIT truncation).
+        // Discovery must cover everything the final match accepts (token
+        // boundaries only — never a bare substring, which would match PB27
+        // for fleet B27). Looped — no LIMIT truncation.
         let lastSeen = null;
         for (let page = 0; page < 40; page++) {
           const normD = `regexp_replace(replace(coalesce(device_name, ''), '/', ' - '), '\\([^)]*\\)', ' ', 'g')`;
@@ -684,10 +688,11 @@ router.get('/vehicle-alerts/:deviceId', async (req, res) => {
              WHERE (split_part(${normD}, ' - ', 1) ILIKE $1
                 OR split_part(${normD}, ' - ', 2) ILIKE $1
                 OR split_part(${normD}, ' - ', 3) ILIKE $1
-                OR ${normD} ILIKE $2)
-               ${lastSeen ? `AND device_id > $3` : ''}
+                OR split_part(${normD}, ' - ', 4) ILIKE $1
+                OR upper(trim(${normD})) = upper($1))
+               ${lastSeen ? `AND device_id > $2` : ''}
              ORDER BY device_id LIMIT 500`,
-            lastSeen ? [fleetKey, `%${fleetKey}%`, lastSeen] : [fleetKey, `%${fleetKey}%`]
+            lastSeen ? [fleetKey, lastSeen] : [fleetKey]
           );
           if (found.rows.length === 0) break;
           found.rows.forEach((r) => r.device_id && idSet.add(String(r.device_id)));
@@ -710,15 +715,16 @@ router.get('/vehicle-alerts/:deviceId', async (req, res) => {
     }
     if (fleetKey) {
       params.push(fleetKey);
-      params.push(`%${fleetKey}%`);
       // Same normalization as normalizeFleetString(): slashes -> separators,
       // parentheticals stripped, so "FM13 (RAPID) - ..." matches fleet FM13.
+      // Token boundaries only (never bare substring: PB27 must not match B27).
       const normName = `regexp_replace(replace(coalesce(ag.device_name, ''), '/', ' - '), '\\([^)]*\\)', ' ', 'g')`;
       matchClauses.push(`split_part(${normName}, ' - ', 1) ILIKE $${idx}`);
       matchClauses.push(`split_part(${normName}, ' - ', 2) ILIKE $${idx}`);
       matchClauses.push(`split_part(${normName}, ' - ', 3) ILIKE $${idx}`);
-      matchClauses.push(`${normName} ILIKE $${idx + 1}`);
-      idx += 2;
+      matchClauses.push(`split_part(${normName}, ' - ', 4) ILIKE $${idx}`);
+      matchClauses.push(`upper(trim(${normName})) = upper($${idx})`);
+      idx++;
     }
     where += ` AND (${matchClauses.join(' OR ')})`;
 
