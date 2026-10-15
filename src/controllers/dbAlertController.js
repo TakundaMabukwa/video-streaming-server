@@ -202,6 +202,44 @@ function groupsToAlerts(groups, { passes, severityFor }, { includeCount = true }
   });
 }
 
+// Vehicle-level scope: if ANY open group of a vehicle passes the strict
+// filter, ALL of that vehicle's open groups are included (same devices and
+// same fleets). A visible vehicle never shows a partial alert set — this is
+// what keeps board cards identical to the (unfiltered) timeline and resolve
+// views. fleetMap comes from batchResolveDeviceCC; stored fleet_number is
+// authoritative, resolved fleet is the fallback.
+function groupsToAlertsVehicleScoped(groups, filterCtx, batch, { includeCount = true } = {}) {
+  const { passes, severityFor } = filterCtx;
+  const fleetMap = (batch && batch.fleetMap) || new Map();
+  const fleetOf = (g) => {
+    const stored = String(g.fleet_number || '').trim().toUpperCase();
+    if (stored) return stored;
+    const resolved = fleetMap.get(g.device_id);
+    if (resolved) return String(resolved).trim().toUpperCase();
+    return '';
+  };
+  const passingDevices = new Set();
+  const passingFleets = new Set();
+  for (const g of groups) {
+    if (!passes(g)) continue;
+    if (g.device_id) passingDevices.add(String(g.device_id));
+    const f = fleetOf(g);
+    if (f) passingFleets.add(f);
+  }
+  return groups
+    .filter((g) => {
+      if (passes(g)) return true;
+      if (g.device_id && passingDevices.has(String(g.device_id))) return true;
+      const f = fleetOf(g);
+      return !!f && passingFleets.has(f);
+    })
+    .map((g) => {
+      const t = transformDbAlert(g, severityFor(g));
+      if (includeCount) t.count = g.count || 1;
+      return t;
+    });
+}
+
 async function getActiveAlerts(req, res) {
   try {
     const forceAll = req.query.includeAll === '1' || req.query.includeAll === 'true';
@@ -221,10 +259,12 @@ async function getActiveAlerts(req, res) {
         // Window too wide (client was away too long) — tell it to full-reload.
         return res.json({ success: true, truncated: true, asOf, source: 'eps-db' });
       }
-      const { deviceCC } = forceAll ? { deviceCC: new Map() } : await batchResolveDeviceCC(changedGroups);
-      const filter = await buildStrictAlertFilter(deviceCC);
+      const batch = forceAll ? { deviceCC: new Map(), fleetMap: new Map() } : await batchResolveDeviceCC(changedGroups);
+      const filter = await buildStrictAlertFilter(batch.deviceCC);
       const alwaysPass = { ...filter, passes: () => true };
-      const changed = groupsToAlerts(changedGroups, forceAll ? alwaysPass : filter);
+      const changed = forceAll
+        ? groupsToAlerts(changedGroups, alwaysPass)
+        : groupsToAlertsVehicleScoped(changedGroups, filter, batch);
       const removedIds = removed.map((r) => String(r.id));
       if (compact) {
         const packed = db.packAlerts(changed);
@@ -245,10 +285,12 @@ async function getActiveAlerts(req, res) {
       const rawLimit = req.query.limit != null ? parseLimit(req.query.limit, 10000) : 10000;
       const pageLimit = rawLimit == null ? 10000 : rawLimit; // explicit all => one big page (compat)
       const page = await db.getActiveAlertGroupsPage({ limit: pageLimit, cursorTs, cursorId });
-      const { deviceCC } = forceAll ? { deviceCC: new Map() } : await batchResolveDeviceCC(page.rows);
-      const filter = await buildStrictAlertFilter(deviceCC);
+      const batch = forceAll ? { deviceCC: new Map(), fleetMap: new Map() } : await batchResolveDeviceCC(page.rows);
+      const filter = await buildStrictAlertFilter(batch.deviceCC);
       const alwaysPass = { ...filter, passes: () => true };
-      const alerts = groupsToAlerts(page.rows, forceAll ? alwaysPass : filter);
+      const alerts = forceAll
+        ? groupsToAlerts(page.rows, alwaysPass)
+        : groupsToAlertsVehicleScoped(page.rows, filter, batch);
       const pageInfo = { hasMore: page.hasMore, nextCursorTs: page.nextCursorTs, nextCursorId: page.nextCursorId };
       if (compact) {
         const packed = db.packAlerts(alerts);
@@ -262,11 +304,15 @@ async function getActiveAlerts(req, res) {
 
     // includeAll (resolve-all modal): keep every open group, bypassing the
     // strict cost-center filter so no alert is invisible and unresolvable.
-    const { deviceCC } = forceAll ? { deviceCC: new Map() } : await batchResolveDeviceCC(groups);
-    const filter = await buildStrictAlertFilter(deviceCC);
+    // Otherwise vehicle-level scope: any passing group pulls its whole
+    // vehicle (devices + fleets) into view.
+    const batch = forceAll ? { deviceCC: new Map(), fleetMap: new Map() } : await batchResolveDeviceCC(groups);
+    const filter = await buildStrictAlertFilter(batch.deviceCC);
     const alwaysPass = { ...filter, passes: () => true };
 
-    const alerts = groupsToAlerts(groups, forceAll ? alwaysPass : filter);
+    const alerts = forceAll
+      ? groupsToAlerts(groups, alwaysPass)
+      : groupsToAlertsVehicleScoped(groups, filter, batch);
 
     if (compact) {
       const packed = db.packAlerts(alerts);
@@ -444,10 +490,10 @@ async function getActiveAlertsAll(req, res) {
     const limit = parseLimit(req.query.limit, 2000);
     const groups = await db.getActiveAlertGroupsAll({ limit });
 
-    const { deviceCC } = await batchResolveDeviceCC(groups);
-    const filter = await buildStrictAlertFilter(deviceCC);
+    const batch = await batchResolveDeviceCC(groups);
+    const filter = await buildStrictAlertFilter(batch.deviceCC);
 
-    const alerts = groupsToAlerts(groups, filter, { includeCount: false });
+    const alerts = groupsToAlertsVehicleScoped(groups, filter, batch, { includeCount: false });
 
     res.json({ success: true, alerts, count: alerts.length, total: alerts.length, source: 'eps-db' });
   } catch (error) {
