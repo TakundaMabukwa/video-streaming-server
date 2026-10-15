@@ -1438,25 +1438,6 @@ function watcherIds(value) {
   return Number.isInteger(n) && n >= 1 ? [n] : [];
 }
 
-async function broadcastWatchers(alertGroupIds) {
-  if (!wsBroadcast || !alertGroupIds.length) return;
-  try {
-    const rows = await db.query(
-      `SELECT alert_group_id, user_email FROM alert_watchers
-       WHERE alert_group_id = ANY($1::int[]) AND heartbeat_at > NOW() - INTERVAL '90 seconds'`,
-      [alertGroupIds]
-    );
-    const byAlert = {};
-    for (const r of rows.rows) {
-      const k = String(r.alert_group_id);
-      (byAlert[k] = byAlert[k] || []).push(r.user_email);
-    }
-    for (const id of alertGroupIds) {
-      wsBroadcast('alert-watching', { alertId: String(id), viewers: byAlert[String(id)] || [] });
-    }
-  } catch (_) { /* broadcast is best-effort */ }
-}
-
 async function watchAlert(req, res) {
   try {
     const ids = watcherIds(req.params.id);
@@ -1471,8 +1452,9 @@ async function watchAlert(req, res) {
         [id, user]
       );
     }
+    // Presence is poll-only (heartbeat POST + watchers GET): no socket emits,
+    // so every screen converges through the same HTTP path.
     res.json({ success: true, watching: ids.map(String) });
-    broadcastWatchers(ids);
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -1489,7 +1471,6 @@ async function unwatchAlert(req, res) {
       await db.query(`DELETE FROM alert_watchers WHERE alert_group_id = ANY($1::int[])`, [ids]);
     }
     res.json({ success: true });
-    broadcastWatchers(ids);
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
