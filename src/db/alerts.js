@@ -1,10 +1,10 @@
 const { query } = require('./pool');
 
 async function upsertAlert(alert) {
-  const { id, deviceId, deviceName, alarmType, alarmTs, alarmTsEnd, lat, lon, alarmText, serialNo, fenceId, alarmExtension, sourceType = 'video' } = alert;
+  const { id, deviceId, deviceName, alarmType, alarmTs, alarmTsEnd, lat, lon, alarmText, serialNo, fenceId, alarmExtension, sourceType = 'video', speed, severity, fleetNumber } = alert;
   const result = await query(
-    `INSERT INTO alerts (id, device_id, device_name, alarm_type, alarm_ts, alarm_ts_end, lat, lon, alarm_text, serial_no, fence_id, alarm_extension, source_type)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+    `INSERT INTO alerts (id, device_id, device_name, alarm_type, alarm_ts, alarm_ts_end, lat, lon, alarm_text, serial_no, fence_id, alarm_extension, source_type, speed, severity, fleet_number)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
      ON CONFLICT (id) DO UPDATE SET
        device_name = EXCLUDED.device_name,
        alarm_type = EXCLUDED.alarm_type,
@@ -17,9 +17,12 @@ async function upsertAlert(alert) {
        fence_id = EXCLUDED.fence_id,
        alarm_extension = EXCLUDED.alarm_extension,
        source_type = EXCLUDED.source_type,
+       speed = COALESCE(EXCLUDED.speed, alerts.speed),
+       severity = COALESCE(NULLIF(EXCLUDED.severity, ''), alerts.severity),
+       fleet_number = COALESCE(NULLIF(EXCLUDED.fleet_number, ''), alerts.fleet_number),
        updated_at = NOW()
      RETURNING id`,
-    [id, deviceId, deviceName, alarmType, alarmTs || null, alarmTsEnd || null, lat || null, lon || null, alarmText, serialNo || null, fenceId || null, alarmExtension || null, sourceType]
+    [id, deviceId, deviceName, alarmType, alarmTs || null, alarmTsEnd || null, lat || null, lon || null, alarmText || null, serialNo || null, fenceId || null, alarmExtension || null, sourceType, speed ?? null, severity || null, fleetNumber || null]
   );
   return result.rows[0];
 }
@@ -27,7 +30,7 @@ async function upsertAlert(alert) {
 async function batchUpsertAlerts(alerts) {
   if (alerts.length === 0) return;
   const values = alerts.map((_, i) =>
-    `($${i * 12 + 1}, $${i * 12 + 2}, $${i * 12 + 3}, $${i * 12 + 4}, $${i * 12 + 5}, $${i * 12 + 6}, $${i * 12 + 7}, $${i * 12 + 8}, $${i * 12 + 9}, $${i * 12 + 10}, $${i * 12 + 11}, $${i * 12 + 12})`
+    `($${i * 15 + 1}, $${i * 15 + 2}, $${i * 15 + 3}, $${i * 15 + 4}, $${i * 15 + 5}, $${i * 15 + 6}, $${i * 15 + 7}, $${i * 15 + 8}, $${i * 15 + 9}, $${i * 15 + 10}, $${i * 15 + 11}, $${i * 15 + 12}, $${i * 15 + 13}, $${i * 15 + 14}, $${i * 15 + 15})`
   ).join(',');
   const params = alerts.flatMap(a => [
     a.id, a.deviceId, a.deviceName || null, a.alarmType,
@@ -35,9 +38,10 @@ async function batchUpsertAlerts(alerts) {
     a.lat || null, a.lon || null,
     a.alarmText || null, a.serialNo || null,
     a.fenceId || null, a.alarmExtension || null,
+    a.speed ?? null, a.severity || null, a.fleetNumber || null,
   ]);
   await query(
-    `INSERT INTO alerts (id, device_id, device_name, alarm_type, alarm_ts, alarm_ts_end, lat, lon, alarm_text, serial_no, fence_id, alarm_extension)
+    `INSERT INTO alerts (id, device_id, device_name, alarm_type, alarm_ts, alarm_ts_end, lat, lon, alarm_text, serial_no, fence_id, alarm_extension, speed, severity, fleet_number)
      VALUES ${values}
      ON CONFLICT (id) DO UPDATE SET
        device_name = EXCLUDED.device_name,
@@ -50,9 +54,37 @@ async function batchUpsertAlerts(alerts) {
        serial_no = EXCLUDED.serial_no,
        fence_id = EXCLUDED.fence_id,
        alarm_extension = EXCLUDED.alarm_extension,
+       speed = COALESCE(EXCLUDED.speed, alerts.speed),
+       severity = COALESCE(NULLIF(EXCLUDED.severity, ''), alerts.severity),
+       fleet_number = COALESCE(NULLIF(EXCLUDED.fleet_number, ''), alerts.fleet_number),
        updated_at = NOW()`,
     params
   );
+}
+
+// Member linkage choke point: every detection (video sync, Geotab feed,
+// poller, auto-NCR) funnels its alert row through here with its group PK.
+// Insert-or-fill: never overwrites existing member data, only fills gaps.
+async function ensureMemberRow({ id, deviceId, deviceName, alarmType, alarmText, alarmTs, lat, lon, speed, severity, fleetNumber, sourceType = 'video', groupId }) {
+  if (!id) return null;
+  const result = await query(
+    `INSERT INTO alerts (id, device_id, device_name, alarm_type, alarm_text, alarm_ts, lat, lon, speed, severity, fleet_number, source_type, alert_group_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+     ON CONFLICT (id) DO UPDATE SET
+       device_name = COALESCE(NULLIF(EXCLUDED.device_name, ''), alerts.device_name),
+       alarm_text = COALESCE(NULLIF(EXCLUDED.alarm_text, ''), alerts.alarm_text),
+       lat = COALESCE(EXCLUDED.lat, alerts.lat),
+       lon = COALESCE(EXCLUDED.lon, alerts.lon),
+       speed = COALESCE(EXCLUDED.speed, alerts.speed),
+       severity = COALESCE(NULLIF(EXCLUDED.severity, ''), alerts.severity),
+       fleet_number = COALESCE(NULLIF(EXCLUDED.fleet_number, ''), alerts.fleet_number),
+       alert_group_id = COALESCE(alerts.alert_group_id, EXCLUDED.alert_group_id),
+       updated_at = NOW()
+     RETURNING id`,
+    [id, deviceId || null, deviceName || null, alarmType || null, alarmText || null, alarmTs || null,
+     lat ?? null, lon ?? null, speed ?? null, severity || null, fleetNumber || null, sourceType, groupId || null]
+  );
+  return result.rows[0] || null;
 }
 
 async function alertExists(id) {
@@ -172,6 +204,7 @@ async function getStats() {
 module.exports = {
   upsertAlert,
   batchUpsertAlerts,
+  ensureMemberRow,
   alertExists,
   batchAlertExists,
   getAlertWithMedia,

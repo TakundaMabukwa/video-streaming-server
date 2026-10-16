@@ -372,6 +372,10 @@ async function syncAlerts(deviceIds, startTime, endTime) {
 
     if (newRecords.length > 0) {
       emptyPageCount = 0;
+      let videoSeverityMap = null;
+      try {
+        videoSeverityMap = await getVideoSeverityMap([]);
+      } catch { videoSeverityMap = null; }
       await db.batchUpsertAlerts(newRecords.map(r => ({
         id: r.id,
         deviceId: r.deviceId,
@@ -385,6 +389,8 @@ async function syncAlerts(deviceIds, startTime, endTime) {
         serialNo: r.serialNo,
         fenceId: r.fenceId,
         alarmExtension: r.alarmExtension ? JSON.stringify(r.alarmExtension) : null,
+        speed: r.speed ?? null,
+        severity: resolveBaseSeverity(r.alarmType, videoSeverityMap),
       })));
 
       // Push new video alerts over WS as fast as possible so the frontend

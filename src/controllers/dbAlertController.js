@@ -661,6 +661,35 @@ async function getAlertScreenshots(req, res) {
   }
 }
 
+// Group members: every individual detection linked to an alert_groups PK,
+// newest first. Lazy-loaded by the timeline expander — never part of board
+// payloads. Members are read-only (no mutate endpoints); closing happens at
+// the group level and cascades via trg_group_resolve.
+async function getAlertMembers(req, res) {
+  try {
+    const gid = Number(req.params.id);
+    if (!Number.isInteger(gid) || gid < 1) {
+      return res.status(400).json({ success: false, message: 'Numeric group id required' });
+    }
+    const lim = Math.min(Math.max(parseInt(String(req.query.limit || '200'), 10) || 200, 1), 500);
+    const result = await db.query(
+      `SELECT id, device_id, device_name, alarm_type, alarm_text, alarm_ts, alarm_ts_end,
+              lat, lon, speed, severity, fleet_number, source_type, status,
+              resolved, false_alert, resolved_by, resolved_at, alert_group_id, created_at
+       FROM alerts
+       WHERE alert_group_id = $1
+       ORDER BY alarm_ts DESC NULLS LAST, created_at DESC
+       LIMIT $2`,
+      [gid, lim + 1]
+    );
+    const truncated = result.rows.length > lim;
+    const members = truncated ? result.rows.slice(0, lim) : result.rows;
+    res.json({ success: true, members, count: members.length, truncated, group_id: gid });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+}
+
 // Build the minimal alert record skycamx needs (alarm id + device + ts).
 // Never touches alert_media — always resolves to a raw row/group then live-fetches.
 async function loadRawAlertForSkycam(id, group, alertId) {
@@ -1530,6 +1559,7 @@ module.exports = {
   getAlertById,
   getAlertScreenshots,
   getAlertMedia,
+  getAlertMembers,
   getAlertHistory,
   acknowledgeAlert,
   resolveAlert,

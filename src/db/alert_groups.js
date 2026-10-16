@@ -1,6 +1,34 @@
 const { query } = require('./pool');
 const { isRegisteredVehicle } = require('../services/fleetRegistryGuard');
 
+// Member stamp: link the detection's alert row to its group (insert-or-fill,
+// never overwrites member data). Guarded — member linkage must never break
+// the hot detection path.
+async function stampMember(groupRow, a) {
+  if (!groupRow || !groupRow.id || !a || !a.alertId) return groupRow;
+  try {
+    const { ensureMemberRow } = require('./alerts');
+    await ensureMemberRow({
+      id: a.alertId,
+      deviceId: a.deviceId,
+      deviceName: a.deviceName,
+      alarmType: a.alarmType,
+      alarmText: a.alarmText,
+      alarmTs: a.alarmTs || null,
+      lat: a.lat ?? null,
+      lon: a.lon ?? null,
+      speed: a.speed ?? null,
+      severity: a.severity || null,
+      fleetNumber: a.fleetExact || null,
+      sourceType: a.sourceType || 'video',
+      groupId: groupRow.id,
+    });
+  } catch (err) {
+    console.error('[GROUPS] member stamp failed:', err.message);
+  }
+  return groupRow;
+}
+
 async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, alertId, alarmTs, lat, lon, speed, sourceType = 'video', severity }) {
   // Only vehicles in fleet_vehicles may raise alerts.
   if (!(await isRegisteredVehicle({ deviceId, deviceName }))) return null;
@@ -47,7 +75,7 @@ async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, al
        RETURNING id, group_key, count, alarm_type`,
       [alertId, alarmTs, deviceName, lat, lon, speed ?? null, alarmText, severity, fleetExact || null, groupKey]
     );
-    return result.rows[0];
+    return stampMember(result.rows[0], { alertId, deviceId, deviceName, alarmType, alarmText, alarmTs, lat, lon, speed, severity, fleetExact, sourceType });
   }
 
   // No active group. (No resolve cooldown — a new event after a manual
@@ -69,7 +97,9 @@ async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, al
     [groupKey, deviceId, deviceName, alarmType, alarmText, alertId, alarmTs || null, lat, lon, speed ?? null, sourceType, severity,
      fleetExact || null]
   );
-  if (result.rows.length > 0) return result.rows[0];
+  if (result.rows.length > 0) {
+    return stampMember(result.rows[0], { alertId, deviceId, deviceName, alarmType, alarmText, alarmTs, lat, lon, speed, severity, fleetExact, sourceType });
+  }
   // Base key lost a race (or is squatted by a dead row): bump-or-insert via
   // the live-row arbiter instead of throwing. Never throws, never twins.
   const raced = await query(
@@ -85,7 +115,7 @@ async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, al
      deviceId, deviceName, alarmType, alarmText, alertId, alarmTs || null, lat, lon, speed ?? null, sourceType, severity,
      fleetExact || null]
   );
-  return raced.rows[0] || null;
+  return stampMember(raced.rows[0] || null, { alertId, deviceId, deviceName, alarmType, alarmText, alarmTs, lat, lon, speed, severity, fleetExact, sourceType });
 }
 
 async function batchUpsertAlertGroups(groups) {
@@ -134,8 +164,10 @@ async function batchUpsertAlertGroups(groups) {
        g.lon || null, g.speed ?? null, g.alarmText || null, g.severity || null,
        g.fleetExact || null, g.deviceId, g.alarmType, g.sourceType || 'video']
     );
-    if (bumped.rows.length > 0) result.rows.push(bumped.rows[0]);
-    else pending.push(g);
+    if (bumped.rows.length > 0) {
+      result.rows.push(bumped.rows[0]);
+      await stampMember(bumped.rows[0], { alertId: g.alertId, deviceId: g.deviceId, deviceName: g.deviceName, alarmType: g.alarmType, alarmText: g.alarmText, alarmTs: g.alarmTs, lat: g.lat, lon: g.lon, speed: g.speed, severity: g.severity, fleetExact: g.fleetExact, sourceType: g.sourceType });
+    } else pending.push(g);
   }
   if (pending.length === 0) return result.rows;
 
@@ -187,7 +219,14 @@ async function batchUpsertAlertGroups(groups) {
   // nothing (the WHERE kills it) — fall through to the twin branch. A conflict
   // against the live row bumps it right in the statement, so even a race
   // converges.
-  for (const r of inserted.rows) result.rows.push(r);
+  const pendingByBaseKey = new Map(pending.map((g) => [`${g.deviceId}:${g.alarmType}`.toLowerCase(), g]));
+  for (const r of inserted.rows) {
+    result.rows.push(r);
+    const g = pendingByBaseKey.get(String(r.group_key || '').toLowerCase());
+    if (g) {
+      await stampMember(r, { alertId: g.alertId, deviceId: g.deviceId, deviceName: g.deviceName, alarmType: g.alarmType, alarmText: g.alarmText, alarmTs: g.alarmTs, lat: g.lat, lon: g.lon, speed: g.speed, severity: g.severity, fleetExact: g.fleetExact, sourceType: g.sourceType });
+    }
+  }
   const settled = new Set(result.rows.map((r) => r.group_key));
   const twins = pending.filter((g) => !settled.has(`${g.deviceId}:${g.alarmType}`.toLowerCase()));
   if (twins.length > 0) {
@@ -257,7 +296,10 @@ async function batchUpsertAlertGroups(groups) {
          g.alertId, g.alarmTs || null, g.lat || null, g.lon || null, g.speed ?? null, g.sourceType || 'video', g.severity || null,
          g.fleetExact || null, ...bumpParams]
       );
-      if (twinIns.rows.length > 0) result.rows.push(twinIns.rows[0]);
+      if (twinIns.rows.length > 0) {
+        result.rows.push(twinIns.rows[0]);
+        await stampMember(twinIns.rows[0], { alertId: g.alertId, deviceId: g.deviceId, deviceName: g.deviceName, alarmType: g.alarmType, alarmText: g.alarmText, alarmTs: g.alarmTs, lat: g.lat, lon: g.lon, speed: g.speed, severity: g.severity, fleetExact: g.fleetExact, sourceType: g.sourceType });
+      }
     }
   }
 

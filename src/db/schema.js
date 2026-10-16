@@ -526,6 +526,44 @@ const MIGRATIONS_SQL = `
   -- from alert_definitions/overrides, this column is a faithful stored snapshot.
   ALTER TABLE alert_groups ADD COLUMN IF NOT EXISTS severity TEXT;
 
+  -- Member linkage: alert_groups is the live rollup, alerts holds every
+  -- individual detection. Linked by PK (groups.id), never by text keys.
+  -- Parity columns so a member row renders the detail modal identically.
+  ALTER TABLE alerts ADD COLUMN IF NOT EXISTS alert_group_id INTEGER REFERENCES alert_groups(id) ON DELETE SET NULL;
+  ALTER TABLE alerts ADD COLUMN IF NOT EXISTS speed DOUBLE PRECISION;
+  ALTER TABLE alerts ADD COLUMN IF NOT EXISTS resolved_by TEXT;
+  ALTER TABLE alerts ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ;
+  ALTER TABLE alerts ADD COLUMN IF NOT EXISTS severity TEXT;
+  ALTER TABLE alerts ADD COLUMN IF NOT EXISTS fleet_number TEXT;
+  CREATE INDEX IF NOT EXISTS idx_alerts_group_id ON alerts(alert_group_id);
+
+  -- Group-to-member resolve cascade: any group flip (resolve OR false
+  -- alert, from ANY writer path) propagates to linked members in-DB, so no
+  -- close path can leave members behind. BEFORE trigger so it can also zero
+  -- the open-member count on the closing transition. Fires only on the
+  -- open→closed edge — unrelated updates (notes, documents) never re-touch.
+  CREATE OR REPLACE FUNCTION propagate_group_resolution() RETURNS trigger AS $$
+  BEGIN
+    IF (NEW.resolved OR NEW.false_alert) AND NOT (OLD.resolved OR OLD.false_alert) THEN
+      NEW.count := 0;
+      UPDATE alerts
+      SET resolved = NEW.resolved,
+          false_alert = NEW.false_alert,
+          resolved_by = COALESCE(NEW.resolved_by, resolved_by),
+          resolved_at = COALESCE(NEW.resolved_at, NOW()),
+          updated_at = NOW()
+      WHERE alert_group_id = NEW.id
+        AND NOT resolved AND NOT false_alert;
+    END IF;
+    RETURN NEW;
+  END;
+  $$ LANGUAGE plpgsql;
+  DROP TRIGGER IF EXISTS trg_group_resolve ON alert_groups;
+  CREATE TRIGGER trg_group_resolve
+  BEFORE UPDATE OF resolved, false_alert ON alert_groups
+  FOR EACH ROW WHEN (NEW.resolved OR NEW.false_alert)
+  EXECUTE FUNCTION propagate_group_resolution();
+
   -- Add missing columns to vehicle_status
   CREATE TABLE IF NOT EXISTS vehicle_status (
     device_id TEXT PRIMARY KEY,

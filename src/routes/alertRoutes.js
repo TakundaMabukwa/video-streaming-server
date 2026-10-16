@@ -1,7 +1,7 @@
 const express = require('express');
 const rateLimit = require('express-rate-limit');
 const { getAlertTypes, getAlarmPage, getAlertFeed, getAlarmFilesById, getAlarmFilesByPage, getDevices } = require('../controllers/alertController');
-const { getActiveAlerts, getActiveAlertsAll, getActivePerVehicleAlerts, getActiveAlertCounts, getClosedSummaryByCC, getResolvedAlerts, getResolvedAlertCount, getAlertById, getAlertScreenshots, getAlertMedia, acknowledgeAlert, resolveAlert, escalateAlert, markFalseAlert, uploadDocumentToAlert, followUpAlert, clearFollowUp, getAlertHistory, listAlerts, watchAlert, unwatchAlert, getAlertWatchers, getAllWatchers } = require('../controllers/dbAlertController');
+const { getActiveAlerts, getActiveAlertsAll, getActivePerVehicleAlerts, getActiveAlertCounts, getClosedSummaryByCC, getResolvedAlerts, getResolvedAlertCount, getAlertById, getAlertScreenshots, getAlertMedia, getAlertMembers, acknowledgeAlert, resolveAlert, escalateAlert, markFalseAlert, uploadDocumentToAlert, followUpAlert, clearFollowUp, getAlertHistory, listAlerts, watchAlert, unwatchAlert, getAlertWatchers, getAllWatchers } = require('../controllers/dbAlertController');
 const db = require('../db');
 const apiClient = require('../helpers/apiClient');
 
@@ -38,6 +38,7 @@ const bulkCloseLimiter = rateLimit({
 router.post('/bulk-close', bulkCloseLimiter, resolveAlertsBulk);
 router.get('/:id/screenshots', getAlertScreenshots);
 router.get('/:id/media', getAlertMedia);
+router.get('/:id/members', getAlertMembers);
 router.post('/:id/capture', async (req, res) => {
   try {
     const { id } = req.params;
