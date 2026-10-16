@@ -546,6 +546,20 @@ async function getAlertById(req, res) {
       alert = await db.getAlertGroupByAlertId(id);
     }
     if (!alert) {
+      // Member row direct hit (older members no group points at anymore).
+      // Shape matches what the detail modal already normalizes.
+      const member = await db.query(
+        `SELECT id, device_id, device_name, alarm_type, alarm_text, alarm_ts, alarm_ts_end,
+                lat, lon, speed, severity, fleet_number, source_type, status,
+                resolved, false_alert, resolved_by, resolved_at, created_at
+         FROM alerts WHERE id = $1`,
+        [String(id)]
+      ).catch(() => ({ rows: [] }));
+      if (member.rows.length > 0) {
+        alert = { ...member.rows[0], alert_id: member.rows[0].id, member: true };
+      }
+    }
+    if (!alert) {
       return res.status(404).json({ success: false, message: `Alert ${id} not found` });
     }
     // Media comes from frontend Next routes — never block open on alert_media.
