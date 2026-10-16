@@ -348,7 +348,7 @@ router.get('/zones', async (req, res) => {
 router.get('/zones-lite', async (req, res) => {
   try {
     const result = await db.query(
-      'SELECT id, name, points, is_high_risk, is_no_go FROM geotab_zones WHERE is_deleted IS NOT TRUE ORDER BY name'
+      'SELECT id, name, points, is_high_risk, is_no_go, is_no_stopping FROM geotab_zones WHERE is_deleted IS NOT TRUE ORDER BY name'
     );
     res.json({ success: true, data: result.rows, count: result.rows.length });
   } catch (error) {
@@ -485,6 +485,49 @@ router.get('/log-records/:deviceId', async (req, res) => {
 // trail points at/before a time (telematics alert route lead-up).
 // Queried by fleet_number so camera + Geotab sibling positions come back in
 // one shot. event_time is device time on both sides of the window.
+// Join polled coordinates into the most-likely driven route: one device's
+// time-ordered trail (camera + Geotab siblings never interleave — two GPS
+// sources would zigzag), collapsed while stationary so idling doesn't
+// hairball the polyline. Always keeps the final (alert-time) point.
+function haversineM(aLat, aLon, bLat, bLon) {
+  const R = 6371000;
+  const dLa = ((bLat - aLat) * Math.PI) / 180;
+  const dLo = ((bLon - aLon) * Math.PI) / 180;
+  const s =
+    Math.sin(dLa / 2) ** 2 +
+    Math.cos((aLat * Math.PI) / 180) * Math.cos((bLat * Math.PI) / 180) * Math.sin(dLo / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(s));
+}
+const TRAIL_JITTER_M = 12;
+function stitchTrail(rows, preferDeviceId) {
+  const devicesSeen = [...new Set((rows || []).map((r) => String(r.device_id || '')))].filter(Boolean);
+  if (!rows || rows.length === 0) return { points: [], deviceId: null, devicesSeen };
+  const byDevice = new Map();
+  for (const r of rows) {
+    const d = String(r.device_id || '');
+    if (!byDevice.has(d)) byDevice.set(d, []);
+    byDevice.get(d).push(r);
+  }
+  let picked = preferDeviceId && byDevice.get(String(preferDeviceId));
+  if (!picked || picked.length < 2) {
+    picked = [...byDevice.values()].sort((a, b) => b.length - a.length)[0];
+  }
+  const ordered = [...picked].sort(
+    (a, b) => new Date(a.event_time).getTime() - new Date(b.event_time).getTime()
+  );
+  const points = [];
+  for (const r of ordered) {
+    const lat = Number(r.lat);
+    const lon = Number(r.lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+    const prev = points[points.length - 1];
+    const isLast = r === ordered[ordered.length - 1];
+    if (prev && !isLast && haversineM(prev.lat, prev.lon, lat, lon) < TRAIL_JITTER_M) continue;
+    points.push({ lat, lon, event_time: r.event_time, device_id: r.device_id });
+  }
+  return { points, deviceId: String(picked[0]?.device_id || ''), devicesSeen };
+}
+
 router.get('/route', async (req, res) => {
   try {
     const { fleet, device_id, at, before, limit } = req.query;
@@ -508,33 +551,38 @@ router.get('/route', async (req, res) => {
       return res.status(400).json({ success: false, message: 'fleet or device_id query param required' });
     }
     const atIso = new Date(String(anchorRaw)).toISOString();
+    // Trail window: polled coordinates for the 5 minutes LEADING UP TO the
+    // alert (never after — the route shows where the vehicle came from).
+    // telemetry_history is written by the 15s position poller (~20 pts), NOT
+    // the sparse Geotab event stream, so the points join into the driven road.
     const where = fleetKey
       ? `upper(fleet_number) = upper($1)`
       : `device_id = $1`;
     const n = limit != null && limit !== ''
       ? Math.min(Math.max(parseInt(String(limit), 10) || 5, 1), 500)
       : 500;
-    const result = before != null && before !== ''
-      ? await db.query(
-        `SELECT device_id, fleet_number, registration, lat, lon, event_time
-         FROM telemetry_history
-         WHERE ${where} AND event_time <= $2::timestamptz
-         ORDER BY event_time DESC
-         LIMIT ${n}`,
-        [fleetKey || devId, atIso]
-      )
-      : await db.query(
-        `SELECT device_id, fleet_number, registration, lat, lon, event_time
-         FROM telemetry_history
-         WHERE ${where}
-           AND event_time BETWEEN $2::timestamptz - INTERVAL '5 minutes'
-                              AND $2::timestamptz + INTERVAL '5 minutes'
-         ORDER BY event_time ASC
-         LIMIT ${n}`,
-        [fleetKey || devId, atIso]
-      );
-    const rows = before != null && before !== '' ? [...result.rows].reverse() : result.rows;
-    res.json({ success: true, data: rows, count: rows.length, fleet: fleetKey || null, at: atIso });
+    const result = await db.query(
+      `SELECT device_id, fleet_number, registration, lat, lon, event_time
+       FROM telemetry_history
+       WHERE ${where}
+         AND event_time BETWEEN $2::timestamptz - INTERVAL '5 minutes'
+                            AND $2::timestamptz
+       ORDER BY event_time ASC
+       LIMIT ${n}`,
+      [fleetKey || devId, atIso]
+    );
+    const trail = stitchTrail(result.rows, devId);
+    res.json({
+      success: true,
+      data: trail.points,
+      points: trail.points,
+      count: trail.points.length,
+      fleet: fleetKey || null,
+      at: atIso,
+      window: { from: new Date(new Date(atIso).getTime() - 5 * 60 * 1000).toISOString(), to: atIso },
+      device_id: trail.deviceId,
+      devices_seen: trail.devicesSeen,
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
