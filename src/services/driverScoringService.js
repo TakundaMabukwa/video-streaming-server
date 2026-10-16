@@ -149,6 +149,24 @@ async function processAlertDeduction(fleet_number, alert_type) {
           [groupKey, fleet_number, ncrDeviceName, `NCR: ${alert_type}`, ncrId]
         );
 
+        // Link the auto-NCR alert row to its group (same choke point as all
+        // other writers, so the member expander sees it too).
+        try {
+          const { ensureMemberRow } = require('../db/alerts');
+          const gidRows = await client.query(
+            `SELECT id FROM alert_groups WHERE group_key = $1 LIMIT 1`, [groupKey]
+          );
+          if (gidRows.rows.length > 0) {
+            await ensureMemberRow({
+              id: ncrId, deviceId: fleet_number, deviceName: ncrDeviceName,
+              alarmType: `NCR: ${alert_type}`, alarmText: `Auto-generated NCR after ${alertEntry.count} ${alert_type} alerts`,
+              alarmTs: now, sourceType: 'telematics', groupId: gidRows.rows[0].id,
+            });
+          }
+        } catch (linkErr) {
+          console.error('[DriverScoring] member link failed:', linkErr.message);
+        }
+
         ncrCreated = true;
         // Reset count after NCR
         alertEntry.count = 0;

@@ -233,11 +233,30 @@ router.post('/increment', async (req, res) => {
           // Reset count after NCR
           alertEntry.count = 0;
 
+          // Link the auto-NCR member row to its group (same as all writers).
+          try {
+            const { ensureMemberRow } = require('../db/alerts');
+            const gidRows = await client.query(
+              `SELECT id FROM alert_groups WHERE group_key = $1 LIMIT 1`, [groupKey]
+            );
+            if (gidRows.rows.length > 0) {
+              await ensureMemberRow({
+                id: ncrId, deviceId: fleet_number, deviceName: ncrDeviceName,
+                alarmType: `NCR: ${alert_type}`,
+                alarmText: `Auto-generated NCR after ${alertEntry.count} ${alert_type} alerts`,
+                alarmTs: now, sourceType: 'telematics', groupId: gidRows.rows[0].id,
+              });
+            }
+          } catch (linkErr) {
+            console.error('[DriverScoring] member link failed:', linkErr.message);
+          }
+
           // Capture incident register row for the auto-NCR
           try {
             const { insertAutoIncident } = require('../services/driverScoringService');
             await insertAutoIncident(client, {
               alertId: ncrId,
+              groupKey,
               fleetNumber: fleet_number,
               alarmType: `NCR: ${alert_type}`,
               costCenterId: vehicleCostCenterId,
