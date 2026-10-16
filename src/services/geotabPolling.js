@@ -1595,16 +1595,29 @@ function startPolling(intervalMs = 60000, eventIntervalMs = 15000) {
       console.error('[GEOTAB] Device status poller failed to start:', err.message);
     }
 
+    // Hot loop (every 60s): live position + ignition only — this feeds the
+    // board presence and the 15s coordinate trail. ~3 API calls.
     pollingInterval = setInterval(async () => {
+      await syncIgnitionStatus();
+      await fetchAndStoreVehicleStatus();
+    }, intervalMs);
+
+    // Warm loop (every 5 min): trip history. Read-only history, no need
+    // for minute-level freshness.
+    setInterval(async () => {
+      await syncLogRecords();
+    }, 5 * 60 * 1000);
+
+    // Cold loop (every 30 min): reference data. Rules, groups, devices,
+    // diagnostics and zones are all upserted to DB + in-memory caches —
+    // re-fetching them every minute burned ~15 API calls for zero new info.
+    // (Fresh deploys still get everything immediately via initialSync.)
+    setInterval(async () => {
       await syncGeotabGroups();
       await syncGeotabExceptionRules();
       await syncGeotabDiagnostics();
       await syncGeotabDevices();
-      await syncGeotabZones();
-      await syncLogRecords();
-      await syncIgnitionStatus();
-      await fetchAndStoreVehicleStatus();
-    }, intervalMs);
+    }, 30 * 60 * 1000);
 
     // Exception events are the time-critical feed — poll frequently so new
     // telematics alerts arrive as they happen. The in-flight guard prevents
@@ -1618,7 +1631,7 @@ function startPolling(intervalMs = 60000, eventIntervalMs = 15000) {
       await syncGeotabZones();
     }, 5 * 60 * 1000);
 
-    console.log(`[GEOTAB] Polling started: metadata every ${intervalMs / 1000}s, events every ${eventIntervalMs / 1000}s`);
+    console.log(`[GEOTAB] Polling started: position+ignition every ${intervalMs / 1000}s, events every ${eventIntervalMs / 1000}s, logrecords 5m, reference data 30m`);
   });
 }
 
