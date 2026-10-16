@@ -699,11 +699,13 @@ async function syncGeotabEvents() {
     let totalAlerted = 0;
     let pages = 0;
 
-    // Bounded drain: max 5 pages per 15s cycle (~32 calls/min worst case
-    // across all pollers, well under the 60/min quota). The cursor persists
-    // after every page, so a capped cycle resumes losslessly on the next
-    // tick — events are delayed seconds, never dropped.
+    // Bounded + paced drain: max 5 pages per 15s cycle AND 300ms between
+    // pages. The quota is burst-sensitive (12 calls in one second trips it
+    // even at ~32/min average), so pages go out smoothly instead of in one
+    // burst. The cursor persists after every page, so a capped cycle resumes
+    // losslessly on the next tick — events are delayed seconds, never dropped.
     while (pages < Math.min(MAX_FEED_PUMP_PAGES, 5)) {
+      if (pages > 0) await new Promise((r) => setTimeout(r, 300));
       pages++;
       const feed = await geotabGetFeed(credentials, 'ExceptionEvent', fromVersion);
       if (feed.error) {
