@@ -1041,7 +1041,7 @@ function getZoneAlertLevel(name) {
   return 'INFO';
 }
 
-// Cache for all zones (refreshed every 5 minutes with syncGeotabZones)
+// Cache for all zones (DB-owned; never refreshed from Geotab)
 let cachedAllZones = [];
 function setCachedAllZones(zones) { cachedAllZones = zones; }
 
@@ -1555,14 +1555,29 @@ async function fetchAndStoreVehicleStatus() {
 
 // ── Polling control ──
 
+// Reference data lives in DB and is NEVER refreshed from Geotab on a timer.
+// Zones: managed in DB only, never synced from Geotab, ever.
+// Rules/groups/devices/diagnostics: synced exactly once at boot, and only
+// if their tables are empty (fresh install). Steady state makes ZERO calls.
+async function tableRowCount(table) {
+  try {
+    const r = await db.query(`SELECT COUNT(*)::int AS n FROM ${table}`);
+    return r.rows[0]?.n || 0;
+  } catch {
+    return 0;
+  }
+}
 async function initialSync() {
-  console.log('[GEOTAB] Starting initial sync...');
-  await syncGeotabGroups();
-  await syncGeotabExceptionRules();
+  console.log('[GEOTAB] Starting initial sync (empty tables only)...');
+  if ((await tableRowCount('geotab_groups')) === 0) await syncGeotabGroups();
+  else console.log('[GEOTAB] geotab_groups populated — skipping Geotab fetch');
+  if ((await tableRowCount('geotab_exception_rules')) === 0) await syncGeotabExceptionRules();
+  else console.log('[GEOTAB] geotab_exception_rules populated — skipping Geotab fetch');
   await loadRuleNameCache();
-  await syncGeotabDiagnostics();
-  await syncGeotabDevices();
-  await syncGeotabZones();
+  if ((await tableRowCount('geotab_diagnostics')) === 0) await syncGeotabDiagnostics();
+  else console.log('[GEOTAB] geotab_diagnostics populated — skipping Geotab fetch');
+  if ((await tableRowCount('geotab_devices')) === 0) await syncGeotabDevices();
+  else console.log('[GEOTAB] geotab_devices populated — skipping Geotab fetch');
   console.log('[GEOTAB] Initial sync complete');
 }
 
@@ -1608,16 +1623,9 @@ function startPolling(intervalMs = 60000, eventIntervalMs = 15000) {
       await syncLogRecords();
     }, 5 * 60 * 1000);
 
-    // Cold loop (every 30 min): reference data. Rules, groups, devices,
-    // diagnostics and zones are all upserted to DB + in-memory caches —
-    // re-fetching them every minute burned ~15 API calls for zero new info.
-    // (Fresh deploys still get everything immediately via initialSync.)
-    setInterval(async () => {
-      await syncGeotabGroups();
-      await syncGeotabExceptionRules();
-      await syncGeotabDiagnostics();
-      await syncGeotabDevices();
-    }, 30 * 60 * 1000);
+    // No cold loop: reference data is DB-owned. Zones are never fetched
+    // from Geotab; rules/groups/devices/diagnostics sync once at boot only
+    // when their tables are empty (see initialSync).
 
     // Exception events are the time-critical feed — poll frequently so new
     // telematics alerts arrive as they happen. The in-flight guard prevents
@@ -1626,12 +1634,7 @@ function startPolling(intervalMs = 60000, eventIntervalMs = 15000) {
       await syncGeotabEvents();
     }, eventIntervalMs);
 
-    // Sync zones less frequently (every 5 minutes)
-    setInterval(async () => {
-      await syncGeotabZones();
-    }, 5 * 60 * 1000);
-
-    console.log(`[GEOTAB] Polling started: position+ignition every ${intervalMs / 1000}s, events every ${eventIntervalMs / 1000}s, logrecords 5m, reference data 30m`);
+    console.log(`[GEOTAB] Polling started: position+ignition every ${intervalMs / 1000}s, events every ${eventIntervalMs / 1000}s, logrecords 5m, zero reference-data calls`);
   });
 }
 
