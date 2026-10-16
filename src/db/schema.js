@@ -683,6 +683,25 @@ const MIGRATIONS_SQL = `
   CREATE INDEX IF NOT EXISTS idx_telemetry_history_event_time ON telemetry_history(event_time);
   CREATE INDEX IF NOT EXISTS idx_telemetry_history_device_time ON telemetry_history(device_id, event_time);
 
+  -- NCR escalation email outbox: the dashboard enqueues finished emails and
+  -- returns instantly; the sweeper delivers in the background with retry, so
+  -- a slow SMTP host never holds the NCR save dialog open.
+  CREATE TABLE IF NOT EXISTS ncr_email_outbox (
+    id SERIAL PRIMARY KEY,
+    to_addrs TEXT[] NOT NULL,
+    subject TEXT NOT NULL,
+    html TEXT NOT NULL,
+    ncr_no TEXT,
+    group_name TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    next_retry_at TIMESTAMPTZ DEFAULT NOW(),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    sent_at TIMESTAMPTZ
+  );
+  CREATE INDEX IF NOT EXISTS idx_ncr_outbox_due ON ncr_email_outbox(status, next_retry_at) WHERE status IN ('pending', 'failed');
+
   -- Composite index for fast unresolved alert_groups lookup
   CREATE INDEX IF NOT EXISTS idx_alert_groups_resolved_ts ON alert_groups(resolved, last_alert_ts DESC) WHERE resolved = FALSE;
 

@@ -148,6 +148,13 @@ async function start() {
       console.error(`[WS] WebSocket failed to start: ${err.message}`);
     }
 
+    // NCR email outbox sweeper: background delivery with retry.
+    try {
+      require('./services/ncrEmailSweeper').start();
+    } catch (err) {
+      console.error(`[NCR-OUTBOX] sweeper failed to start: ${err.message}`);
+    }
+
     // Start Geotab polling (connects WebSocket broadcast)
     try {
       const geotabPolling = require('./services/geotabPolling');
