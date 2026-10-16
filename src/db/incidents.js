@@ -33,6 +33,48 @@ async function upsertIncidentFromAlert({
   const saveTime = new Date();
   const saveIso = saveTime.toISOString();
 
+  // Fill-instead-of-duplicate: an auto-NCR row created earlier (SYSTEM, OPEN)
+  // carries a different alert_id per threshold hit, so the alert_id conflict
+  // never matches it. Match its group key while still OPEN and fill the human
+  // data (driver, controller, doc, outcome) onto that same row.
+  if (alertGroupKey) {
+    const open = await query(
+      `SELECT id FROM incidents WHERE alert_group_key = $1 AND status = 'OPEN' LIMIT 1`,
+      [alertGroupKey]
+    ).catch(() => ({ rows: [] }));
+    if (open.rows.length > 0) {
+      const oid = open.rows[0].id;
+      const filled = await query(
+        `UPDATE incidents SET
+           alert_id = COALESCE(NULLIF($2, ''), alert_id),
+           alarm_type = COALESCE(NULLIF($3, ''), alarm_type),
+           controller = COALESCE(NULLIF($4, ''), controller),
+           driver_name = COALESCE(NULLIF($5, ''), driver_name),
+           contact_number = COALESCE(NULLIF($6, ''), contact_number),
+           id_number = COALESCE(NULLIF($7, ''), id_number),
+           division = COALESCE(NULLIF($8, ''), division),
+           infringement = COALESCE(NULLIF($9, ''), infringement),
+           infringement_detail = COALESCE(NULLIF($10, ''), infringement_detail),
+           action_taken = COALESCE(NULLIF($11, ''), action_taken),
+           outcome = COALESCE(NULLIF($12, ''), outcome),
+           notes = COALESCE(NULLIF($13, ''), notes),
+           document_link = COALESCE(NULLIF($14, ''), document_link),
+           document_type = COALESCE(NULLIF($15, ''), document_type),
+           status = COALESCE(NULLIF($16, ''), status),
+           filled_by = COALESCE(NULLIF($17, ''), filled_by),
+           updated_at = NOW()
+         WHERE id = $1
+         RETURNING ${incidentSelectColumns()}`,
+        [oid, alertId, alarmType, form.controller || null, form.driver_name || null,
+         form.contact_number || null, form.id_number || null, form.division || null,
+         form.infringement || null, form.infringement_detail || null, form.action_taken || null,
+         form.outcome || null, form.notes || null, form.document_link || null,
+         form.document_type || null, status, filledBy]
+      );
+      if (filled.rows.length > 0) return filled.rows[0];
+    }
+  }
+
   const result = await query(
     `INSERT INTO incidents (
        incident_no, alert_id, alert_group_key, alarm_type, source_type, device_id, fleet_number, cost_center_id,

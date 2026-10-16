@@ -155,10 +155,11 @@ async function processAlertDeduction(fleet_number, alert_type) {
 
         // Never auto-resolve the original alerts — only a human closes them.
 
-        // Capture incident register row for the auto-NCR
+        // Capture incident register row for the auto-NCR (enriched + deduped)
         try {
           await insertAutoIncident(client, {
             alertId: ncrId,
+            groupKey,
             fleetNumber: fleet_number,
             alarmType: `NCR: ${alert_type}`,
             costCenterId: vehicleCostCenterId,
@@ -218,18 +219,84 @@ async function resolveNcrDeviceName(fleetNumber) {
   }
 }
 
+// Assigned driver for a fleet (Supabase drivers table, service role).
+let sbAdmin = null;
+function supabaseAdmin() {
+  if (sbAdmin !== undefined && sbAdmin !== null) return sbAdmin;
+  try {
+    const { createClient } = require('@supabase/supabase-js');
+    const config = require('../config/config');
+    sbAdmin = config.supabaseUrl && config.supabaseServiceRoleKey
+      ? createClient(config.supabaseUrl, config.supabaseServiceRoleKey)
+      : null;
+  } catch {
+    sbAdmin = null;
+  }
+  return sbAdmin;
+}
+async function resolveFleetDriver(fleetNumber) {
+  const out = { name: null, contact: null, idNumber: null };
+  try {
+    const sb = supabaseAdmin();
+    if (!sb || !fleetNumber) return out;
+    const { data } = await sb
+      .from('drivers')
+      .select('first_name, surname, cell_number, id_or_passport_number, fleet_number, assigned_vehicle')
+      .or(`fleet_number.eq.${fleetNumber},assigned_vehicle.eq.${fleetNumber}`)
+      .limit(1)
+      .maybeSingle();
+    if (data) {
+      out.name = `${data.first_name || ''} ${data.surname || ''}`.trim() || null;
+      out.contact = data.cell_number || null;
+      out.idNumber = data.id_or_passport_number || null;
+    }
+  } catch {
+    /* driver stays unknown — row still created */
+  }
+  return out;
+}
+async function resolveCostCenterName(costCenterId) {
+  try {
+    if (costCenterId == null) return null;
+    const { rows } = await query(
+      `SELECT name FROM geotab_groups WHERE id = $1 LIMIT 1`,
+      [String(costCenterId)]
+    );
+    return rows[0]?.name || null;
+  } catch {
+    return null;
+  }
+}
+
 // Insert an OPEN incident register row for an auto-generated NCR (uses caller's transaction client).
-async function insertAutoIncident(client, { alertId, fleetNumber, alarmType, costCenterId, sourceType = 'telematics' }) {
+// One OPEN row per fleet+type (repeat threshold hits bump the group, not the
+// register), enriched with assigned driver + division so the register is
+// informative before any human touches it. The human close fills the rest
+// (doc, controller, outcome) onto this same row via alert_group_key match.
+async function insertAutoIncident(client, { alertId, groupKey, fleetNumber, alarmType, costCenterId, sourceType = 'telematics' }) {
+  const dupe = await client.query(
+    `SELECT id FROM incidents
+     WHERE fleet_number = $1 AND alarm_type = $2 AND status = 'OPEN' LIMIT 1`,
+    [fleetNumber, alarmType]
+  ).catch(() => ({ rows: [] }));
+  if (dupe.rows.length > 0) return;
+  const [driver, division] = await Promise.all([
+    resolveFleetDriver(fleetNumber),
+    resolveCostCenterName(costCenterId),
+  ]);
   await client.query(
     `INSERT INTO incidents (
-       incident_no, alert_id, alarm_type, source_type, device_id, fleet_number, cost_center_id,
-       week, shift, incident_date, incident_time, infringement, filled_by, status
+       incident_no, alert_id, alert_group_key, alarm_type, source_type, device_id, fleet_number, cost_center_id,
+       week, shift, incident_date, incident_time, driver_name, contact_number, id_number, division,
+       infringement, filled_by, status
      ) VALUES (
-       DEFAULT, $1, $2, $3, $4, $5, $6,
-       EXTRACT(WEEK FROM NOW())::int, to_char(NOW() + interval '2 hours', 'HH24:MI'), (NOW() + interval '2 hours')::date, (NOW() + interval '2 hours')::time, $2, 'SYSTEM', 'OPEN'
+       DEFAULT, $1, $2, $3, $4, $5, $6, $7,
+       EXTRACT(WEEK FROM NOW())::int, to_char(NOW() + interval '2 hours', 'HH24:MI'), (NOW() + interval '2 hours')::date, (NOW() + interval '2 hours')::time,
+       $8, $9, $10, $11, $3, 'SYSTEM', 'OPEN'
      )
      ON CONFLICT (alert_id) DO NOTHING`,
-    [alertId, alarmType, sourceType, fleetNumber, fleetNumber, costCenterId]
+    [alertId, groupKey || null, alarmType, sourceType, fleetNumber, fleetNumber, costCenterId,
+     driver.name, driver.contact, driver.idNumber, division]
   );
 }
 
