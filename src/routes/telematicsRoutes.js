@@ -656,7 +656,7 @@ router.get('/vehicle-alerts', async (req, res) => {
 router.get('/vehicle-alerts/:deviceId', async (req, res) => {
   try {
     const { deviceId } = req.params;
-    const { fleet, includeAll, cursorTs, cursorId, limit } = req.query;
+    const { fleet, fleets, deviceIds, includeAll, cursorTs, cursorId, limit } = req.query;
 
     let where = `WHERE ag.resolved = FALSE AND ag.false_alert = FALSE`;
     const params = [];
@@ -678,6 +678,15 @@ router.get('/vehicle-alerts/:deviceId', async (req, res) => {
       } catch (_) { fleetKey = null; }
     }
 
+    // BATCH mode: `fleets=A,B,C` (comma-separated) returns the union of
+    // those vehicles' open groups in ONE request. Same exact-match semantics
+    // and same row shaping as the single-vehicle path — the board needs every
+    // visible vehicle's groups at once (one call instead of one per card).
+    const fleetList = String(fleets || '')
+      .split(',')
+      .map((f) => f.trim().toUpperCase())
+      .filter(Boolean);
+
     if (fleetKey) {
       try {
         const g = await db.query(
@@ -695,8 +704,35 @@ router.get('/vehicle-alerts/:deviceId', async (req, res) => {
       } catch (_) { /* optional */ }
     }
 
+    // Batched device ids (camera alerts may carry no fleet_number) — exact
+    // ids only, same matching rules as the single-vehicle path.
+    const deviceIdList = String(deviceIds || '')
+      .split(',')
+      .map((d) => d.trim())
+      .filter(Boolean);
+    deviceIdList.forEach((d) => idSet.add(d));
+
+    // Sibling device ids for every batched fleet (camera + Geotab siblings
+    // share a vehicle — the timeline shows both, so the board must too).
+    if (fleetList.length > 0) {
+      try {
+        const g = await db.query(
+          `SELECT id FROM geotab_devices WHERE upper(trim(fleet_number)) = ANY($1::text[])`,
+          [fleetList]
+        );
+        g.rows.forEach((r) => r.id && idSet.add(String(r.id)));
+      } catch (_) { /* optional */ }
+      try {
+        const vs = await db.query(
+          `SELECT device_id FROM vehicle_status WHERE upper(trim(fleet_number)) = ANY($1::text[])`,
+          [fleetList]
+        );
+        vs.rows.forEach((r) => r.device_id && idSet.add(String(r.device_id)));
+      } catch (_) { /* optional */ }
+    }
+
     const idList = [...idSet];
-    if (idList.length === 0 && !fleetKey) {
+    if (idList.length === 0 && !fleetKey && fleetList.length === 0) {
       return res.json({ success: true, alerts: [], count: 0 });
     }
 
@@ -709,6 +745,11 @@ router.get('/vehicle-alerts/:deviceId', async (req, res) => {
     if (fleetKey) {
       params.push(fleetKey);
       matchClauses.push(`upper(trim(coalesce(ag.fleet_number, ''))) = upper($${idx})`);
+      idx++;
+    }
+    if (fleetList.length > 0) {
+      params.push(fleetList);
+      matchClauses.push(`upper(trim(coalesce(ag.fleet_number, ''))) = ANY($${idx}::text[])`);
       idx++;
     }
     where += ` AND (${matchClauses.join(' OR ')})`;
@@ -770,7 +811,15 @@ router.get('/vehicle-alerts/:deviceId', async (req, res) => {
       console.error('[vehicle-alerts] transform failed:', transformError.message);
     }
 
-    res.json({ success: true, alerts, count: alerts.length, device_ids: idList, fleet: fleetKey || null, page });
+    res.json({
+      success: true,
+      alerts,
+      count: alerts.length,
+      device_ids: idList,
+      fleet: fleetKey || null,
+      fleets: fleetList.length > 0 ? fleetList : (fleetKey ? [fleetKey] : []),
+      page,
+    });
   } catch (error) {
     console.error('[vehicle-alerts] Error:', error.message, error.stack);
     res.status(500).json({ success: false, message: error.message });
