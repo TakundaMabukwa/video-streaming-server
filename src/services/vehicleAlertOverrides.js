@@ -22,6 +22,24 @@ let loading = false;
 
 const norm = (v) => String(v || '').trim().toLowerCase();
 
+// Registrations arrive in different shapes ("LCZ948MP" vs "EX63 - LCZ948MP"),
+// so compare the whole value AND the last token.
+const regTokens = (v) => {
+  const full = norm(v).replace(/[^a-z0-9]+/g, "");
+  const parts = norm(v).split(/[\s\-/]+/).filter(Boolean);
+  const last = parts.length ? parts[parts.length - 1].replace(/[^a-z0-9]+/g, "") : "";
+  return { full, last };
+};
+
+const regMatches = (a, b) => {
+  if (!a || !b) return false;
+  const ta = regTokens(a);
+  const tb = regTokens(b);
+  if (!ta.full || !tb.full) return false;
+  if (ta.full === tb.full) return true;
+  return !!ta.last && ta.last === tb.last;
+};
+
 function keyFor(fleetNumber, registration) {
   return `${norm(fleetNumber)}|${norm(registration)}`;
 }
@@ -80,10 +98,14 @@ function isSuppressedSync({ fleetNumber, registration, alertName, signalCode } =
   const name = norm(alertName);
   const code = norm(signalCode);
   for (const entry of cache.values()) {
-    // Vehicle match: every key the row declares must match; empty = wildcard.
-    if (entry.fleet && entry.fleet !== fleet) continue;
-    if (entry.reg && entry.reg !== reg) continue;
-    if (!entry.fleet && !entry.reg) continue;
+    // Vehicle match: EITHER declared key matching is enough ("fleet or reg is
+    // ok"). Both keys are optional; a row with only one matches on that one.
+    // OR semantics are required in practice: the plate a detector reports is
+    // not always the registry plate (camera vehicles report a device id in
+    // license_plate), so requiring both would stop the override matching.
+    const fleetHit = !!entry.fleet && entry.fleet === fleet;
+    const regHit = !!entry.reg && regMatches(entry.reg, reg);
+    if (!fleetHit && !regHit) continue;
     // Alert match: signal code first (stable), then the display name.
     if (code && entry.codes.has(code)) return true;
     if (name && entry.types.has(name)) return true;
