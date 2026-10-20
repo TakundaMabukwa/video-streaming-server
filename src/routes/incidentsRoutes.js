@@ -47,9 +47,10 @@ router.patch('/:id', async (req, res) => {
   }
 });
 
-// POST /api/incidents/:id/close — close an open NCR from the register.
-// Marks the NCR closed and resolves the linked alert group (if still open)
-// so the register and the board never disagree.
+// POST /api/incidents/:id/close — close an NCR from the register.
+// Works for OPEN and RESOLVED records (a resolved NCR can still be signed
+// off). Sets the canonical CLOSED status and resolves the linked alert
+// group (if still open) so the register and the board never disagree.
 router.post('/:id/close', async (req, res) => {
   try {
     const id = String(req.params.id || '').trim();
@@ -58,7 +59,7 @@ router.post('/:id/close', async (req, res) => {
     }
     const existing = await db.getIncident(id);
     if (!existing) return res.status(404).json({ success: false, message: 'Incident not found' });
-    const status = String(req.body?.status || 'RESOLVED').toUpperCase();
+    const status = String(req.body?.status || 'CLOSED').toUpperCase();
     const closedBy = String(req.body?.resolved_by || '').trim() || null;
     const notes = String(req.body?.notes || '').trim() || null;
 
