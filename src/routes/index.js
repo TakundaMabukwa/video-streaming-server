@@ -15,6 +15,7 @@ const policeRoutes = require('./policeRoutes');
 const incidentsRoutes = require('./incidentsRoutes');
 const repairRoutes = require('./repairRoutes');
 const presenceRoutes = require('./presenceRoutes');
+const vehicleOverrideRoutes = require('./vehicleOverrideRoutes');
 const ncrRoutes = require('./ncrRoutes');
 
 const router = express.Router();
@@ -36,5 +37,6 @@ router.use('/incidents', incidentsRoutes);
 router.use('/repair-requests', repairRoutes);
 router.use('/ncr', ncrRoutes);
 router.use('/presence', presenceRoutes);
+router.use('/vehicle-overrides', vehicleOverrideRoutes);
 
 module.exports = router;

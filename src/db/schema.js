@@ -362,6 +362,25 @@ const MIGRATIONS_SQL = `
   );
   CREATE INDEX IF NOT EXISTS idx_alert_watchers_heartbeat ON alert_watchers(heartbeat_at);
 
+  -- Vehicle alert overrides: alerts that must NOT be raised for a given
+  -- vehicle. One row per vehicle; fleet_number and registration are
+  -- independent match keys (an empty one is a wildcard).
+  CREATE TABLE IF NOT EXISTS vehicle_alert_overrides (
+    id SERIAL PRIMARY KEY,
+    fleet_number TEXT,
+    registration TEXT,
+    alert_types TEXT[] NOT NULL DEFAULT '{}'::text[],
+    signal_codes TEXT[] NOT NULL DEFAULT '{}'::text[],
+    is_active BOOLEAN DEFAULT TRUE,
+    notes TEXT,
+    created_by TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_vae_vehicle
+    ON vehicle_alert_overrides (COALESCE(fleet_number, ''), COALESCE(registration, ''));
+  CREATE INDEX IF NOT EXISTS idx_vae_active ON vehicle_alert_overrides(is_active);
+
   CREATE TABLE IF NOT EXISTS camera_status (
     fleet_number TEXT PRIMARY KEY,
     reg TEXT,

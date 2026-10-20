@@ -155,6 +155,14 @@ async function start() {
       console.error(`[NCR-OUTBOX] sweeper failed to start: ${err.message}`);
     }
 
+    // Vehicle alert overrides: warm the in-memory cache so the detection
+    // path never queries for it.
+    try {
+      require('./services/vehicleAlertOverrides').start();
+    } catch (err) {
+      console.error(`[OVERRIDES] cache failed to start: ${err.message}`);
+    }
+
     // Start Geotab polling (connects WebSocket broadcast)
     try {
       const geotabPolling = require('./services/geotabPolling');

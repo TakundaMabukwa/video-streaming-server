@@ -4,6 +4,7 @@ const { fetchVehiclesFromSupabase } = require('../helpers/supabaseClient');
 const { getTelematicsNameMap } = require('../db/alert_definitions');
 const { matchAlertDefinition } = require('../helpers/alertMatching');
 const { isPollerOwnedAlert, SPEED_85_CODE, SPEED_90_CODE } = require('../helpers/pollerOwnedAlerts');
+const overrides = require('./vehicleAlertOverrides');
 const { processAlertDeduction } = require('./driverScoringService');
 const { escalateSeverity } = require('../helpers/transform');
 
@@ -758,6 +759,7 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
   let inserted = 0;
   let unknownDevice = 0;
   let alerted = 0;
+  let suppressed = 0;
 
   for (let i = 0; i < events.length; i++) {
     const event = events[i];
@@ -818,6 +820,19 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
       }
 
       const eventTime = event.activeFrom || event.lastModifiedDateTime || new Date();
+
+      // Vehicle override: this vehicle must not raise this alert. Checked
+      // BEFORE anything is written — the event is not archived, no group is
+      // created, and it does not count toward auto-NCR/deduction.
+      if (overrides.isSuppressedSync({
+        fleetNumber,
+        registration: licensePlate,
+        alertName: eventName,
+        signalCode: eventCode,
+      })) {
+        suppressed++;
+        continue;
+      }
 
       // Store telematics events even for unknown devices — device_id is known,
       // so the event must never be silently dropped.
@@ -960,6 +975,8 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
         speed: evtSpeed ?? null,
         sourceType: 'telematics',
         severity: String(matchedDef.severity || 'MEDIUM').toLowerCase(),
+        fleetNumber: fleetNumber || null,
+        registration: licensePlate || null,
       });
       if (!groupRow) continue; // vehicle not in fleet_vehicles — no alert
       alerted++;
@@ -1015,7 +1032,7 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
     }
   }
 
-  return { inserted, unknownDevice, alerted };
+  return { inserted, unknownDevice, alerted, suppressed };
 }
 
 // ── Vehicle status from Skycamx (independent of Geotab) ──
@@ -1321,6 +1338,8 @@ async function createZoneEntryAlert({ deviceId, fleetNumber, licensePlate, lat, 
       speed: speed ?? null,
       sourceType: 'telematics',
       severity: String(matchedDef.severity || 'MEDIUM').toLowerCase(),
+      fleetNumber: fleetNumber || null,
+      registration: licensePlate || null,
     });
     if (!groupRow || groupRow.id == null) return null;
 

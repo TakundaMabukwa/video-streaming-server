@@ -29,7 +29,20 @@ async function stampMember(groupRow, a) {
   return groupRow;
 }
 
-async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, alertId, alarmTs, lat, lon, speed, sourceType = 'video', severity }) {
+async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, alertId, alarmTs, lat, lon, speed, sourceType = 'video', severity, fleetNumber, registration }) {
+  // Backstop: a vehicle configured to skip this alert must never get a
+  // group, whichever detection path tried to create one.
+  try {
+    const { isSuppressedSync } = require('../services/vehicleAlertOverrides');
+    if (isSuppressedSync({
+      fleetNumber: fleetNumber || null,
+      registration: registration || null,
+      alertName: alarmType,
+    })) {
+      return null;
+    }
+  } catch (_) { /* never block detection on the override check */ }
+
   // Only vehicles in fleet_vehicles may raise alerts.
   if (!(await isRegisteredVehicle({ deviceId, deviceName }))) return null;
 

@@ -244,6 +244,13 @@ function findCurrentZone(zones, lat, lon) {
 // long as it exists in fleet_vehicles.
 async function emitDeviceStatusAlert({ deviceId, fleetNumber, licensePlate, signalCode, alarmText, lat, lon, speed, ts, extra = {} }) {
   try {
+    // Vehicle override: this vehicle must not raise this alert (checked
+    // before anything is written — no group, no event row, no alert).
+    const overrides = require('./vehicleAlertOverrides');
+    if (overrides.isSuppressedSync({ fleetNumber, registration: licensePlate, signalCode })) {
+      logDropOnce(`ovr:${signalCode}:${fleetNumber || deviceId}`, `[DEVSTATUS] suppressed ${signalCode} for ${fleetNumber || deviceId}: vehicle alert override`);
+      return null;
+    }
     const ccId = await findVehicleCostCenterId(fleetNumber || deviceId).catch(() => null);
     const def = await isAlertActiveForCC(signalCode, ccId).catch(() => null);
     if (!def) {
@@ -289,6 +296,8 @@ async function emitDeviceStatusAlert({ deviceId, fleetNumber, licensePlate, sign
       speed: speed ?? null,
       sourceType: 'telematics',
       severity: String(def.severity || 'MEDIUM').toLowerCase(),
+      fleetNumber: fleetNumber || null,
+      registration: licensePlate || null,
     });
     if (!groupRow) return null;
 
