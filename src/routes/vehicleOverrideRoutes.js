@@ -38,30 +38,58 @@ router.get('/', async (req, res) => {
 });
 
 // GET /vehicle-overrides/vehicles — the vehicle registry for the pickers.
-// Reads Supabase `vehiclesc` (registration_number + fleet_number), capped.
+// Primary source: Supabase `vehiclesc` (registration_number + fleet_number),
+// capped. The EPS-side registry is unioned in so no tracked fleet is missing
+// from the picker (vehiclesc does not carry every fleet the system tracks).
 router.get('/vehicles', async (req, res) => {
   try {
     const limit = Math.min(Math.max(parseInt(String(req.query.limit || '2000'), 10) || 2000, 1), 5000);
-    const { createClient } = require('@supabase/supabase-js');
-    const url = process.env.SUPABASE_URL;
-    const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-    if (!url || !key) {
-      return res.status(500).json({ success: false, message: 'Supabase not configured' });
+    const rows = [];
+    const seen = new Set();
+    const add = (fleet, reg) => {
+      const f = String(fleet || '').trim();
+      const p = String(reg || '').trim();
+      if (!f && !p) return;
+      const key = `${f.toUpperCase()}|${p.toUpperCase()}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      rows.push({ fleet_number: f, registration_number: p });
+    };
+
+    // 1) Supabase vehiclesc (the source of truth for the app's vehicles).
+    try {
+      const { createClient } = require('@supabase/supabase-js');
+      const url = process.env.SUPABASE_URL;
+      const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+      if (url && key) {
+        const supabase = createClient(url, key);
+        const { data, error } = await supabase
+          .from('vehiclesc')
+          .select('registration_number, fleet_number')
+          .limit(limit);
+        if (error) {
+          console.error('[OVERRIDES] vehiclesc query failed:', error.message);
+        } else {
+          for (const r of data || []) add(r?.fleet_number, r?.registration_number);
+        }
+      }
+    } catch (err) {
+      console.error('[OVERRIDES] vehiclesc fetch failed:', err.message);
     }
-    const supabase = createClient(url, key);
-    const { data, error } = await supabase
-      .from('vehiclesc')
-      .select('registration_number, fleet_number')
-      .limit(limit);
-    if (error) {
-      return res.status(500).json({ success: false, message: error.message });
+
+    // 2) EPS registry — covers fleets that are not in vehiclesc.
+    try {
+      const { rows: epsRows } = await db.query(
+        `SELECT fleet_number, registration_number FROM fleet_vehicles
+         WHERE fleet_number IS NOT NULL OR registration_number IS NOT NULL
+         LIMIT $1`,
+        [limit]
+      );
+      for (const r of epsRows || []) add(r?.fleet_number, r?.registration_number);
+    } catch (err) {
+      console.error('[OVERRIDES] fleet_vehicles fetch failed:', err.message);
     }
-    const rows = (data || [])
-      .map((r) => ({
-        registration_number: String(r?.registration_number || '').trim(),
-        fleet_number: String(r?.fleet_number || '').trim(),
-      }))
-      .filter((r) => r.registration_number || r.fleet_number);
+
     res.json({ success: true, data: rows, count: rows.length });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
