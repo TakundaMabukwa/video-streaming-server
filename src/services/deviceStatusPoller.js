@@ -1132,4 +1132,4 @@ async function checkCameraStatus(deviceId, fleetNumber, licensePlate, mettaxDevi
   }
 }
 
-module.exports = { startPoller, stopPoller, runOnce, setWsBroadcast, pollDeviceStatus, parseGeotabDurationMs, invalidateZonesCache, getPollHealth };
+module.exports = { startPoller, stopPoller, runOnce, setWsBroadcast, pollDeviceStatus, parseGeotabDurationMs, invalidateZonesCache, getPollHealth, emitDeviceStatusAlert };
