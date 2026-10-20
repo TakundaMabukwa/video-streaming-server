@@ -191,8 +191,18 @@ async function getIncidents({ cost_center_id, cost_center_ids, fleet_number, sta
     conditions.push(`fleet_number = $${params.length}`);
   }
   if (status) {
-    params.push(String(status).toUpperCase());
-    conditions.push(`status = $${params.length}`);
+    // Comma-separated statuses (e.g. RESOLVED,FALSE_ALERT for the closed tab).
+    const statuses = String(status)
+      .split(',')
+      .map((s) => s.trim().toUpperCase())
+      .filter(Boolean);
+    if (statuses.length === 1) {
+      params.push(statuses[0]);
+      conditions.push(`status = $${params.length}`);
+    } else if (statuses.length > 1) {
+      params.push(statuses);
+      conditions.push(`status = ANY($${params.length}::text[])`);
+    }
   }
   if (from && to) {
     params.push(from, to);

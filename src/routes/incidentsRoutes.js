@@ -47,4 +47,56 @@ router.patch('/:id', async (req, res) => {
   }
 });
 
+// POST /api/incidents/:id/close — close an open NCR from the register.
+// Marks the NCR closed and resolves the linked alert group (if still open)
+// so the register and the board never disagree.
+router.post('/:id/close', async (req, res) => {
+  try {
+    const id = String(req.params.id || '').trim();
+    if (!id) {
+      return res.status(400).json({ success: false, message: 'Invalid incident id' });
+    }
+    const existing = await db.getIncident(id);
+    if (!existing) return res.status(404).json({ success: false, message: 'Incident not found' });
+    const status = String(req.body?.status || 'RESOLVED').toUpperCase();
+    const closedBy = String(req.body?.resolved_by || '').trim() || null;
+    const notes = String(req.body?.notes || '').trim() || null;
+
+    const incident = await db.updateIncidentFields(id, {
+      status,
+      resolved_by: closedBy,
+      resolved_at: new Date().toISOString(),
+      closure_type: existing.closure_type || 'ncr',
+      ...(notes ? { notes } : {}),
+    });
+    if (!incident) return res.status(400).json({ success: false, message: 'Could not close incident' });
+
+    // Resolve the linked alert group so the board matches the register.
+    let alertGroupResolved = false;
+    const groupKey = String(existing.alert_group_key || '').trim();
+    if (groupKey) {
+      try {
+        const res = await db.query(
+          `UPDATE alert_groups
+           SET resolved = TRUE, resolved_by = $2, resolved_at = NOW(), updated_at = NOW()
+           WHERE group_key = $1 AND resolved = FALSE AND false_alert = FALSE`,
+          [groupKey, closedBy]
+        );
+        alertGroupResolved = res.rowCount > 0;
+      } catch (err) {
+        console.error('[Incidents] linked alert resolve failed:', err.message);
+      }
+    }
+
+    console.log(
+      `[Incidents] closed #${id} (${existing.incident_no || ''}) by ${closedBy || 'unknown'}` +
+      `${alertGroupResolved ? ' + linked alert group resolved' : ''}`
+    );
+    res.json({ success: true, incident, alert_group_resolved: alertGroupResolved });
+  } catch (err) {
+    console.error('[Incidents] Close error:', err.message);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 module.exports = router;
