@@ -37,6 +37,37 @@ router.get('/', async (req, res) => {
   }
 });
 
+// GET /vehicle-overrides/vehicles — the vehicle registry for the pickers.
+// Reads Supabase `vehiclesc` (registration_number + fleet_number), capped.
+router.get('/vehicles', async (req, res) => {
+  try {
+    const limit = Math.min(Math.max(parseInt(String(req.query.limit || '2000'), 10) || 2000, 1), 5000);
+    const { createClient } = require('@supabase/supabase-js');
+    const url = process.env.SUPABASE_URL;
+    const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+    if (!url || !key) {
+      return res.status(500).json({ success: false, message: 'Supabase not configured' });
+    }
+    const supabase = createClient(url, key);
+    const { data, error } = await supabase
+      .from('vehiclesc')
+      .select('registration_number, fleet_number')
+      .limit(limit);
+    if (error) {
+      return res.status(500).json({ success: false, message: error.message });
+    }
+    const rows = (data || [])
+      .map((r) => ({
+        registration_number: String(r?.registration_number || '').trim(),
+        fleet_number: String(r?.fleet_number || '').trim(),
+      }))
+      .filter((r) => r.registration_number || r.fleet_number);
+    res.json({ success: true, data: rows, count: rows.length });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 // GET /vehicle-overrides/alert-types — selectable alert statuses.
 router.get('/alert-types', async (req, res) => {
   try {
