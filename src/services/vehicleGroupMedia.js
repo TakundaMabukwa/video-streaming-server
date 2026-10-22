@@ -7,7 +7,11 @@ const db = require('../db');
 const syncService = require('./syncService');
 
 const CONCURRENCY = 6;
-const PER_ALERT_TIMEOUT_MS = 8000;
+const PER_ALERT_TIMEOUT_MS = 6000;
+// Live camera lookups are slow and the HTTP server cuts a socket off after
+// 30s (server.setTimeout). Stop starting new work before that and return what
+// we have, flagged as partial, instead of letting the whole request 500.
+const OVERALL_BUDGET_MS = 18000;
 
 /** Member detections of a group, newest first. */
 async function groupMembers(groupId, limit = 50) {
@@ -31,18 +35,23 @@ async function mediaForGroup(groupId, { limit = 50 } = {}) {
   if (members.length === 0) return { media: [], members: 0, partial: false };
 
   const collected = [];
+  const startedAt = Date.now();
   let partial = false;
   let cursor = 0;
+  let processed = 0;
 
   const worker = async () => {
     while (cursor < members.length) {
+      if (Date.now() - startedAt >= OVERALL_BUDGET_MS) return;
       const member = members[cursor++];
+      processed += 1;
+      let timer = null;
       try {
         const media = await Promise.race([
           syncService.fetchMediaOnDemand(member),
-          new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('media timeout')), PER_ALERT_TIMEOUT_MS)
-          ),
+          new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error('media timeout')), PER_ALERT_TIMEOUT_MS);
+          }),
         ]);
         for (const m of media || []) {
           collected.push({
@@ -54,6 +63,8 @@ async function mediaForGroup(groupId, { limit = 50 } = {}) {
         }
       } catch (err) {
         partial = true;
+      } finally {
+        if (timer) clearTimeout(timer);
       }
     }
   };
@@ -61,6 +72,9 @@ async function mediaForGroup(groupId, { limit = 50 } = {}) {
   await Promise.all(
     Array.from({ length: Math.min(CONCURRENCY, members.length) }, () => worker())
   );
+
+  // Anything not attempted before the deadline makes this a partial result.
+  if (processed < members.length) partial = true;
 
   return { media: collected, members: members.length, partial };
 }

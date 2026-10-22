@@ -226,6 +226,8 @@ router.get('/alert-groups/:groupId/archive', async (req, res) => {
 
 router.get('/alert-groups/:groupId/media', async (req, res) => {
   try {
+    // Live camera lookups can exceed the server's default 30s socket timeout.
+    req.setTimeout(120000);
     const groupId = Number(req.params.groupId);
     if (!Number.isInteger(groupId) || groupId < 1) {
       return res.status(400).json({ success: false, message: 'Invalid group id' });
