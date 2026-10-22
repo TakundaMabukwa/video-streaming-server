@@ -5,16 +5,24 @@ const db = require('../db');
 const { findVehicleCostCenterId } = require('./costCenterLookup');
 
 const ALERT_FORM_KEYS = [
-  'ncrNo', 'driverName', 'contactNumber', 'idNumber', 'idDocumentType',
+  'ncrNo', 'driverId', 'driverName', 'contactNumber', 'idNumber', 'idDocumentType',
   'department', 'section', 'responsibleManager', 'manager', 'investigator',
-  'vehicleFleetNumber', 'vehicleRegistration', 'date', 'time', 'duration',
+  'vehicleFleetNumber', 'vehicleRegistration', 'costCenterId', 'costCenterName',
+  'date', 'time', 'duration',
   'area', 'site', 'location', 'alertId', 'lastOccurrence', 'alertType',
   'alertSeverity', 'classifications', 'otherClassification', 'description',
   'riskRating', 'rootCauses', 'correctiveAction', 'correctiveResponsibility',
-  'correctiveTargetDate', 'preventiveAction', 'preventiveResponsibility',
+  'correctiveTargetDate', 'outcome', 'preventiveAction', 'preventiveResponsibility',
   'preventiveTargetDate', 'probability', 'ratingMatrix', 'actions',
   'evidenceCount', 'attachments', 'notes',
 ];
+
+// Human-readable cost-centre name for the stored document (best effort).
+async function findCostCenterName(costCenterId) {
+  if (costCenterId == null) return null;
+  const { rows } = await db.query('SELECT name FROM cost_centers WHERE id = $1 LIMIT 1', [costCenterId]);
+  return rows[0]?.name || null;
+}
 
 /**
  * Persist an NCR document for an alert group.
@@ -66,6 +74,13 @@ async function createNcrFromAlert(opts = {}) {
     formData.vehicleFleetNumber || formData.fleetNumber || group.fleet_number || group.device_id || ''
   ).trim();
   const costCenterId = await findVehicleCostCenterId(fleetNumber).catch(() => null);
+  // Always keep the vehicle's cost centre on the stored document too, not only
+  // on the incident row. When the id resolves, the authoritative name wins.
+  formData.costCenterId = costCenterId == null ? null : costCenterId;
+  if (costCenterId != null) {
+    const resolvedCostCenterName = await findCostCenterName(costCenterId).catch(() => null);
+    if (resolvedCostCenterName) formData.costCenterName = resolvedCostCenterName;
+  }
 
   const now = new Date().toISOString();
   const incident = await db.upsertIncidentFromAlert({
@@ -86,7 +101,7 @@ async function createNcrFromAlert(opts = {}) {
     infringement: (formData.classifications || []).join(', ') || group.alarm_type,
     infringement_detail: formData.description || null,
     action_taken: formData.correctiveAction || null,
-    outcome: formData.preventiveAction || null,
+    outcome: formData.outcome || formData.preventiveAction || null,
     notes: formData.notes || null,
     filled_at: now,
   });
@@ -168,7 +183,7 @@ async function createNcrFromAlert(opts = {}) {
             infringement: (formData.classifications || []).join(', ') || null,
             infringement_detail: formData.description || null,
             action_taken: formData.correctiveAction || null,
-            outcome: formData.preventiveAction || null,
+            outcome: formData.outcome || formData.preventiveAction || null,
           },
           incidentId: incident.id,
         }),
@@ -177,6 +192,9 @@ async function createNcrFromAlert(opts = {}) {
         groupId,
       ]
     ).catch(() => {});
+    // Close the alert group now, not on the next 15s poll: the caller expects
+    // the alert resolved within seconds of the save returning.
+    require('./jobRunner').kick();
   }
 
   if (archive) {
@@ -184,6 +202,7 @@ async function createNcrFromAlert(opts = {}) {
     await queueArchiveForForm(ncrFormId, groupId, { requestedBy: actorEmail }).catch((err) => {
       console.error('[NCR] archive queue failed:', err.message);
     });
+    require('./jobRunner').kick();
   }
 
   return {

@@ -21,6 +21,9 @@ const ARCHIVE_MAX_ATTEMPTS = 60;
 
 let timer = null;
 let running = false;
+// A save can request an immediate run (e.g. the alert must close right after
+// the NCR is stored) without waiting for the 15s tick.
+let pendingKick = false;
 
 async function claimJobs(limit = 5) {
   const { rows } = await db.query(
@@ -100,54 +103,80 @@ async function runJob(job) {
   throw new Error(`unknown job type: ${job.job_type}`);
 }
 
-async function tick() {
-  if (running) return;
-  running = true;
-  try {
-    const jobs = await claimJobs(5);
-    // The jobs run one after the other, but every one of them is capped so a
-    // slow camera can never stall the queue.
-    for (const job of jobs) {
-      try {
-        const result = await withTimeout(runJob(job), JOB_TIMEOUT_MS, `${job.job_type} #${job.id} timed out`);
+// Drain whatever is claimable right now. Extracted so tick() can expose the
+// in-flight run as a promise that manual callers (tests, kick) can await.
+async function drain() {
+  const jobs = await claimJobs(5);
+  // The jobs run one after the other, but every one of them is capped so a
+  // slow camera can never stall the queue.
+  for (const job of jobs) {
+    try {
+      const result = await withTimeout(runJob(job), JOB_TIMEOUT_MS, `${job.job_type} #${job.id} timed out`);
 
-        // The footage job is only finished when the uploaded file is there.
-        // While the camera has not uploaded it yet, keep the job alive.
-        if (job.job_type === 'footage' && !footageComplete(result)) {
-          await scheduleRetry(job, 'Waiting for the camera to upload the footage');
-          continue;
-        }
+      // The footage job is only finished when the uploaded file is there.
+      // While the camera has not uploaded it yet, keep the job alive.
+      if (job.job_type === 'footage' && !footageComplete(result)) {
+        await scheduleRetry(job, 'Waiting for the camera to upload the footage');
+        continue;
+      }
 
-        // The archive job stays alive until the ZIP is built and linked.
-        if (job.job_type === 'archive' && !result?.ready) {
-          await scheduleRetry(job, 'Building the evidence archive');
-          continue;
-        }
+      // The archive job stays alive until the ZIP is built and linked.
+      if (job.job_type === 'archive' && !result?.ready) {
+        await scheduleRetry(job, 'Building the evidence archive');
+        continue;
+      }
 
+      await db.query(
+        `UPDATE jobs SET status = 'done', error = NULL, updated_at = NOW() WHERE id = $1`,
+        [job.id]
+      );
+      // Only the closure job resolves the document — an archive job must
+      // never mark an NCR resolved on its own.
+      if (job.job_type === 'resolve' && job.ncr_form_id) {
         await db.query(
-          `UPDATE jobs SET status = 'done', error = NULL, updated_at = NOW() WHERE id = $1`,
-          [job.id]
+          `UPDATE ncr_forms SET status = 'RESOLVED', updated_at = NOW()
+           WHERE id = $1 AND status = 'SAVED'`,
+          [job.ncr_form_id]
         );
-        // Only the closure job resolves the document — an archive job must
-        // never mark an NCR resolved on its own.
-        if (job.job_type === 'resolve' && job.ncr_form_id) {
-          await db.query(
-            `UPDATE ncr_forms SET status = 'RESOLVED', updated_at = NOW()
-             WHERE id = $1 AND status = 'SAVED'`,
-            [job.ncr_form_id]
-          );
-        }
-        console.log(`[JOBS] ${job.job_type} #${job.id} done`, result ? '' : '');
-      } catch (err) {
-        await scheduleRetry(job, String(err.message || err).slice(0, 500), true);
-        console.error(`[JOBS] ${job.job_type} #${job.id} attempt failed:`, err.message);
+      }
+      console.log(`[JOBS] ${job.job_type} #${job.id} done`, result ? '' : '');
+    } catch (err) {
+      await scheduleRetry(job, String(err.message || err).slice(0, 500), true);
+      console.error(`[JOBS] ${job.job_type} #${job.id} attempt failed:`, err.message);
+    }
+  }
+}
+
+let currentRun = null;
+
+async function tick() {
+  if (running && currentRun) {
+    // Join the run already in flight so callers that await tick() observe the
+    // completed work. Queue one more pass for jobs that arrived meanwhile.
+    pendingKick = true;
+    try {
+      await currentRun;
+    } catch {
+      /* already logged by the run */
+    }
+    return;
+  }
+  running = true;
+  currentRun = (async () => {
+    try {
+      await drain();
+    } catch (err) {
+      console.error('[JOBS] tick failed:', err.message);
+    } finally {
+      running = false;
+      currentRun = null;
+      if (pendingKick) {
+        pendingKick = false;
+        setImmediate(() => tick().catch(() => {}));
       }
     }
-  } catch (err) {
-    console.error('[JOBS] tick failed:', err.message);
-  } finally {
-    running = false;
-  }
+  })();
+  await currentRun;
 }
 
 // Never let one job run forever.
@@ -225,4 +254,10 @@ function start() {
   console.log(`[JOBS] runner started (every ${TICK_MS / 1000}s)`);
 }
 
-module.exports = { start, tick, runJob, claimJobs };
+// Run the queue now instead of waiting for the next interval. Non-blocking and
+// safe to call from a request handler (the save must never wait on it).
+function kick() {
+  setImmediate(() => tick().catch(() => {}));
+}
+
+module.exports = { start, tick, kick, runJob, claimJobs };

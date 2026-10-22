@@ -61,6 +61,7 @@ const check = (c, m) => { if (!c) ok = false; console.log(`${c ? 'PASS' : 'FAIL'
       description: 'QA description',
       correctiveAction: 'QA corrective',
       preventiveAction: 'QA preventive',
+      outcome: 'QA outcome',
       riskRating: 'high',
       rootCauses: ['Unsafe Acts'],
       evidenceCount: 1,
@@ -79,6 +80,12 @@ const check = (c, m) => { if (!c) ok = false; console.log(`${c ? 'PASS' : 'FAIL'
   check(!!form, 'form readable');
   check(form.form_data.ncrNo === 'NCR-TEST-1', 'form_data keeps the document fields');
   check(form.form_data.correctiveAction === 'QA corrective', 'corrective action stored');
+  check(form.form_data.outcome === 'QA outcome', `outcome stored (${form.form_data.outcome})`);
+  check(Object.prototype.hasOwnProperty.call(form.form_data, 'costCenterId'), 'cost center id key stored');
+  check(
+    !form.form_data.costCenterId || typeof form.form_data.costCenterName === 'string',
+    `cost center name resolved (${form.form_data.costCenterName})`
+  );
   check(form.evidence.length === 1, `evidence stored (${form.evidence.length})`);
   check(form.status === 'SAVED', `form status ${form.status}`);
 
