@@ -42,24 +42,47 @@ router.get('/outbox-status', async (req, res) => {
 // POST /ncr — store the signed NCR document. FAST: the register row, the
 // document and the evidence go in one transaction, and the follow-up work
 // (resolve + email) is queued. The user never waits for a PDF or an email.
+/**
+ * The creator of an NCR is the signed-in user. It must come from the verified
+ * token — never from the request body and never a placeholder.
+ */
+function actorFromRequest(req) {
+  const user = req.user || {};
+  const email = String(user.email || user.user_metadata?.email || '').trim();
+  if (!email) return null;
+  return { id: user.id || user.sub || null, email };
+}
+
 router.post('/', async (req, res) => {
   try {
-    const { groupId, alertGroupId, form, evidence, userId } = req.body || {};
+    const { groupId, alertGroupId, form, evidence, archive } = req.body || {};
     const gid = groupId ?? alertGroupId;
+    const actor = actorFromRequest(req);
+    if (!actor) {
+      return res.status(422).json({
+        success: false,
+        message:
+          'Your session has no email address, so the NCR cannot be attributed to you. Please sign in again with an account that has an email.',
+      });
+    }
     const result = await ncrService.createNcrFromAlert({
       groupId: gid,
       form: form || {},
       evidence: Array.isArray(evidence) ? evidence : [],
-      userId: userId || null,
+      actor,
+      archive: archive === true,
     });
     if (!result.ok) {
-      return res.status(400).json({ success: false, message: result.error });
+      return res.status(result.status || 400).json({ success: false, message: result.error });
     }
     res.json({
       success: true,
       ncrFormId: result.ncrFormId,
       incidentId: result.incidentId,
       ncrNo: result.ncrNo,
+      updated: result.updated === true,
+      creatorEmail: result.creatorEmail,
+      archiveRequested: archive === true,
     });
   } catch (error) {
     console.error('[NCR] create failed:', error.message);
@@ -107,18 +130,18 @@ router.post('/:formId/document', async (req, res) => {
 // GET /ncr/footage — stored incident footage (Alert Footage tab).
 router.get('/footage/list', async (req, res) => {
   try {
-    const { deviceId, fleetNumber, status, limit } = req.query;
-    const rows = await alertFootage.listFootage({ deviceId, fleetNumber, status, limit });
+    const { deviceId, fleetNumber, status, limit, days } = req.query;
+    const rows = await alertFootage.listFootage({ deviceId, fleetNumber, status, limit, sinceDays: days });
     res.json({ success: true, data: rows, count: rows.length });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
 });
 
-// GET /ncr/footage/devices — vehicles that have footage.
+// GET /ncr/footage/devices — vehicles that have footage in the last N days.
 router.get('/footage/devices', async (req, res) => {
   try {
-    const rows = await alertFootage.listFootageDevices();
+    const rows = await alertFootage.listFootageDevices({ sinceDays: req.query.days });
     res.json({ success: true, data: rows, count: rows.length });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
@@ -150,6 +173,57 @@ router.post('/footage/refresh', async (req, res) => {
 
 // GET /ncr/alert-groups/:groupId/media — every member detection's media
 // (the "apply all media to docs" source).
+function archivePayload(row) {
+  if (!row) return null;
+  return {
+    status: row.status || null,
+    url: row.url || null,
+    error: row.error || null,
+    fileCount: row.file_count || 0,
+    byteSize: Number(row.byte_size || 0),
+    updatedAt: row.updated_at || null,
+  };
+}
+
+// POST /ncr/alert-groups/:groupId/archive — build (or reuse) the evidence ZIP.
+router.post('/alert-groups/:groupId/archive', async (req, res) => {
+  try {
+    const groupId = Number(req.params.groupId);
+    if (!Number.isInteger(groupId) || groupId < 1) {
+      return res.status(400).json({ success: false, message: 'Invalid alert group id' });
+    }
+    const actor = actorFromRequest(req);
+    if (!actor) {
+      return res.status(422).json({ success: false, message: 'Your session has no email address' });
+    }
+    const { requestGroupArchive } = require('../services/incidentArchiveService');
+    const row = await requestGroupArchive(groupId, {
+      requestedBy: actor.email,
+      force: req.body?.force === true,
+    });
+    res.json({ success: true, archive: archivePayload(row) });
+  } catch (error) {
+    console.error('[NCR] archive request failed:', error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// GET /ncr/alert-groups/:groupId/archive — poll the archive build.
+router.get('/alert-groups/:groupId/archive', async (req, res) => {
+  try {
+    const groupId = Number(req.params.groupId);
+    if (!Number.isInteger(groupId) || groupId < 1) {
+      return res.status(400).json({ success: false, message: 'Invalid alert group id' });
+    }
+    const { getGroupArchive } = require('../services/incidentArchiveService');
+    const row = await getGroupArchive(groupId);
+    res.json({ success: true, archive: archivePayload(row) });
+  } catch (error) {
+    console.error('[NCR] archive lookup failed:', error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 router.get('/alert-groups/:groupId/media', async (req, res) => {
   try {
     const groupId = Number(req.params.groupId);

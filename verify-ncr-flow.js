@@ -47,7 +47,7 @@ const check = (c, m) => { if (!c) ok = false; console.log(`${c ? 'PASS' : 'FAIL'
   const t0 = Date.now();
   const created = await ncrService.createNcrFromAlert({
     groupId: gid,
-    userId: 'qa@test',
+    actor: { id: 'qa-user', email: 'qa@test' },
     form: {
       ncrNo: 'NCR-TEST-1',
       driverName: 'QA Driver',

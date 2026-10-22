@@ -13,24 +13,39 @@ const ALERT_FORM_KEYS = [
   'riskRating', 'rootCauses', 'correctiveAction', 'correctiveResponsibility',
   'correctiveTargetDate', 'preventiveAction', 'preventiveResponsibility',
   'preventiveTargetDate', 'probability', 'ratingMatrix', 'actions',
-  'evidenceCount', 'attachments',
+  'evidenceCount', 'attachments', 'notes',
 ];
 
 /**
  * Persist an NCR document for an alert group.
  *
+ * The creator is mandatory and comes from the VERIFIED session (req.user),
+ * never from the payload and never a placeholder — an NCR must always be
+ * attributable to a real person.
+ *
  * @param {object} opts
  * @param {number|string} opts.groupId     alert_groups.id
  * @param {object} opts.form               the document fields (as displayed)
  * @param {Array}  [opts.evidence]        [{ url, type, channel, alertId, capturedAt }]
- * @param {string} [opts.userId]
+ * @param {{id?: string, email: string}} opts.actor  the signed-in user
+ * @param {boolean} [opts.archive]         build + link the evidence ZIP
  * @returns {Promise<{ok: boolean, error?: string, ncrFormId?: string, incidentId?: string}>}
  */
 async function createNcrFromAlert(opts = {}) {
-  const { groupId: rawGroupId, form = {}, evidence = [], userId = null } = opts;
+  const { groupId: rawGroupId, form = {}, evidence = [], actor = null, archive = false } = opts;
   const groupId = Number(rawGroupId);
   if (!Number.isInteger(groupId) || groupId < 1) {
     return { ok: false, error: 'groupId must be alert_groups.id (integer)' };
+  }
+
+  const actorEmail = String(actor?.email || '').trim();
+  const actorId = actor?.id ? String(actor.id) : null;
+  if (!actorEmail) {
+    return {
+      ok: false,
+      status: 422,
+      error: 'The signed-in account has no email address, so the NCR cannot be attributed. Sign in with an account that has an email.',
+    };
   }
 
   const group = await db.getAlertGroupById(groupId);
@@ -44,6 +59,8 @@ async function createNcrFromAlert(opts = {}) {
   formData.savedAt = new Date().toISOString();
   formData.alertType = formData.alertType || group.alarm_type || null;
   formData.fleetNumber = formData.vehicleFleetNumber || group.fleet_number || null;
+  formData.createdByEmail = actorEmail;
+  formData.createdById = actorId;
 
   const fleetNumber = String(
     formData.vehicleFleetNumber || formData.fleetNumber || group.fleet_number || group.device_id || ''
@@ -59,9 +76,9 @@ async function createNcrFromAlert(opts = {}) {
     deviceId: group.device_id,
     fleetNumber,
     costCenterId,
-    filledBy: userId || 'SYSTEM',
+    filledBy: actorEmail,
     status: 'OPEN',
-    controller: userId || null,
+    controller: actorEmail,
     driver_name: formData.driverName || null,
     contact_number: formData.contactNumber || null,
     id_number: formData.idNumber || null,
@@ -75,11 +92,25 @@ async function createNcrFromAlert(opts = {}) {
   });
   if (!incident) return { ok: false, error: 'Could not create the incident register row' };
 
-  const ncr = await db.query(
+  // One NCR per incident: a second save UPDATES the stored document instead
+  // of failing on the unique index.
+  const inserted = await db.query(
     `INSERT INTO ncr_forms
-       (incident_id, ncr_no, alert_id, alert_group_id, alert_group_key, form_data, status, created_by)
-     VALUES ($1, $2, $3, $4, $5, $6::jsonb, 'SAVED', $7)
-     RETURNING id, incident_id, ncr_no, status`,
+       (incident_id, ncr_no, alert_id, alert_group_id, alert_group_key, form_data, status,
+        created_by, created_by_id, created_by_email)
+     VALUES ($1, $2, $3, $4, $5, $6::jsonb, 'SAVED', $7, $8, $9)
+     ON CONFLICT (incident_id) DO UPDATE
+       SET form_data = EXCLUDED.form_data,
+           ncr_no = COALESCE(EXCLUDED.ncr_no, ncr_forms.ncr_no),
+           alert_id = EXCLUDED.alert_id,
+           alert_group_id = EXCLUDED.alert_group_id,
+           alert_group_key = COALESCE(EXCLUDED.alert_group_key, ncr_forms.alert_group_key),
+           created_by = EXCLUDED.created_by,
+           created_by_id = EXCLUDED.created_by_id,
+           created_by_email = EXCLUDED.created_by_email,
+           updated_at = NOW()
+     RETURNING id, incident_id, ncr_no, status, archive_url, archive_status,
+               (xmax = 0) AS inserted`,
     [
       incident.id,
       formData.ncrNo || null,
@@ -87,12 +118,18 @@ async function createNcrFromAlert(opts = {}) {
       groupId,
       group.group_key || null,
       JSON.stringify(formData),
-      userId,
+      actorEmail,
+      actorId,
+      actorEmail,
     ]
   );
-  const ncrFormId = ncr.rows[0]?.id;
-  if (!ncrFormId) return { ok: false, error: 'Could not create the NCR form' };
+  const ncrFormId = inserted.rows[0]?.id;
+  if (!ncrFormId) return { ok: false, error: 'Could not store the NCR form' };
+  const isNew = inserted.rows[0]?.inserted === true;
 
+  // The evidence is replaced, not appended: a re-save shows exactly what the
+  // document was saved with.
+  await db.query('DELETE FROM ncr_evidence WHERE ncr_form_id = $1', [ncrFormId]);
   for (const item of evidence || []) {
     const url = String(item?.url || '').trim();
     if (!url) continue;
@@ -110,40 +147,52 @@ async function createNcrFromAlert(opts = {}) {
     ).catch(() => {});
   }
 
-  // Background work: close the group, send the escalation email. Neither
-  // blocks the user's save.
-  await db.query(
-    `INSERT INTO jobs (job_type, payload, ncr_form_id, incident_id, alert_group_id)
-     VALUES ('resolve', $1::jsonb, $2, $3, $4)`,
-    [
-      JSON.stringify({
-        userId,
-        closureType: 'ncr',
-        notes: formData.description || null,
-        incident: {
-          fleet_number: fleetNumber,
-          driver_name: formData.driverName || null,
-          contact_number: formData.contactNumber || null,
-          id_number: formData.idNumber || null,
-          division: [formData.department, formData.section].filter(Boolean).join(' - ') || null,
-          infringement: (formData.classifications || []).join(', ') || null,
-          infringement_detail: formData.description || null,
-          action_taken: formData.correctiveAction || null,
-          outcome: formData.preventiveAction || null,
-        },
-        incidentId: incident.id,
-      }),
-      ncrFormId,
-      incident.id,
-      groupId,
-    ]
-  ).catch(() => {});
+  // Background work: close the group (first save only — a re-save must not
+  // close again or deduct twice). The escalation email is dispatched by the
+  // client after this returns.
+  if (isNew) {
+    await db.query(
+      `INSERT INTO jobs (job_type, payload, ncr_form_id, incident_id, alert_group_id)
+       VALUES ('resolve', $1::jsonb, $2, $3, $4)`,
+      [
+        JSON.stringify({
+          userId: actorEmail,
+          closureType: 'ncr',
+          notes: formData.description || null,
+          incident: {
+            fleet_number: fleetNumber,
+            driver_name: formData.driverName || null,
+            contact_number: formData.contactNumber || null,
+            id_number: formData.idNumber || null,
+            division: [formData.department, formData.section].filter(Boolean).join(' - ') || null,
+            infringement: (formData.classifications || []).join(', ') || null,
+            infringement_detail: formData.description || null,
+            action_taken: formData.correctiveAction || null,
+            outcome: formData.preventiveAction || null,
+          },
+          incidentId: incident.id,
+        }),
+        ncrFormId,
+        incident.id,
+        groupId,
+      ]
+    ).catch(() => {});
+  }
+
+  if (archive) {
+    const { queueArchiveForForm } = require('./incidentArchiveService');
+    await queueArchiveForForm(ncrFormId, groupId, { requestedBy: actorEmail }).catch((err) => {
+      console.error('[NCR] archive queue failed:', err.message);
+    });
+  }
 
   return {
     ok: true,
     ncrFormId,
     incidentId: incident.id,
-    ncrNo: ncr.rows[0]?.ncr_no || formData.ncrNo || null,
+    ncrNo: inserted.rows[0]?.ncr_no || formData.ncrNo || null,
+    updated: !isNew,
+    creatorEmail: actorEmail,
   };
 }
 
@@ -174,8 +223,15 @@ async function getNcrForm(formId) {
     document_path: form.document_path,
     document_status: form.document_status,
     status: form.status,
+    error: form.error,
     created_by: form.created_by,
+    created_by_id: form.created_by_id,
+    created_by_email: form.created_by_email,
     created_at: form.created_at,
+    updated_at: form.updated_at,
+    archive_url: form.archive_url || null,
+    archive_status: form.archive_status || null,
+    archive_error: form.archive_error || null,
     evidence: evidence.rows || [],
   };
 }

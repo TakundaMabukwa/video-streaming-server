@@ -15,6 +15,9 @@ const MAX_ATTEMPTS = 6;
 const MAX_ATTEMPTS_CLAIM = 8;
 // No job may block the queue for longer than this.
 const JOB_TIMEOUT_MS = 120000;
+// The archive build only starts work; it returns immediately so it never
+// blocks resolve/footage, and the job keeps checking until the ZIP is ready.
+const ARCHIVE_MAX_ATTEMPTS = 60;
 
 let timer = null;
 let running = false;
@@ -25,14 +28,14 @@ async function claimJobs(limit = 5) {
      WHERE id IN (
        SELECT id FROM jobs
        WHERE status IN ('pending', 'failed')
-         AND attempts < $1
+         AND attempts < CASE job_type WHEN 'archive' THEN $3::int ELSE $1::int END
          AND next_retry_at <= NOW()
        ORDER BY created_at ASC
-       LIMIT $2
+       LIMIT $2::int
        FOR UPDATE SKIP LOCKED
      )
      RETURNING id, job_type, payload, ncr_form_id, incident_id, alert_group_id, attempts`,
-    [MAX_ATTEMPTS_CLAIM, limit]
+    [MAX_ATTEMPTS_CLAIM, limit, ARCHIVE_MAX_ATTEMPTS]
   );
   return rows;
 }
@@ -77,6 +80,23 @@ async function runJob(job) {
     return refreshIncidentFootage(payload);
   }
 
+  if (job.job_type === 'archive') {
+    // The build itself runs in the background (it downloads hundreds of MB);
+    // the job only checks whether it is done and links it to the NCR.
+    const archive = require('./incidentArchiveService');
+    const groupId = Number(payload.groupId || job.alert_group_id);
+    if (!Number.isInteger(groupId) || groupId < 1) throw new Error('archive job has no group id');
+    const row = await archive.getGroupArchive(groupId);
+    if (row?.status === 'READY' && row.url) {
+      await archive.markForms(groupId, 'READY', { url: row.url });
+      return { ready: true, url: row.url };
+    }
+    archive.buildGroupArchive(groupId, { requestedBy: payload.userId || null }).catch((err) => {
+      console.error('[JOBS] archive build failed:', err.message);
+    });
+    return { ready: false };
+  }
+
   throw new Error(`unknown job type: ${job.job_type}`);
 }
 
@@ -98,11 +118,19 @@ async function tick() {
           continue;
         }
 
+        // The archive job stays alive until the ZIP is built and linked.
+        if (job.job_type === 'archive' && !result?.ready) {
+          await scheduleRetry(job, 'Building the evidence archive');
+          continue;
+        }
+
         await db.query(
           `UPDATE jobs SET status = 'done', error = NULL, updated_at = NOW() WHERE id = $1`,
           [job.id]
         );
-        if (job.ncr_form_id) {
+        // Only the closure job resolves the document — an archive job must
+        // never mark an NCR resolved on its own.
+        if (job.job_type === 'resolve' && job.ncr_form_id) {
           await db.query(
             `UPDATE ncr_forms SET status = 'RESOLVED', updated_at = NOW()
              WHERE id = $1 AND status = 'SAVED'`,
@@ -149,9 +177,15 @@ function footageComplete(result) {
 async function scheduleRetry(job, message, isError = false) {
   const attempts = (job.attempts || 0) + 1;
   const isFootage = job.job_type === 'footage';
+  const isArchive = job.job_type === 'archive';
   const backoff = isFootage ? FOOTAGE_BACKOFF_MIN : BACKOFF_MIN;
-  const maxAttempts = isFootage ? FOOTAGE_MAX_ATTEMPTS : MAX_ATTEMPTS;
-  const wait = backoff[Math.min(attempts - 1, backoff.length - 1)];
+  const maxAttempts = isFootage
+    ? FOOTAGE_MAX_ATTEMPTS
+    : isArchive
+      ? ARCHIVE_MAX_ATTEMPTS
+      : MAX_ATTEMPTS;
+  // An archive build can take a while (large clips): check every minute.
+  const wait = isArchive ? 1 : backoff[Math.min(attempts - 1, backoff.length - 1)];
   const dead = attempts >= maxAttempts;
   await db.query(
     `UPDATE jobs SET status = $2, attempts = $3, error = $4,
@@ -159,7 +193,13 @@ async function scheduleRetry(job, message, isError = false) {
      WHERE id = $1`,
     [job.id, dead ? 'dead' : 'failed', attempts, String(message || '').slice(0, 500), String(wait)]
   );
-  if (dead && job.ncr_form_id) {
+  if (dead && isArchive) {
+    await db.query(
+      `UPDATE ncr_forms SET archive_status = 'FAILED', archive_error = $2, updated_at = NOW()
+       WHERE id = $1 AND (archive_url IS NULL OR archive_url = '')`,
+      [job.ncr_form_id, String(message || '').slice(0, 500)]
+    ).catch(() => {});
+  } else if (dead && job.ncr_form_id) {
     await db.query(
       `UPDATE ncr_forms SET status = 'FAILED', error = $2, updated_at = NOW() WHERE id = $1`,
       [job.ncr_form_id, String(message || '').slice(0, 500)]

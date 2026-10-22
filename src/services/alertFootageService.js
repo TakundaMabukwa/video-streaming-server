@@ -727,7 +727,7 @@ async function refreshIncidentFootage(payload = {}) {
 }
 
 /** Footage rows for the dashboard tab. */
-async function listFootage({ deviceId = null, fleetNumber = null, status = null, limit = 500 } = {}) {
+async function listFootage({ deviceId = null, fleetNumber = null, status = null, limit = 500, sinceDays = 7 } = {}) {
   const conditions = [];
   const params = [];
   if (deviceId) {
@@ -741,6 +741,12 @@ async function listFootage({ deviceId = null, fleetNumber = null, status = null,
   if (status) {
     params.push(String(status).toUpperCase());
     conditions.push(`status = $${params.length}`);
+  }
+  // The screen shows the last 7 days by default; older footage stays stored.
+  const days = Number(sinceDays);
+  if (Number.isFinite(days) && days > 0) {
+    params.push(Math.min(Math.max(Math.round(days), 1), 90));
+    conditions.push(`created_at >= NOW() - ($${params.length} || ' days')::interval`);
   }
   params.push(Math.min(Math.max(parseInt(limit, 10) || 500, 1), 2000));
   const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
@@ -756,8 +762,12 @@ async function listFootage({ deviceId = null, fleetNumber = null, status = null,
   return rows;
 }
 
-/** Distinct vehicles that have footage. */
-async function listFootageDevices() {
+/** Distinct vehicles that have footage in the last `sinceDays` days. */
+async function listFootageDevices({ sinceDays = 7 } = {}) {
+  const days = Number(sinceDays);
+  const since = Number.isFinite(days) && days > 0
+    ? `AND created_at >= NOW() - ($${1} || ' days')::interval`
+    : '';
   const { rows } = await db.query(
     `SELECT device_id,
             max(fleet_number) AS fleet_number,
@@ -767,9 +777,10 @@ async function listFootageDevices() {
             count(*) FILTER (WHERE file_url IS NOT NULL)::int AS files,
             max(created_at) AS last_at
      FROM alert_footage
-     WHERE device_id IS NOT NULL AND device_id <> ''
+     WHERE device_id IS NOT NULL AND device_id <> '' ${since}
      GROUP BY device_id
-     ORDER BY last_at DESC`
+     ORDER BY last_at DESC`,
+    since ? [Math.min(Math.max(Math.round(days), 1), 90)] : []
   );
   return rows;
 }

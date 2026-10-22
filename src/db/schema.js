@@ -859,10 +859,37 @@ const MIGRATIONS_SQL = `
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
   );
+  -- The creator is the signed-in user, not a placeholder: the stable user id
+  -- is kept for the audit tie and the email for display. New saves require it.
+  ALTER TABLE ncr_forms ADD COLUMN IF NOT EXISTS created_by_id TEXT;
+  ALTER TABLE ncr_forms ADD COLUMN IF NOT EXISTS created_by_email TEXT;
+  -- The evidence archive (ZIP of every clip + screenshot of the group).
+  ALTER TABLE ncr_forms ADD COLUMN IF NOT EXISTS archive_url TEXT;
+  ALTER TABLE ncr_forms ADD COLUMN IF NOT EXISTS archive_status TEXT;
+  ALTER TABLE ncr_forms ADD COLUMN IF NOT EXISTS archive_error TEXT;
   CREATE UNIQUE INDEX IF NOT EXISTS idx_ncr_forms_incident ON ncr_forms(incident_id);
   CREATE INDEX IF NOT EXISTS idx_ncr_forms_group ON ncr_forms(alert_group_id);
   CREATE INDEX IF NOT EXISTS idx_ncr_forms_ncr_no ON ncr_forms(ncr_no);
   CREATE INDEX IF NOT EXISTS idx_ncr_forms_status ON ncr_forms(status);
+  CREATE INDEX IF NOT EXISTS idx_ncr_forms_creator ON ncr_forms(created_by_email);
+
+  -- One evidence archive per alert group (the "apply all media" ZIP). The
+  -- build downloads every clip + screenshot, zips them and uploads the ZIP;
+  -- the NCR links it when it is ready.
+  CREATE TABLE IF NOT EXISTS alert_group_archives (
+    id SERIAL PRIMARY KEY,
+    alert_group_id INTEGER NOT NULL UNIQUE,
+    status TEXT NOT NULL DEFAULT 'BUILDING',
+    url TEXT,
+    error TEXT,
+    file_count INTEGER DEFAULT 0,
+    byte_size BIGINT DEFAULT 0,
+    manifest JSONB DEFAULT '{}'::jsonb,
+    requested_by TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  );
+  CREATE INDEX IF NOT EXISTS idx_alert_group_archives_status ON alert_group_archives(status);
 
   -- Media attached to an NCR (the annexure), linked to the detection it came from.
   CREATE TABLE IF NOT EXISTS ncr_evidence (
@@ -952,6 +979,7 @@ const MIGRATIONS_SQL = `
   CREATE INDEX IF NOT EXISTS idx_alert_footage_group ON alert_footage(alert_group_id);
   CREATE INDEX IF NOT EXISTS idx_alert_footage_device ON alert_footage(device_id);
   CREATE INDEX IF NOT EXISTS idx_alert_footage_status ON alert_footage(status);
+  CREATE INDEX IF NOT EXISTS idx_alert_footage_created_at ON alert_footage(created_at DESC);
   -- One row per alert + channel: the row is created by the replay and later
   -- upgraded in place when the uploaded file arrives.
   DELETE FROM alert_footage a USING alert_footage b
