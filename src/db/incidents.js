@@ -231,7 +231,11 @@ async function updateIncidentFields(id, fields) {
   const allowed = [
     'week', 'shift', 'incident_date', 'incident_time', 'controller', 'driver_name', 'contact_number',
     'id_number', 'division', 'infringement', 'infringement_detail', 'action_taken', 'outcome', 'notes',
-    'document_link', 'document_type', 'status', 'resolved_by', 'resolved_at', 'closure_type', 'deduction_applied'
+    'document_link', 'document_type', 'status', 'resolved_by', 'resolved_at', 'closure_type', 'deduction_applied',
+    // Register identity (set when the NCR row is created up-front and
+    // completed later by the background closure job).
+    'alert_id', 'alert_group_key', 'alarm_type', 'source_type', 'device_id', 'fleet_number',
+    'cost_center_id', 'filled_by', 'filled_at'
   ];
   const sets = [];
   const params = [];

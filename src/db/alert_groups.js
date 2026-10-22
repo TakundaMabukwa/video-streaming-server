@@ -111,7 +111,9 @@ async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, al
      fleetExact || null]
   );
   if (result.rows.length > 0) {
-    return stampMember(result.rows[0], { alertId, deviceId, deviceName, alarmType, alarmText, alarmTs, lat, lon, speed, severity, fleetExact, sourceType });
+    const row = await stampMember(result.rows[0], { alertId, deviceId, deviceName, alarmType, alarmText, alarmTs, lat, lon, speed, severity, fleetExact, sourceType });
+    await requestIncidentFootage(row, { alertId, deviceId, alarmType, alarmTs, fleetExact, deviceName, sourceType });
+    return row;
   }
   // Base key lost a race (or is squatted by a dead row): bump-or-insert via
   // the live-row arbiter instead of throwing. Never throws, never twins.
@@ -129,6 +131,36 @@ async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, al
      fleetExact || null]
   );
   return stampMember(raced.rows[0] || null, { alertId, deviceId, deviceName, alarmType, alarmText, alarmTs, lat, lon, speed, severity, fleetExact, sourceType });
+}
+
+// Collision alerts must have their footage captured. The request is queued
+// (never inline) so detection is never slowed down, and it only fires when a
+// NEW group is created — a burst of collisions is one incident, one capture.
+async function requestIncidentFootage(groupRow, ctx) {
+  try {
+    if (!groupRow || !groupRow.id) return;
+    const { isFootageAlarmType } = require('../services/alertFootageService');
+    if (!isFootageAlarmType(ctx.alarmType)) return;
+    const { query: q } = require('./pool');
+    await q(
+      `INSERT INTO jobs (job_type, payload, alert_group_id)
+       VALUES ('footage', $1::jsonb, $2)`,
+      [
+        JSON.stringify({
+          alertId: ctx.alertId,
+          alertGroupId: groupRow.id,
+          deviceId: ctx.deviceId,
+          fleetNumber: ctx.fleetExact || null,
+          registration: ctx.deviceName || null,
+          alarmType: ctx.alarmType,
+          alertTime: ctx.alarmTs || new Date().toISOString(),
+        }),
+        groupRow.id,
+      ]
+    );
+  } catch (err) {
+    console.error('[FOOTAGE] could not queue the capture:', err.message);
+  }
 }
 
 async function batchUpsertAlertGroups(groups) {
@@ -158,6 +190,7 @@ async function batchUpsertAlertGroups(groups) {
   // the live-row unique index — a group_key conflict means a dead base row.
   const result = { rows: [] };
   const pending = [];
+  const newGroupKeys = new Set();
   for (const g of entries) {
     const bumped = await query(
       `UPDATE alert_groups SET
@@ -238,6 +271,7 @@ async function batchUpsertAlertGroups(groups) {
     const g = pendingByBaseKey.get(String(r.group_key || '').toLowerCase());
     if (g) {
       await stampMember(r, { alertId: g.alertId, deviceId: g.deviceId, deviceName: g.deviceName, alarmType: g.alarmType, alarmText: g.alarmText, alarmTs: g.alarmTs, lat: g.lat, lon: g.lon, speed: g.speed, severity: g.severity, fleetExact: g.fleetExact, sourceType: g.sourceType });
+      await requestIncidentFootage(r, { alertId: g.alertId, deviceId: g.deviceId, alarmType: g.alarmType, alarmTs: g.alarmTs, fleetExact: g.fleetExact, deviceName: g.deviceName, sourceType: g.sourceType });
     }
   }
   const settled = new Set(result.rows.map((r) => r.group_key));

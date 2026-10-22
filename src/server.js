@@ -163,6 +163,14 @@ async function start() {
       console.error(`[OVERRIDES] cache failed to start: ${err.message}`);
     }
 
+    // Background job runner: NCR closures + escalation emails + incident
+    // footage capture — everything the user must never wait for.
+    try {
+      require('./services/jobRunner').start();
+    } catch (err) {
+      console.error(`[JOBS] runner failed to start: ${err.message}`);
+    }
+
     // Start Geotab polling (connects WebSocket broadcast)
     try {
       const geotabPolling = require('./services/geotabPolling');

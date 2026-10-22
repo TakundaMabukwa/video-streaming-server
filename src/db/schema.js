@@ -839,6 +839,95 @@ const MIGRATIONS_SQL = `
   CREATE INDEX IF NOT EXISTS idx_incidents_cc_date ON incidents(cost_center_id, incident_date DESC);
   CREATE INDEX IF NOT EXISTS idx_incidents_fleet ON incidents(fleet_number);
 
+  -- ── NCR document store ──────────────────────────────────────────────
+  -- ncr_forms holds the SIGNED NCR document exactly as it was submitted
+  -- (every field, as displayed). The register renders from this instead of
+  -- a PDF, so the record survives even if the PDF never got rendered.
+  CREATE TABLE IF NOT EXISTS ncr_forms (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    incident_id UUID REFERENCES incidents(id) ON DELETE CASCADE,
+    ncr_no TEXT,
+    alert_id TEXT,
+    alert_group_id INTEGER,
+    alert_group_key TEXT,
+    form_data JSONB NOT NULL DEFAULT '{}'::jsonb,
+    document_path TEXT,
+    document_status TEXT DEFAULT 'PENDING',
+    status TEXT DEFAULT 'SAVED',
+    error TEXT,
+    created_by TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_ncr_forms_incident ON ncr_forms(incident_id);
+  CREATE INDEX IF NOT EXISTS idx_ncr_forms_group ON ncr_forms(alert_group_id);
+  CREATE INDEX IF NOT EXISTS idx_ncr_forms_ncr_no ON ncr_forms(ncr_no);
+  CREATE INDEX IF NOT EXISTS idx_ncr_forms_status ON ncr_forms(status);
+
+  -- Media attached to an NCR (the annexure), linked to the detection it came from.
+  CREATE TABLE IF NOT EXISTS ncr_evidence (
+    id SERIAL PRIMARY KEY,
+    ncr_form_id UUID NOT NULL REFERENCES ncr_forms(id) ON DELETE CASCADE,
+    alert_id TEXT,
+    file_url TEXT NOT NULL,
+    file_type TEXT,
+    channel INTEGER,
+    captured_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  );
+  CREATE INDEX IF NOT EXISTS idx_ncr_evidence_form ON ncr_evidence(ncr_form_id);
+  CREATE INDEX IF NOT EXISTS idx_ncr_evidence_alert ON ncr_evidence(alert_id);
+
+  -- ── Generic background job queue ───────────────────────────────────
+  -- Drives the parts of the NCR flow the user should never wait on:
+  --   resolve  → close the alert group (+ members) for a saved NCR
+  --   email    → hand the escalation email to the outbox
+  --   footage  → request + store incident footage for collision alerts
+  CREATE TABLE IF NOT EXISTS jobs (
+    id SERIAL PRIMARY KEY,
+    job_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    ncr_form_id UUID REFERENCES ncr_forms(id) ON DELETE CASCADE,
+    incident_id UUID,
+    alert_group_id INTEGER,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_retry_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    error TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  );
+  CREATE INDEX IF NOT EXISTS idx_jobs_due ON jobs(status, next_retry_at);
+  CREATE INDEX IF NOT EXISTS idx_jobs_type ON jobs(job_type, status);
+
+  -- ── Incident footage (collision alerts) ─────────────────────────────
+  -- The replay/file link requested for a collision alert, kept so the
+  -- footage can be watched later without re-requesting it.
+  CREATE TABLE IF NOT EXISTS alert_footage (
+    id SERIAL PRIMARY KEY,
+    alert_id TEXT,
+    alert_group_id INTEGER,
+    device_id TEXT,
+    fleet_number TEXT,
+    registration TEXT,
+    channel_id INTEGER,
+    alarm_type TEXT,
+    video_url TEXT,
+    kind TEXT DEFAULT 'replay',
+    window_start TIMESTAMPTZ,
+    window_end TIMESTAMPTZ,
+    status TEXT DEFAULT 'REQUESTED',
+    error TEXT,
+    requested_by TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  );
+  CREATE INDEX IF NOT EXISTS idx_alert_footage_group ON alert_footage(alert_group_id);
+  CREATE INDEX IF NOT EXISTS idx_alert_footage_device ON alert_footage(device_id);
+  CREATE INDEX IF NOT EXISTS idx_alert_footage_status ON alert_footage(status);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_alert_footage_unique
+    ON alert_footage(alert_id, channel_id) WHERE video_url IS NOT NULL;
+
   -- Config Groups: allow multiple cost centers to share the same driver config criteria
   CREATE TABLE IF NOT EXISTS config_groups (
     id SERIAL PRIMARY KEY,
