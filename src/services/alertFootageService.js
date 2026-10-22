@@ -29,30 +29,36 @@ function isFootageAlarmType(alarmType) {
 
 // "YYYY-MM-DD HH:mm:ss" in SAST (the camera API works in SAST wall time).
 function toSastStamp(date) {
-  const shifted = new Date(date.getTime() + SAST_OFFSET_MIN * 60 * 1000);
-  const p = (n) => String(n).padStart(2, '0');
-  return `${shifted.getUTCFullYear()}-${p(shifted.getUTCMonth() + 1)}-${p(shifted.getUTCDate())} ${p(shifted.getUTCHours())}:${p(shifted.getUTCMinutes())}:${p(shifted.getUTCSeconds())}`;
+  return formatCameraTime(date, SAST_OFFSET_MIN);
 }
 
 let deviceCache = { at: 0, rows: [] };
 const DEVICE_CACHE_MS = 5 * 60 * 1000;
 
-// Camera devices with their plate names and channels.
+// The camera device list (id, plate name, channel count) — the same
+// /device/page feed the stream controller uses.
 async function cameraDevices(force = false) {
   if (!force && Date.now() - deviceCache.at < DEVICE_CACHE_MS && deviceCache.rows.length) {
     return deviceCache.rows;
   }
-  const tree = await apiClient.makeRequest('/customer/tree', { customerId: null });
-  if (tree.code !== 0 || !tree.data) {
-    throw new Error(tree.msg || 'Could not resolve the customer tree');
+  const rows = [];
+  let pageIndex = 1;
+  let hasMore = true;
+  while (hasMore) {
+    const res = await apiClient.makeRequest(
+      '/device/page',
+      { pageIndex, pageSize: 100, subsumption: true },
+      15000
+    );
+    if (res.code !== 0 || !Array.isArray(res.data?.records) || res.data.records.length === 0) {
+      hasMore = false;
+      break;
+    }
+    rows.push(...res.data.records);
+    pageIndex += 1;
+    hasMore = res.data.records.length === 100;
+    if (pageIndex > 20) hasMore = false;
   }
-  const customerId = Array.isArray(tree.data) ? tree.data[0]?.id : tree.data?.id;
-  if (!customerId) throw new Error('No customer id available');
-  const shadow = await apiClient.makeRequest('/device/shadow/customer', { customerId });
-  if (shadow.code !== 0 || !shadow.data) {
-    throw new Error(shadow.msg || 'Could not load the camera device list');
-  }
-  const rows = Array.isArray(shadow.data) ? shadow.data : [];
   deviceCache = { at: Date.now(), rows };
   return rows;
 }
@@ -65,69 +71,117 @@ async function resolveVehicleCamera({ fleetNumber, registration, deviceId }) {
 
   // Direct camera device id (video-sourced alerts already carry it).
   if (deviceId) {
-    const direct = rows.find((r) => String(r?.deviceId || '') === String(deviceId));
-    if (direct) return { deviceId: String(direct.deviceId), plate: direct.plateName || null, channels: channelIdsOf(direct) };
+    const direct = rows.find((r) => String(r?.id || '') === String(deviceId));
+    if (direct) {
+      return {
+        deviceId: String(direct.id),
+        plate: direct.deviceName || null,
+        channels: channelIdsOf(direct),
+        offsetMinutes: timezoneOffsetMinutes(direct),
+      };
+    }
   }
 
   // Otherwise match on the plate name ("FLEET - REG" or "REG").
   for (const r of rows) {
-    const plate = String(r?.plateName || '').trim().toUpperCase();
+    const plate = String(r?.deviceName || '').trim().toUpperCase();
     if (!plate) continue;
     const parts = plate.split(' - ').map((x) => x.trim().toUpperCase());
     const hit =
       (fleet && (plate === fleet || parts.includes(fleet))) ||
       (reg && (plate === reg || parts.includes(reg)));
     if (hit) {
-      return { deviceId: String(r.deviceId || ''), plate: r.plateName || null, channels: channelIdsOf(r) };
+      return {
+        deviceId: String(r.id || ''),
+        plate: r.deviceName || null,
+        channels: channelIdsOf(r),
+        offsetMinutes: timezoneOffsetMinutes(r),
+      };
     }
   }
   return null;
 }
 
+// A device's channels: camCount channels, numbered from 1 (as the Playback
+// tab and the stream controller do).
 function channelIdsOf(device) {
-  const raw = device?.channels;
-  const list = Array.isArray(raw) ? raw : [];
-  const ids = list
-    .map((c) => Number(c?.id ?? c?.channelId ?? c))
-    .filter((n) => Number.isFinite(n) && n > 0);
-  return ids.length ? [...new Set(ids)].sort((a, b) => a - b) : [1];
+  const count = Number(device?.camCount || 0);
+  if (Number.isFinite(count) && count > 0) {
+    return Array.from({ length: count }, (_, i) => i + 1);
+  }
+  return [1];
 }
 
-// Ask the camera for the replay of a window on one channel.
+// The camera API wants plain local times ("YYYY-MM-DD HH:mm:ss") in the
+// device's own timezone (UTC+02:00 for the fleet). Everything we send and
+// compare — replay windows, uploaded file times — uses this format.
+function formatCameraTime(date, offsetMinutes) {
+  const shifted = new Date(date.getTime() + offsetMinutes * 60 * 1000);
+  return shifted.toISOString().slice(0, 19).replace('T', ' ');
+}
+
+// The device's timezone offset in minutes ("UTC+02:00" -> 120).
+function timezoneOffsetMinutes(device) {
+  const tz = String(device?.timezone || 'UTC+02:00');
+  const m = tz.match(/([+-])(\d{1,2})(?::?(\d{2}))?/);
+  if (!m) return 120;
+  const sign = m[1] === '-' ? -1 : 1;
+  const hours = Number(m[2] || 0);
+  const minutes = Number(m[3] || 0);
+  return sign * (hours * 60 + minutes);
+}
+
+// Ask the camera for the replay of a window on one channel — the same call
+// the Playback tab makes (live stream from the device).
 async function requestReplay({ deviceId, channelId, startTime, endTime }) {
-  const res = await apiClient.makeRequest('/video/history/replay', {
-    deviceId,
-    channelId: Number(channelId),
-    playbackType: 0,
-    fastForwardOrBackward: 0,
-    startTime,
-    endTime,
-  });
+  const res = await apiClient.makeRequest(
+    '/video/history/replay',
+    {
+      deviceId,
+      channelId: Number(channelId),
+      playbackType: 0,
+      fastForwardOrBackward: 1,
+      startTime,
+      endTime,
+    },
+    10000
+  );
   if (res.code === 0 && res.data) return { url: String(res.data), kind: 'replay' };
   return { url: null, kind: 'replay', error: res.msg || 'No replay available' };
 }
 
-// Fallback: ask the camera to upload the window, then read the resulting file.
-async function requestUpload({ deviceId, channelId, startTime, endTime }) {
-  const created = await apiClient.makeRequest('/video/history/upload', {
-    deviceId,
-    channelId: Number(channelId),
-    startTime,
-    endTime,
-  });
-  if (created.code !== 0 || !created.data) {
-    return { url: null, kind: 'file', error: created.msg || 'Upload task could not be created' };
+// The footage the camera already uploaded for that window — the same cached
+// upload tasks the Playback tab falls back to. We never create a new upload
+// task: the footage must actually exist, not be queued for later.
+let uploadTasksCache = { at: 0, rows: [] };
+const UPLOAD_TASKS_TTL_MS = 60 * 1000;
+
+async function getUploadTasks() {
+  if (uploadTasksCache.rows.length > 0 && Date.now() - uploadTasksCache.at < UPLOAD_TASKS_TTL_MS) {
+    return uploadTasksCache.rows;
   }
-  const taskId = created.data;
-  for (let attempt = 0; attempt < 6; attempt++) {
-    const task = await apiClient.makeRequest('/video/history/upload/task', { taskId });
-    const rows = Array.isArray(task?.data) ? task.data : (task?.data ? [task.data] : []);
-    const done = rows.find((r) => r?.fileUrl || r?.url);
-    if (done) return { url: String(done.fileUrl || done.url), kind: 'file' };
-    if (task?.code !== 0) break;
-    await new Promise((r) => setTimeout(r, 3000));
+  const res = await apiClient.makeRequest(
+    '/video/history/upload/task',
+    { pageSize: 200, pageIndex: 1 },
+    15000
+  );
+  if (res.code === 0 && Array.isArray(res.data?.records)) {
+    uploadTasksCache = { at: Date.now(), rows: res.data.records };
   }
-  return { url: null, kind: 'file', error: 'Upload did not complete in time' };
+  return uploadTasksCache.rows;
+}
+
+// The uploaded file that covers the window (same matching as the Playback tab).
+async function findUploadedFootage({ deviceId, channelId, startTime, endTime }) {
+  const tasks = await getUploadTasks();
+  const ready = (t) =>
+    t && t.deviceId === deviceId && t.status === 1 && t.fileUrl && Number(t.channelId) === Number(channelId);
+  let match = tasks.find(
+    (t) => ready(t) && t.fileStartTime <= endTime && t.fileEndTime >= startTime
+  );
+  if (!match) match = tasks.find((t) => ready(t));
+  if (!match) return { url: null, kind: 'file', error: 'No uploaded footage covers that window' };
+  return { url: String(match.fileUrl), kind: 'file' };
 }
 
 /**
@@ -158,15 +212,19 @@ async function captureIncidentFootage(payload = {}) {
   if (Number.isNaN(when.getTime())) throw new Error('Invalid alert time');
   const start = new Date(when.getTime() - WINDOW_BEFORE_SEC * 1000);
   const end = new Date(when.getTime() + WINDOW_AFTER_SEC * 1000);
-  const startTime = toSastStamp(start);
-  const endTime = toSastStamp(end);
+  const offsetMinutes = camera.offsetMinutes ?? SAST_OFFSET_MIN;
+  const startTime = formatCameraTime(start, offsetMinutes);
+  const endTime = formatCameraTime(end, offsetMinutes);
 
   const results = [];
   for (const channelId of camera.channels) {
+    // Live replay first, then the footage the camera already uploaded for
+    // that window — the same two steps the Playback tab uses. No new upload
+    // task is created: the footage has to actually exist.
     let outcome = await requestReplay({ deviceId: camera.deviceId, channelId, startTime, endTime });
     if (!outcome.url) {
-      const upload = await requestUpload({ deviceId: camera.deviceId, channelId, startTime, endTime });
-      outcome = upload.url ? upload : outcome;
+      const uploaded = await findUploadedFootage({ deviceId: camera.deviceId, channelId, startTime, endTime });
+      outcome = uploaded.url ? uploaded : outcome;
     }
     const row = {
       alertId,

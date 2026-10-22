@@ -136,28 +136,48 @@ async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, al
 // Collision alerts must have their footage captured. The request is queued
 // (never inline) so detection is never slowed down, and it only fires when a
 // NEW group is created — a burst of collisions is one incident, one capture.
+// The capture itself starts IMMEDIATELY (not on the next runner tick) and the
+// queued job only exists to retry it.
 async function requestIncidentFootage(groupRow, ctx) {
   try {
     if (!groupRow || !groupRow.id) return;
     const { isFootageAlarmType } = require('../services/alertFootageService');
     if (!isFootageAlarmType(ctx.alarmType)) return;
     const { query: q } = require('./pool');
-    await q(
-      `INSERT INTO jobs (job_type, payload, alert_group_id)
-       VALUES ('footage', $1::jsonb, $2)`,
-      [
-        JSON.stringify({
-          alertId: ctx.alertId,
-          alertGroupId: groupRow.id,
-          deviceId: ctx.deviceId,
-          fleetNumber: ctx.fleetExact || null,
-          registration: ctx.deviceName || null,
-          alarmType: ctx.alarmType,
-          alertTime: ctx.alarmTs || new Date().toISOString(),
-        }),
-        groupRow.id,
-      ]
+    const payload = {
+      alertId: ctx.alertId,
+      alertGroupId: groupRow.id,
+      deviceId: ctx.deviceId,
+      fleetNumber: ctx.fleetExact || null,
+      registration: ctx.deviceName || null,
+      alarmType: ctx.alarmType,
+      alertTime: ctx.alarmTs || new Date().toISOString(),
+    };
+    const inserted = await q(
+      `INSERT INTO jobs (job_type, payload, alert_group_id, next_retry_at)
+       VALUES ('footage', $1::jsonb, $2, NOW() + INTERVAL '60 seconds') RETURNING id`,
+      [JSON.stringify(payload), groupRow.id]
     );
+    const jobId = inserted.rows[0]?.id;
+    if (!jobId) return;
+
+    // Start the capture NOW — the alert's footage must be requested the
+    // moment the alert arrives, not on the next 15s sweep. The queued job is
+    // only the retry path (it waits 60s so it cannot race this attempt).
+    void (async () => {
+      try {
+        const { captureIncidentFootage } = require('../services/alertFootageService');
+        await captureIncidentFootage(payload);
+        await q(`UPDATE jobs SET status = 'done', updated_at = NOW() WHERE id = $1`, [jobId]);
+      } catch (err) {
+        // Let the runner retry it (the camera may only come back later).
+        await q(
+          `UPDATE jobs SET next_retry_at = NOW(), error = $2, updated_at = NOW() WHERE id = $1`,
+          [jobId, String(err.message || err).slice(0, 500)]
+        ).catch(() => {});
+        console.error('[FOOTAGE] immediate capture failed (the job will retry):', err.message);
+      }
+    })();
   } catch (err) {
     console.error('[FOOTAGE] could not queue the capture:', err.message);
   }
