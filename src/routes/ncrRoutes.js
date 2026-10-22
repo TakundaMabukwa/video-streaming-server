@@ -125,6 +125,29 @@ router.get('/footage/devices', async (req, res) => {
   }
 });
 
+// POST /ncr/footage/refresh — ask for the footage again (the camera may have
+// been off when the alert fired; this polls the upload and asks again).
+router.post('/footage/refresh', async (req, res) => {
+  try {
+    const { alertId, alertGroupId, deviceId, fleetNumber, registration, alarmType, alertTime } = req.body || {};
+    if (!alertId && !alertGroupId) {
+      return res.status(400).json({ success: false, message: 'alertId or alertGroupId required' });
+    }
+    const result = await alertFootage.refreshIncidentFootage({
+      alertId: alertId || null,
+      alertGroupId: alertGroupId ? Number(alertGroupId) : null,
+      deviceId: deviceId || null,
+      fleetNumber: fleetNumber || null,
+      registration: registration || null,
+      alarmType: alarmType || null,
+      alertTime: alertTime || null,
+    });
+    res.json({ success: true, ...result });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // GET /ncr/alert-groups/:groupId/media — every member detection's media
 // (the "apply all media to docs" source).
 router.get('/alert-groups/:groupId/media', async (req, res) => {

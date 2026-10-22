@@ -167,8 +167,15 @@ async function requestIncidentFootage(groupRow, ctx) {
     void (async () => {
       try {
         const { captureIncidentFootage } = require('../services/alertFootageService');
-        await captureIncidentFootage(payload);
-        await q(`UPDATE jobs SET status = 'done', updated_at = NOW() WHERE id = $1`, [jobId]);
+        const result = await captureIncidentFootage(payload);
+        // The job is only done when the durable file is there. Until then the
+        // runner keeps polling the upload task.
+        const rows = Array.isArray(result?.rows) ? result.rows : [];
+        const complete =
+          rows.length > 0 && rows.every((r) => r.fileState === 'READY' && r.fileUrl);
+        if (complete) {
+          await q(`UPDATE jobs SET status = 'done', updated_at = NOW() WHERE id = $1`, [jobId]);
+        }
       } catch (err) {
         // Let the runner retry it (the camera may only come back later).
         await q(

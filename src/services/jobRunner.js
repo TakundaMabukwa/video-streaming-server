@@ -11,7 +11,10 @@ const { closeAlertGroup } = require('./alertClosureService');
 
 const TICK_MS = 15000;
 const MAX_ATTEMPTS = 6;
-const BACKOFF_MIN = [0, 1, 2, 5, 15, 45];
+// The claim limit is the highest per-type cap (the footage job runs longer).
+const MAX_ATTEMPTS_CLAIM = 8;
+// No job may block the queue for longer than this.
+const JOB_TIMEOUT_MS = 120000;
 
 let timer = null;
 let running = false;
@@ -29,10 +32,16 @@ async function claimJobs(limit = 5) {
        FOR UPDATE SKIP LOCKED
      )
      RETURNING id, job_type, payload, ncr_form_id, incident_id, alert_group_id, attempts`,
-    [MAX_ATTEMPTS, limit]
+    [MAX_ATTEMPTS_CLAIM, limit]
   );
   return rows;
 }
+
+// The footage job keeps going for hours: a camera that was powered off at the
+// crash uploads the file as soon as it is back online.
+const BACKOFF_MIN = [0, 1, 2, 5, 15, 45];
+const FOOTAGE_BACKOFF_MIN = [0, 1, 3, 10, 30, 60, 120, 180];
+const FOOTAGE_MAX_ATTEMPTS = FOOTAGE_BACKOFF_MIN.length;
 
 async function runJob(job) {
   const payload = job.payload || {};
@@ -62,8 +71,10 @@ async function runJob(job) {
   }
 
   if (job.job_type === 'footage') {
-    const { captureIncidentFootage } = require('./alertFootageService');
-    return captureIncidentFootage(payload);
+    // Follow up on the footage: poll the upload task and ask the camera
+    // again when it never uploaded (it may have been powered off).
+    const { refreshIncidentFootage } = require('./alertFootageService');
+    return refreshIncidentFootage(payload);
   }
 
   throw new Error(`unknown job type: ${job.job_type}`);
@@ -74,9 +85,19 @@ async function tick() {
   running = true;
   try {
     const jobs = await claimJobs(5);
+    // The jobs run one after the other, but every one of them is capped so a
+    // slow camera can never stall the queue.
     for (const job of jobs) {
       try {
-        const result = await runJob(job);
+        const result = await withTimeout(runJob(job), JOB_TIMEOUT_MS, `${job.job_type} #${job.id} timed out`);
+
+        // The footage job is only finished when the uploaded file is there.
+        // While the camera has not uploaded it yet, keep the job alive.
+        if (job.job_type === 'footage' && !footageComplete(result)) {
+          await scheduleRetry(job, 'Waiting for the camera to upload the footage');
+          continue;
+        }
+
         await db.query(
           `UPDATE jobs SET status = 'done', error = NULL, updated_at = NOW() WHERE id = $1`,
           [job.id]
@@ -90,28 +111,67 @@ async function tick() {
         }
         console.log(`[JOBS] ${job.job_type} #${job.id} done`, result ? '' : '');
       } catch (err) {
-        const attempts = (job.attempts || 0) + 1;
-        const wait = BACKOFF_MIN[Math.min(attempts - 1, BACKOFF_MIN.length - 1)];
-        const dead = attempts >= MAX_ATTEMPTS;
-        await db.query(
-          `UPDATE jobs SET status = $2, attempts = $3, error = $4,
-             next_retry_at = NOW() + ($5 || ' minutes')::interval, updated_at = NOW()
-           WHERE id = $1`,
-          [job.id, dead ? 'dead' : 'failed', attempts, String(err.message || err).slice(0, 500), String(wait)]
-        );
-        if (dead && job.ncr_form_id) {
-          await db.query(
-            `UPDATE ncr_forms SET status = 'FAILED', error = $2, updated_at = NOW() WHERE id = $1`,
-            [job.ncr_form_id, String(err.message || err).slice(0, 500)]
-          );
-        }
-        console.error(`[JOBS] ${job.job_type} #${job.id} attempt ${attempts} failed:`, err.message);
+        await scheduleRetry(job, String(err.message || err).slice(0, 500), true);
+        console.error(`[JOBS] ${job.job_type} #${job.id} attempt failed:`, err.message);
       }
     }
   } catch (err) {
     console.error('[JOBS] tick failed:', err.message);
   } finally {
     running = false;
+  }
+}
+
+// Never let one job run forever.
+function withTimeout(promise, ms, message) {
+  let timer = null;
+  return Promise.race([
+    Promise.resolve(promise).finally(() => clearTimeout(timer)),
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), ms);
+      if (typeof timer.unref === 'function') timer.unref();
+    }),
+  ]);
+}
+
+// Is every channel's durable file there?
+function footageComplete(result) {
+  // Nothing to follow up on yet (the camera could not be resolved) — keep the
+  // job alive, the vehicle may be back on the road later.
+  if (result?.skipped) return false;
+  const rows = result?.rows;
+  // Every channel already has its file.
+  if (!Array.isArray(rows) || rows.length === 0) return true;
+  return rows.every((r) => r.fileState === 'READY' && r.fileUrl);
+}
+
+// Put the job back in the queue, or kill it when it has run out of attempts.
+async function scheduleRetry(job, message, isError = false) {
+  const attempts = (job.attempts || 0) + 1;
+  const isFootage = job.job_type === 'footage';
+  const backoff = isFootage ? FOOTAGE_BACKOFF_MIN : BACKOFF_MIN;
+  const maxAttempts = isFootage ? FOOTAGE_MAX_ATTEMPTS : MAX_ATTEMPTS;
+  const wait = backoff[Math.min(attempts - 1, backoff.length - 1)];
+  const dead = attempts >= maxAttempts;
+  await db.query(
+    `UPDATE jobs SET status = $2, attempts = $3, error = $4,
+       next_retry_at = NOW() + ($5 || ' minutes')::interval, updated_at = NOW()
+     WHERE id = $1`,
+    [job.id, dead ? 'dead' : 'failed', attempts, String(message || '').slice(0, 500), String(wait)]
+  );
+  if (dead && job.ncr_form_id) {
+    await db.query(
+      `UPDATE ncr_forms SET status = 'FAILED', error = $2, updated_at = NOW() WHERE id = $1`,
+      [job.ncr_form_id, String(message || '').slice(0, 500)]
+    );
+  }
+  if (dead) {
+    console.error(`[JOBS] ${job.job_type} #${job.id} gave up after ${attempts} attempts:`, message);
+  } else {
+    console.log(
+      `[JOBS] ${job.job_type} #${job.id} attempt ${attempts}${isError ? ' failed' : ''}, next in ${wait} min:`,
+      message
+    );
   }
 }
 

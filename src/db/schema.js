@@ -901,8 +901,13 @@ const MIGRATIONS_SQL = `
   CREATE INDEX IF NOT EXISTS idx_jobs_type ON jobs(job_type, status);
 
   -- ── Incident footage (collision alerts) ─────────────────────────────
-  -- The replay/file link requested for a collision alert, kept so the
-  -- footage can be watched later without re-requesting it.
+  -- Two links per collision alert, because they behave differently:
+  --   replay_url -> the live history stream (.history.flv). Ready at once,
+  --                 but one-shot: it can only be watched right away.
+  --   file_url   -> the uploaded mp4 the camera produced for that exact
+  --                 period. Durable: it can be played again later.
+  -- video_url stays the resolved primary (file_url preferred, else
+  -- replay_url) so every existing consumer keeps working.
   CREATE TABLE IF NOT EXISTS alert_footage (
     id SERIAL PRIMARY KEY,
     alert_id TEXT,
@@ -919,14 +924,43 @@ const MIGRATIONS_SQL = `
     status TEXT DEFAULT 'REQUESTED',
     error TEXT,
     requested_by TEXT,
+    replay_url TEXT,
+    replay_state TEXT DEFAULT 'PENDING',
+    replay_error TEXT,
+    file_url TEXT,
+    file_state TEXT DEFAULT 'PENDING',
+    file_error TEXT,
+    file_start TIMESTAMPTZ,
+    file_end TIMESTAMPTZ,
+    upload_task_id TEXT,
+    upload_period_start TIMESTAMPTZ,
+    upload_period_end TIMESTAMPTZ,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
   );
+  ALTER TABLE alert_footage ADD COLUMN IF NOT EXISTS replay_url TEXT;
+  ALTER TABLE alert_footage ADD COLUMN IF NOT EXISTS replay_state TEXT DEFAULT 'PENDING';
+  ALTER TABLE alert_footage ADD COLUMN IF NOT EXISTS replay_error TEXT;
+  ALTER TABLE alert_footage ADD COLUMN IF NOT EXISTS file_url TEXT;
+  ALTER TABLE alert_footage ADD COLUMN IF NOT EXISTS file_state TEXT DEFAULT 'PENDING';
+  ALTER TABLE alert_footage ADD COLUMN IF NOT EXISTS file_error TEXT;
+  ALTER TABLE alert_footage ADD COLUMN IF NOT EXISTS file_start TIMESTAMPTZ;
+  ALTER TABLE alert_footage ADD COLUMN IF NOT EXISTS file_end TIMESTAMPTZ;
+  ALTER TABLE alert_footage ADD COLUMN IF NOT EXISTS upload_task_id TEXT;
+  ALTER TABLE alert_footage ADD COLUMN IF NOT EXISTS upload_period_start TIMESTAMPTZ;
+  ALTER TABLE alert_footage ADD COLUMN IF NOT EXISTS upload_period_end TIMESTAMPTZ;
   CREATE INDEX IF NOT EXISTS idx_alert_footage_group ON alert_footage(alert_group_id);
   CREATE INDEX IF NOT EXISTS idx_alert_footage_device ON alert_footage(device_id);
   CREATE INDEX IF NOT EXISTS idx_alert_footage_status ON alert_footage(status);
+  -- One row per alert + channel: the row is created by the replay and later
+  -- upgraded in place when the uploaded file arrives.
+  DELETE FROM alert_footage a USING alert_footage b
+   WHERE a.id < b.id
+     AND a.alert_id IS NOT DISTINCT FROM b.alert_id
+     AND a.channel_id IS NOT DISTINCT FROM b.channel_id;
+  DROP INDEX IF EXISTS idx_alert_footage_unique;
   CREATE UNIQUE INDEX IF NOT EXISTS idx_alert_footage_unique
-    ON alert_footage(alert_id, channel_id) WHERE video_url IS NOT NULL;
+    ON alert_footage(alert_id, channel_id);
 
   -- Config Groups: allow multiple cost centers to share the same driver config criteria
   CREATE TABLE IF NOT EXISTS config_groups (

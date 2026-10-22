@@ -171,6 +171,14 @@ async function start() {
       console.error(`[JOBS] runner failed to start: ${err.message}`);
     }
 
+    // Footage watcher: the camera uploads the clip in its own time; this
+    // picks up the link as soon as the file is there.
+    try {
+      require('./services/alertFootageService').startWatcher();
+    } catch (err) {
+      console.error(`[FOOTAGE] watcher failed to start: ${err.message}`);
+    }
+
     // Start Geotab polling (connects WebSocket broadcast)
     try {
       const geotabPolling = require('./services/geotabPolling');

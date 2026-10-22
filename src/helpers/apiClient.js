@@ -44,6 +44,7 @@ class ApiClient {
       
       const response = await axios.post(`${this.baseURL}/system/createToken`, requestBody, {
         headers: { 'Content-Type': 'application/json' },
+        timeout: 15000,
         httpsAgent
       });
 
