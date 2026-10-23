@@ -235,7 +235,7 @@ function geotabMultiCall(credentials, calls) {
   });
 }
 
-// ── Sync: Fleet Vehicles from Supabase (midnight only, new vehicles only) ──
+// ── Sync: Fleet Vehicles from Supabase (midnight) ──
 
 async function syncNewFleetVehicles() {
   try {
@@ -251,10 +251,19 @@ async function syncNewFleetVehicles() {
       make: v.make || null,
       model: v.model || null,
       cost_center: v.cost_center || null,
+      cost_center_id: v.cost_center_id == null ? null : Number(v.cost_center_id),
     })).filter(v => v.fleet_number && v.registration_number);
 
     await db.upsertNewFleetVehicles(enriched);
-    console.log(`[FLEET] Midnight sync: ${enriched.length} vehicles fetched (new-only)`);
+    // A vehicle that is REASSIGNED to another cost centre must follow it. The
+    // insert-only sync froze fleet_vehicles.cost_center_id at first sight, so
+    // the registry disagreed with the live source (Supabase) — and the board
+    // (which resolves the vehicle through Supabase) then filed those vehicles
+    // under a cost centre the operator had not selected.
+    const updated = await db.syncFleetVehicleCostCenters(enriched);
+    console.log(
+      `[FLEET] Midnight sync: ${enriched.length} vehicles fetched (new-only + ${updated} cost-centre reassignments)`
+    );
 
     // Refresh the Soltrack in-memory fleet dict so new vehicles resolve immediately
     try {

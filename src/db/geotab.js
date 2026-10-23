@@ -386,6 +386,77 @@ async function upsertNewFleetVehicles(vehicles) {
   return inserted;
 }
 
+// Follow a vehicle to its current cost centre. The insert-only sync froze
+// fleet_vehicles.cost_center_id at first sight, so a vehicle reassigned in
+// Supabase kept its OLD cost centre here — while the dashboard (which resolves
+// vehicles through Supabase) filed it under the new one. The two registries
+// then disagreed, and vehicles showed up under a cost centre the operator had
+// not selected.
+//
+// Only vehicles whose cost centre actually changed are written, so the table is
+// not churned on every sync.
+async function syncFleetVehicleCostCenters(vehicles) {
+  if (!vehicles || vehicles.length === 0) return 0;
+
+  // Cost centre name -> id, for rows that carry only a name.
+  let ccMap = new Map();
+  try {
+    const ccResult = await query('SELECT id, name, code FROM cost_centers');
+    for (const cc of ccResult.rows) {
+      if (cc.name) ccMap.set(String(cc.name).toLowerCase(), cc.id);
+      if (cc.code) ccMap.set(String(cc.code).toLowerCase(), cc.id);
+    }
+  } catch (err) {
+    console.error('[FLEET] Failed to resolve cost centers:', err.message);
+  }
+
+  const norm = (s) => String(s || '').trim().replace(/\s+/g, ' ').toLowerCase();
+  const wanted = new Map();
+  for (const v of vehicles) {
+    const fleet = String(v.fleet_number || '').trim();
+    if (!fleet) continue;
+    const ccId =
+      v.cost_center_id != null
+        ? Number(v.cost_center_id)
+        : (v.cost_center && ccMap.get(String(v.cost_center).toLowerCase())) || null;
+    if (ccId == null) continue;
+    // A vehicle can carry several plates; key on the fleet so any plate row
+    // for it is corrected.
+    const prev = wanted.get(fleet);
+    if (prev == null) wanted.set(fleet, { ccId, costCenter: v.cost_center || null });
+  }
+  if (wanted.size === 0) return 0;
+
+  const fleets = Array.from(wanted.keys());
+  const current = await query(
+    `SELECT fleet_number, cost_center, cost_center_id FROM fleet_vehicles
+     WHERE UPPER(fleet_number) = ANY($1::text[])`,
+    [fleets.map((f) => f.toUpperCase())]
+  );
+  const byFleet = new Map(current.rows.map((r) => [String(r.fleet_number || '').toUpperCase(), r]));
+
+  let changed = 0;
+  for (const [fleet, want] of wanted.entries()) {
+    const row = byFleet.get(fleet.toUpperCase());
+    if (!row) continue; // not in the registry yet — the insert sync handles it
+    const currentId = row.cost_center_id == null ? null : Number(row.cost_center_id);
+    const currentName = norm(row.cost_center);
+    const wantName = norm(want.costCenter);
+    if (currentId === want.ccId && (!wantName || currentName === wantName)) continue;
+    await query(
+      `UPDATE fleet_vehicles
+       SET cost_center = COALESCE($2, cost_center), cost_center_id = $3, last_synced = NOW()
+       WHERE UPPER(fleet_number) = $1`,
+      [fleet.toUpperCase(), want.costCenter || null, want.ccId]
+    );
+    changed++;
+  }
+  if (changed > 0) {
+    console.log(`[FLEET] Cost-centre reassignment: ${changed} vehicle(s) moved to their current cost centre`);
+  }
+  return changed;
+}
+
 async function getFleetVehicleByFleet(fleetNumber) {
   const result = await query(
     'SELECT * FROM fleet_vehicles WHERE fleet_number = $1 LIMIT 1',
@@ -805,6 +876,7 @@ module.exports = {
   getDiagnostic,
   upsertFleetVehicles,
   upsertNewFleetVehicles,
+  syncFleetVehicleCostCenters,
   getFleetVehicleByFleet,
   getFleetVehicleByReg,
   getAllFleetVehicles,
