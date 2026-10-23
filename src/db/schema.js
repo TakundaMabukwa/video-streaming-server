@@ -173,7 +173,10 @@ const MIGRATIONS_SQL = `
     -- grouping and becomes an AND-combination trigger — its member alerts are
     -- held back individually and only surface as ONE merged alert once every
     -- member has fired for the same vehicle inside combo_window_seconds.
-    combo_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    -- Default TRUE: a group of two or more alert types is a combination unless
+    -- an operator deliberately switches it off. A single-member group can never
+    -- complete, so the API forces it off (see alertConfigController).
+    combo_enabled BOOLEAN NOT NULL DEFAULT TRUE,
     combo_window_seconds INTEGER NOT NULL DEFAULT 300,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -1239,10 +1242,12 @@ const MIGRATIONS_SQL = `
   ON CONFLICT (alert_definition_id, cost_center_id) DO NOTHING;
 
   -- ── COMBO MODE (AND-combination alert groups) ──
-  -- combo_enabled defaults FALSE, so every existing group config stays a passive
-  -- grouping and detection behaviour is unchanged until a group is explicitly
-  -- turned into a combo.
-  ALTER TABLE alert_group_configs ADD COLUMN IF NOT EXISTS combo_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+  -- combo_enabled defaults TRUE: two or more alert types in a group means the
+  -- operator wants the combination. Existing rows keep whatever they already
+  -- have (switching detection behaviour on silently is not this migration's
+  -- job); only the column DEFAULT is corrected so new groups behave correctly.
+  ALTER TABLE alert_group_configs ADD COLUMN IF NOT EXISTS combo_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+  ALTER TABLE alert_group_configs ALTER COLUMN combo_enabled SET DEFAULT TRUE;
   ALTER TABLE alert_group_configs ADD COLUMN IF NOT EXISTS combo_window_seconds INTEGER NOT NULL DEFAULT 300;
 
   -- alerts.combo_state marks a detection row that is being held back by a combo.

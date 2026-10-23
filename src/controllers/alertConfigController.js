@@ -401,17 +401,23 @@ async function createAlertGroupConfig(req, res) {
       severity,
       description = '',
       member_ids = [],
-      combo_enabled = false,
+      combo_enabled,
       combo_window_seconds,
     } = req.body;
     if (!name) return sendError(res, 'name required', 400);
     const sev = (severity || 'MEDIUM').toUpperCase();
     if (!VALID_SEVERITY.includes(sev)) return sendError(res, 'severity must be CRITICAL, HIGH, MEDIUM, or LOW', 400);
 
-    const comboOn = combo_enabled === true || combo_enabled === 'true';
+    // DEFAULT TRUE: a group holding two or more alert types is a combination
+    // unless the operator deliberately switches it off. A group that cannot
+    // ever complete (fewer than 2 members) is forced off rather than rejected,
+    // so an existing "group with one alert" flow keeps working.
+    const memberCount = Array.isArray(member_ids) ? member_ids.length : 0;
+    const comboRequested = combo_enabled === undefined || combo_enabled === null
+      ? true
+      : (combo_enabled === true || combo_enabled === 'true');
+    const comboOn = comboRequested && memberCount >= 2;
     const comboWindow = normalizeComboWindow(combo_window_seconds);
-    const comboError = await validateComboMembers(null, member_ids, comboOn);
-    if (comboError) return sendError(res, comboError, 400);
 
     const groupResult = await db.query(
       `INSERT INTO alert_group_configs (name, severity, description, combo_enabled, combo_window_seconds)

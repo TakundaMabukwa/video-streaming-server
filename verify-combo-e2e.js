@@ -430,13 +430,38 @@ async function stagedRows(fleet) {
       return r;
     };
 
-    // Combo needs at least two members.
+    // A combination that can never complete is never created: it is saved as a
+    // normal group with the combination switched off.
     let res = mkRes();
     await ctrl.createAlertGroupConfig({
       body: { name: `${TAG} Combo 1`, severity: 'HIGH', member_ids: [defs.a.id], combo_enabled: true },
     }, res);
-    check(res.statusCode === 400, `combo with 1 member rejected (got ${res.statusCode})`);
-    check(/at least 2/i.test(res.body?.message || ''), 'rejection explains why');
+    check(res.statusCode === 200, `1-member group saved rather than rejected (got ${res.statusCode})`);
+    check(res.body?.data?.combo_enabled === false, `forced off so it cannot swallow member alerts (got ${res.body?.data?.combo_enabled})`);
+
+    // DEFAULT: combo_enabled omitted -> a 2-member group becomes a combination.
+    res = mkRes();
+    await ctrl.createAlertGroupConfig({
+      body: { name: `${TAG} Combo Default`, severity: 'HIGH', member_ids: [defs.a.id, defs.b.id] },
+    }, res);
+    check(res.statusCode === 200, `2-member group created without combo_enabled (got ${res.statusCode})`);
+    check(res.body?.data?.combo_enabled === true, `defaults to a combination (got ${res.body?.data?.combo_enabled})`);
+    check(Number(res.body?.data?.combo_window_seconds) === 300, 'default window is 5 min');
+
+    // DEFAULT: a 1-member group is NOT a combination (it could never complete).
+    res = mkRes();
+    await ctrl.createAlertGroupConfig({
+      body: { name: `${TAG} Solo Default`, severity: 'LOW', member_ids: [defs.c.id] },
+    }, res);
+    check(res.statusCode === 200, `1-member group created without combo_enabled (got ${res.statusCode})`);
+    check(res.body?.data?.combo_enabled === false, `1-member group is not a combination (got ${res.body?.data?.combo_enabled})`);
+
+    // An explicit "off" is still honoured on a 2-member group.
+    res = mkRes();
+    await ctrl.createAlertGroupConfig({
+      body: { name: `${TAG} Explicit Off`, severity: 'LOW', member_ids: [defs.a.id, defs.b.id], combo_enabled: false },
+    }, res);
+    check(res.body?.data?.combo_enabled === false, 'explicit combo_enabled=false is honoured');
 
     // Two members is accepted, and the window is normalised.
     res = mkRes();
