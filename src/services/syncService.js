@@ -404,7 +404,6 @@ async function syncAlerts(deviceIds, startTime, endTime) {
           const alertCombos = require('./alertCombos');
           const combosActive = await alertCombos.listEnabledCombos(null).catch(() => []);
           if (combosActive.length > 0) {
-            const { findVehicleCostCenterId: ccLookup, resolveFleetNumber: fleetLookup } = require('./costCenterLookup');
             const ccByDevice = new Map();
             const comboHeld = new Set();
             for (const r of newRecords) {
@@ -412,8 +411,8 @@ async function syncAlerts(deviceIds, startTime, endTime) {
               if (!ccByDevice.has(did)) {
                 let ccId = null;
                 try {
-                  const fleet = await fleetLookup({ deviceId: did, vehicleRegistration: r.deviceName }).catch(() => null);
-                  ccId = fleet ? await ccLookup(fleet).catch(() => null) : null;
+                  const fleet = await resolveFleetNumber({ deviceId: did, vehicleRegistration: r.deviceName }).catch(() => null);
+                  ccId = fleet ? await findVehicleCostCenterId(fleet).catch(() => null) : null;
                 } catch (_) { ccId = null; }
                 ccByDevice.set(did, ccId);
               }
@@ -458,16 +457,30 @@ async function syncAlerts(deviceIds, startTime, endTime) {
       try {
         severityMap = await getVideoSeverityMap([]);
       } catch (_) { /* fall back to PRIORITY_MAP */ }
-      const groupEntries = Object.values(groupMap).map(r => ({
-        deviceId: r.deviceId,
-        deviceName: r.deviceName,
-        alarmType: r.alarmType,
-        alarmText: r.alarmText,
-        alertId: r.id,
-        alarmTs: r.alarmTs ? new Date(r.alarmTs) : null,
-        lat: r.lat,
-        lon: r.lon,
-        severity: resolveBaseSeverity(r.alarmType, severityMap),
+      // The vehicle identifiers travel with the entry so the batch upsert can
+      // (a) honour a vehicle alert override and (b) store a fleet number for
+      // cost-centre attribution. cameraName already carries both ("FM10 - LDG067MP").
+      const groupEntries = await Promise.all(Object.values(groupMap).map(async (r) => {
+        let fleetNumber = null;
+        let registration = null;
+        try {
+          fleetNumber = await resolveFleetNumber({ deviceId: r.deviceId, vehicleRegistration: r.deviceName }).catch(() => null);
+        } catch (_) { fleetNumber = null; }
+        const nameParts = String(r.deviceName || '').split(/\s*-\s*/).map((p) => p.trim()).filter(Boolean);
+        registration = nameParts.length > 1 ? nameParts[nameParts.length - 1] : (nameParts[0] || null);
+        return {
+          deviceId: r.deviceId,
+          deviceName: r.deviceName,
+          alarmType: r.alarmType,
+          alarmText: r.alarmText,
+          alertId: r.id,
+          alarmTs: r.alarmTs ? new Date(r.alarmTs) : null,
+          lat: r.lat,
+          lon: r.lon,
+          severity: resolveBaseSeverity(r.alarmType, severityMap),
+          fleetNumber,
+          registration,
+        };
       }));
       const groupSeverityByKey = {};
       if (groupEntries.length > 0) {

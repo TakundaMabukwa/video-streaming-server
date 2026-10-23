@@ -89,28 +89,58 @@ async function ensureLoaded() {
 
 /**
  * True when this vehicle must not raise this alert.
- * @param {{fleetNumber?: string, registration?: string, alertName?: string, signalCode?: string}} input
+ * @param {{fleetNumber?: string, registration?: string, alertName?: string, signalCode?: string, deviceName?: string}} input
  */
-function isSuppressedSync({ fleetNumber, registration, alertName, signalCode } = {}) {
+function isSuppressedSync({ fleetNumber, registration, alertName, signalCode, deviceName } = {}) {
   if (cache.size === 0) return false;
   const fleet = norm(fleetNumber);
   const reg = norm(registration);
   const name = norm(alertName);
   const code = norm(signalCode);
+  // Camera detections identify the vehicle in the NAME, not in a fleet/reg
+  // field: "RH23 - GGD359X" on an opaque device id. Without these fallbacks an
+  // override saved for RH23 never matched a camera alert for that vehicle.
+  const nameCandidates = nameCandidatesFrom(deviceName);
   for (const entry of cache.values()) {
     // Vehicle match: EITHER declared key matching is enough ("fleet or reg is
     // ok"). Both keys are optional; a row with only one matches on that one.
     // OR semantics are required in practice: the plate a detector reports is
     // not always the registry plate (camera vehicles report a device id in
     // license_plate), so requiring both would stop the override matching.
-    const fleetHit = !!entry.fleet && entry.fleet === fleet;
-    const regHit = !!entry.reg && regMatches(entry.reg, reg);
+    let fleetHit = !!entry.fleet && entry.fleet === fleet;
+    let regHit = !!entry.reg && regMatches(entry.reg, reg);
+    if (!fleetHit) {
+      fleetHit = nameCandidates.fleets.some((t) => entry.fleet && entry.fleet === t);
+    }
+    if (!regHit) {
+      regHit = nameCandidates.regs.some((t) => entry.reg && regMatches(entry.reg, t));
+    }
     if (!fleetHit && !regHit) continue;
     // Alert match: signal code first (stable), then the display name.
     if (code && entry.codes.has(code)) return true;
     if (name && entry.types.has(name)) return true;
   }
   return false;
+}
+
+// Fleet and plate candidates from a device name such as "RH23 - GGD359X".
+// Short alphanumeric tokens only; long pure-digit camera/IMEI ids are skipped.
+function nameCandidatesFrom(deviceName) {
+  const fleets = [];
+  const regs = [];
+  const seen = new Set();
+  const parts = String(deviceName || '').split(/[\s/\-()|,]+/);
+  for (const part of parts) {
+    const token = part.trim().toLowerCase();
+    if (!token || token.length < 2 || token.length > 12) continue;
+    if (!/^[a-z0-9]+$/.test(token)) continue;
+    if (/^\d{6,}$/.test(token)) continue;
+    if (seen.has(token)) continue;
+    seen.add(token);
+    fleets.push(token);
+    regs.push(token);
+  }
+  return { fleets, regs };
 }
 
 /** Async variant for callers that can await (cold paths). */

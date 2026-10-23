@@ -1,6 +1,16 @@
 const { query } = require('./pool');
 const { isRegisteredVehicle } = require('../services/fleetRegistryGuard');
 
+// Log an override drop once per (alert, vehicle) so a chatty camera cannot flood
+// the log every poll.
+const overrideDropLog = new Set();
+function logDropOnce(key, message) {
+  if (overrideDropLog.has(key)) return;
+  overrideDropLog.add(key);
+  if (overrideDropLog.size > 500) overrideDropLog.clear();
+  console.log(message);
+}
+
 // Member stamp: link the detection's alert row to its group (insert-or-fill,
 // never overwrites member data). Guarded — member linkage must never break
 // the hot detection path.
@@ -199,6 +209,30 @@ async function requestIncidentFootage(groupRow, ctx) {
 
 async function batchUpsertAlertGroups(groups) {
   if (!groups || groups.length === 0) return [];
+  // Vehicle override: this vehicle must not raise this alert. Checked BEFORE
+  // anything is written, exactly as the single-group path and the telematics
+  // paths do — the video/camera path used to skip this entirely, so an
+  // override saved for a vehicle never stopped its camera alerts.
+  const { isSuppressedSync } = require('../services/vehicleAlertOverrides');
+  const notSuppressed = [];
+  for (const g of groups) {
+    if (isSuppressedSync({
+      fleetNumber: g.fleetNumber || null,
+      registration: g.registration || null,
+      deviceName: g.deviceName || null,
+      alertName: g.alarmType,
+      signalCode: g.signalCode || null,
+    })) {
+      logDropOnce(
+        `ovr:${g.alarmType}:${g.fleetNumber || g.deviceId}`,
+        `[GROUPS] suppressed ${g.alarmType} for ${g.fleetNumber || g.deviceName || g.deviceId}: vehicle alert override`
+      );
+      continue;
+    }
+    notSuppressed.push(g);
+  }
+  if (notSuppressed.length === 0) return [];
+  groups = notSuppressed;
   // Only vehicles in fleet_vehicles may raise alerts.
   const allowed = [];
   for (const g of groups) {
