@@ -256,10 +256,26 @@ async function getNcrForm(formId) {
 }
 
 /** The stored document for an incident (register lookup by incident id). */
+/** The stored document for a register row (lookup by incident id). */
 async function getNcrFormByIncident(incidentId) {
-  const { rows } = await db.query('SELECT id FROM ncr_forms WHERE incident_id = $1 LIMIT 1', [incidentId]);
-  if (rows.length === 0) return null;
-  return getNcrForm(rows[0].id);
+  const direct = await db.query('SELECT id FROM ncr_forms WHERE incident_id = $1 LIMIT 1', [incidentId]);
+  if (direct.rows.length > 0) return getNcrForm(direct.rows[0].id);
+
+  // Fallback: an NCR saved before the incident row was linked still belongs to
+  // the incident through its alert group, so resolve it that way rather than
+  // reporting "no document" for a report that exists.
+  const viaGroup = await db.query(
+    `SELECT nf.id
+     FROM incidents i
+     JOIN alert_groups g ON g.group_key = i.alert_group_key
+     JOIN ncr_forms nf ON nf.alert_group_id = g.id
+     WHERE i.id = $1
+     ORDER BY nf.created_at DESC
+     LIMIT 1`,
+    [incidentId]
+  ).catch(() => ({ rows: [] }));
+  if (viaGroup.rows.length > 0) return getNcrForm(viaGroup.rows[0].id);
+  return null;
 }
 
 /** Record the PDF the client rendered in the background. */
