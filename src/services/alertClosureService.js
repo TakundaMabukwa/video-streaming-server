@@ -44,6 +44,13 @@ async function closeAlertGroup(opts = {}) {
     incidentId = null,
   } = opts;
 
+  // Attribution must never degrade to a placeholder. An unknown actor is left
+  // null rather than written as "unknown_user"; callers pass the identity they
+  // resolved (server-side that is the authenticated user).
+  const UNKNOWN_ACTORS = new Set(['unknown_user', 'unknown', 'unknown user', 'null', 'undefined', '']);
+  const provided = String(userId ?? '').trim();
+  const actor = provided && !UNKNOWN_ACTORS.has(provided.toLowerCase()) ? provided : null;
+
   const groupId = Number(rawGroupId);
   if (!Number.isInteger(groupId) || groupId < 1) {
     return { ok: false, error: 'Alert id must be alert_groups.id (integer)' };
@@ -58,7 +65,7 @@ async function closeAlertGroup(opts = {}) {
   const resolved = await db.resolveAlertGroupById(groupId, {
     resolved: true,
     false_alert: isFalse,
-    resolved_by: userId || null,
+    resolved_by: actor,
     resolved_at: now,
     notes: notes || null,
   });
@@ -76,7 +83,7 @@ async function closeAlertGroup(opts = {}) {
         docs.push({
           type: d.type,
           timestamp: d.timestamp || now,
-          filled_by: d.filled_by || userId || 'unknown',
+          filled_by: d.filled_by || actor,
           link: d.link,
         });
       }
@@ -116,7 +123,7 @@ async function closeAlertGroup(opts = {}) {
         device_id: group.device_id,
         fleet_number: fleetNumber,
         cost_center_id: costCenterId,
-        filled_by: userId || 'SYSTEM',
+        filled_by: actor || 'SYSTEM',
         controller: reported_by || incidentData.controller || incidentData.reported_by || null,
         driver_name: incidentData.driver_name || incidentData.driverName || incidentData['name & surname'] || null,
         contact_number: incidentData.contact_number || incidentData.contactNumber || null,
@@ -139,7 +146,7 @@ async function closeAlertGroup(opts = {}) {
         deviceId: group.device_id,
         fleetNumber,
         costCenterId,
-        filledBy: userId || 'SYSTEM',
+        filledBy: actor || 'SYSTEM',
         status: isFalse ? 'FALSE_ALERT' : 'OPEN',
         controller: reported_by || incidentData.controller || incidentData.reported_by || null,
         driver_name:
@@ -171,7 +178,7 @@ async function closeAlertGroup(opts = {}) {
         }
         const resFields = {
           status: 'RESOLVED',
-          resolved_by: userId || null,
+          resolved_by: actor,
           resolved_at: now,
           closure_type: closureType,
         };
@@ -205,7 +212,7 @@ async function closeAlertGroup(opts = {}) {
         status: 'resolved',
         resolved: true,
         false_alert: isFalse,
-        resolved_by: userId || null,
+        resolved_by: actor,
         group_key: resolvedGroupKey,
         device_id: targetDeviceId || null,
         alert_type: targetAlarmType || null,

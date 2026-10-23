@@ -1120,6 +1120,26 @@ async function getAlertHistory(req, res) {
   }
 }
 
+// Who actually closed this. The caller is already authenticated by requireAuth,
+// so the AUTHENTICATED identity is authoritative: a client that failed to read
+// its own session (slow/absent Supabase client, expired client-side token) must
+// never leave "unknown_user" on a closed alert. Anything the client sends is
+// accepted only when it is a real value.
+const UNKNOWN_ACTORS = new Set(['unknown_user', 'unknown', 'unknown user', 'null', 'undefined', '']);
+
+function resolveActor(req, provided) {
+  const candidate = String(provided ?? '').trim();
+  if (candidate && !UNKNOWN_ACTORS.has(candidate.toLowerCase())) return candidate;
+  const email = String(req?.user?.email || '').trim();
+  if (email) return email;
+  const metaEmail = String(req?.user?.user_metadata?.email || '').trim();
+  if (metaEmail) return metaEmail;
+  const id = String(req?.user?.id || '').trim();
+  if (id) return id;
+  // No authenticated identity at all: record nothing rather than a lie.
+  return null;
+}
+
 async function acknowledgeAlert(req, res) {
   res.json({ success: true, alertId: req.params.id, action: 'acknowledge', message: 'EPS read-only: acknowledged locally' });
 }
@@ -1138,6 +1158,7 @@ async function resolveAlert(req, res) {
       reported_by,
       incident: incidentData = {},
     } = req.body || {};
+    const actor = resolveActor(req, userId);
 
     const groupId = Number(id);
     if (!Number.isInteger(groupId) || groupId < 1 || String(id).trim() === '') {
@@ -1155,7 +1176,7 @@ async function resolveAlert(req, res) {
     const resolved = await db.resolveAlertGroupById(groupId, {
       resolved: true,
       false_alert: isFalse,
-      resolved_by: userId || null,
+      resolved_by: actor,
       resolved_at: now,
       notes: notes || null,
     });
@@ -1175,7 +1196,7 @@ async function resolveAlert(req, res) {
           docs.push({
             type: d.type,
             timestamp: d.timestamp || now,
-            filled_by: d.filled_by || userId || 'unknown',
+            filled_by: d.filled_by || actor,
             link: d.link,
           });
         }
@@ -1212,7 +1233,7 @@ async function resolveAlert(req, res) {
         deviceId: group.device_id,
         fleetNumber,
         costCenterId,
-        filledBy: userId || 'SYSTEM',
+        filledBy: actor || 'SYSTEM',
         status: isFalse ? 'FALSE_ALERT' : 'OPEN',
         controller: reported_by || incidentData.controller || incidentData.reported_by || null,
         driver_name:
@@ -1243,7 +1264,7 @@ async function resolveAlert(req, res) {
           }
           const resFields = {
             status: 'RESOLVED',
-            resolved_by: userId || null,
+            resolved_by: actor,
             resolved_at: now,
             closure_type: closureType,
           };
@@ -1277,7 +1298,7 @@ async function resolveAlert(req, res) {
           status: 'resolved',
           resolved: true,
           false_alert: isFalse,
-          resolved_by: userId || null,
+          resolved_by: actor,
           group_key: resolvedGroupKey,
           device_id: targetDeviceId || null,
           alert_type: targetAlarmType || null,
@@ -1297,6 +1318,7 @@ async function markFalseAlert(req, res) {
   try {
     const { id } = req.params;
     const { userId, notes } = req.body || {};
+    const actor = resolveActor(req, userId);
 
     const groupId = Number(id);
     if (!Number.isInteger(groupId) || groupId < 1 || String(id).trim() === '') {
@@ -1312,7 +1334,7 @@ async function markFalseAlert(req, res) {
     const updated = await db.resolveAlertGroupById(groupId, {
       resolved: true,
       false_alert: true,
-      resolved_by: userId || null,
+      resolved_by: actor,
       resolved_at: now,
       notes: notes || null,
     });
@@ -1328,7 +1350,7 @@ async function markFalseAlert(req, res) {
           status: 'resolved',
           resolved: true,
           false_alert: true,
-          resolved_by: userId || null,
+          resolved_by: actor,
           group_key: group.group_key,
           device_id: group.device_id || null,
           alert_type: group.alarm_type || null,
@@ -1475,6 +1497,7 @@ async function clearFollowUp(req, res) {
 async function resolveAlertsBulk(req, res) {
   try {
     const { alertIds, userId, notes, notesById, closureType = 'resolved' } = req.body || {};
+    const actor = resolveActor(req, userId);
     if (!Array.isArray(alertIds) || alertIds.length === 0) {
       return res.status(400).json({ success: false, message: 'alertIds array is required' });
     }
@@ -1543,7 +1566,7 @@ async function resolveAlertsBulk(req, res) {
             status: 'resolved',
             resolved: true,
             false_alert: isFalse,
-            resolved_by: userId || null,
+            resolved_by: actor,
             group_key: row.group_key,
             device_id: row.device_id,
             alert_type: row.alarm_type,
