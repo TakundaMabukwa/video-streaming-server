@@ -393,6 +393,57 @@ async function syncAlerts(deviceIds, startTime, endTime) {
         severity: resolveBaseSeverity(r.alarmType, videoSeverityMap),
       })));
 
+      // Combo gate: a member of an enabled AND-combination group is held back
+      // here. The detection row is already stored above (so its media and
+      // footage work exactly as before), but it gets NO alert_groups row until
+      // every member has fired for the device inside the combo's window.
+      // Anything not claimed by a combo keeps the normal batch group upsert.
+      const comboRaisedGroups = [];
+      if (newRecords.length > 0) {
+        try {
+          const alertCombos = require('./alertCombos');
+          const combosActive = await alertCombos.listEnabledCombos(null).catch(() => []);
+          if (combosActive.length > 0) {
+            const { findVehicleCostCenterId: ccLookup, resolveFleetNumber: fleetLookup } = require('./costCenterLookup');
+            const ccByDevice = new Map();
+            const comboHeld = new Set();
+            for (const r of newRecords) {
+              const did = String(r.deviceId || '');
+              if (!ccByDevice.has(did)) {
+                let ccId = null;
+                try {
+                  const fleet = await fleetLookup({ deviceId: did, vehicleRegistration: r.deviceName }).catch(() => null);
+                  ccId = fleet ? await ccLookup(fleet).catch(() => null) : null;
+                } catch (_) { ccId = null; }
+                ccByDevice.set(did, ccId);
+              }
+              const comboResult = await alertCombos.handleDetection({
+                alertId: r.id,
+                deviceId: did,
+                deviceName: r.deviceName,
+                alarmType: r.alarmType,
+                alarmText: r.alarmText,
+                alarmTs: r.alarmTs ? new Date(r.alarmTs) : null,
+                lat: r.lat,
+                lon: r.lon,
+                speed: r.speed ?? null,
+                severity: r.severity,
+                fleetNumber: did,
+                sourceType: 'video',
+                costCenterId: ccByDevice.get(did),
+              });
+              if (comboResult.action !== 'pass') comboHeld.add(r.id);
+              for (const g of comboResult.groupRows) comboRaisedGroups.push(g);
+            }
+            if (comboHeld.size > 0) {
+              newRecords = newRecords.filter(r => !comboHeld.has(r.id));
+            }
+          }
+        } catch (comboErr) {
+          console.error('[SYNC] combo gate error (processing unfiltered):', comboErr.message);
+        }
+      }
+
       // Push new video alerts over WS as fast as possible so the frontend
       // receives them without waiting for its own polling cycle.
       // Groups are upserted first so severity can be escalated by event count.
@@ -480,6 +531,51 @@ async function syncAlerts(deviceIds, startTime, endTime) {
                 group_key: gkey,
                 lat: r.lat,
                 lon: r.lon,
+              },
+            });
+          } catch (_) { /* skip */ }
+        }
+      }
+
+      // A completed combo has no per-record entry above (its detections were
+      // held back), so broadcast each merged group explicitly.
+      if (wsBroadcast && comboRaisedGroups.length > 0) {
+        for (const g of comboRaisedGroups) {
+          try {
+            const groupId = g?.id != null ? String(g.id) : '';
+            if (!groupId) continue;
+            const comboType = String(g.alarm_type || g.combo_name || 'Combined alert');
+            const base = String(g.severity || 'MEDIUM').toLowerCase();
+            const count = Number(g.count || 1) || 1;
+            const escalated = escalateSeverity(base, count);
+            const ts = g.last_alert_ts ? new Date(g.last_alert_ts).toISOString() : new Date().toISOString();
+            wsBroadcast('new-alert', {
+              alert: {
+                id: groupId,
+                alert_id: groupId,
+                device_id: g.device_id,
+                deviceId: g.device_id,
+                vehicleId: g.device_id,
+                device_name: g.device_name,
+                deviceName: g.device_name,
+                alert_type: comboType,
+                alarm_type: comboType,
+                type: comboType,
+                title: comboType,
+                alarmText: comboType,
+                timestamp: ts,
+                alarmTs: ts,
+                last_occurrence: ts,
+                source_type: g.source_type || 'video',
+                severity: escalated,
+                priority: escalated,
+                base_severity: base,
+                escalated: escalated !== base,
+                status: 'new',
+                resolved: false,
+                count,
+                combo: g.combo_name || comboType,
+                group_key: g.group_key || '',
               },
             });
           } catch (_) { /* skip */ }

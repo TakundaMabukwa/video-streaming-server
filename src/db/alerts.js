@@ -137,6 +137,10 @@ async function getAlertsPaginated({ pageSize = 50, pageIndex = 1, deviceIds, ala
     paramIndex++;
   }
 
+  // A detection held back by an enabled combo is not an alert yet — it only
+  // becomes visible once the whole set fires and it is linked to a group.
+  conditions.push(`combo_state IS DISTINCT FROM 'pending'`);
+
   const where = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
   const offset = (pageIndex - 1) * pageSize;
 
@@ -176,13 +180,17 @@ async function getAlertsWithoutMedia(limit = 200) {
 
 async function getActiveAlertsWithMedia({ pageSize = 2000, pageIndex = 1 }) {
   const offset = (pageIndex - 1) * pageSize;
+  // Combo-held detections are not alerts yet, so they never count here either.
   const countResult = await query(
-    'SELECT COUNT(*) FROM alerts a WHERE EXISTS (SELECT 1 FROM alert_media m WHERE m.alert_id = a.id)'
+    `SELECT COUNT(*) FROM alerts a
+     WHERE a.combo_state IS DISTINCT FROM 'pending'
+       AND EXISTS (SELECT 1 FROM alert_media m WHERE m.alert_id = a.id)`
   );
   const total = parseInt(countResult.rows[0].count);
   const dataResult = await query(
     `SELECT a.* FROM alerts a
-     WHERE EXISTS (SELECT 1 FROM alert_media m WHERE m.alert_id = a.id)
+     WHERE a.combo_state IS DISTINCT FROM 'pending'
+       AND EXISTS (SELECT 1 FROM alert_media m WHERE m.alert_id = a.id)
      ORDER BY a.alarm_ts DESC NULLS LAST
      LIMIT $1 OFFSET $2`,
     [pageSize, offset]

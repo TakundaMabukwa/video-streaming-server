@@ -138,15 +138,19 @@ async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, al
 // NEW group is created — a burst of collisions is one incident, one capture.
 // The capture itself starts IMMEDIATELY (not on the next runner tick) and the
 // queued job only exists to retry it.
+// groupRow may be null: combo-held detections have no group yet, but they still
+// need their evidence. jobs.alert_group_id and alert_footage.alert_group_id are
+// nullable and backfilled via COALESCE when the combo eventually fires.
 async function requestIncidentFootage(groupRow, ctx) {
   try {
-    if (!groupRow || !groupRow.id) return;
+    const groupId = groupRow && groupRow.id ? groupRow.id : null;
     const { isFootageAlarmType } = require('../services/alertFootageService');
     if (!isFootageAlarmType(ctx.alarmType)) return;
+    if (!ctx || !ctx.alertId) return;
     const { query: q } = require('./pool');
     const payload = {
       alertId: ctx.alertId,
-      alertGroupId: groupRow.id,
+      alertGroupId: groupId,
       deviceId: ctx.deviceId,
       fleetNumber: ctx.fleetExact || null,
       registration: ctx.deviceName || null,
@@ -156,7 +160,7 @@ async function requestIncidentFootage(groupRow, ctx) {
     const inserted = await q(
       `INSERT INTO jobs (job_type, payload, alert_group_id, next_retry_at)
        VALUES ('footage', $1::jsonb, $2, NOW() + INTERVAL '60 seconds') RETURNING id`,
-      [JSON.stringify(payload), groupRow.id]
+      [JSON.stringify(payload), groupId]
     );
     const jobId = inserted.rows[0]?.id;
     if (!jobId) return;
@@ -877,6 +881,7 @@ async function getAlertGroupStats() {
 
 module.exports = {
   upsertAlertGroup,
+  requestIncidentFootage,
   batchUpsertAlertGroups,
   getActiveAlertGroups,
   getActiveAlertCountRows,

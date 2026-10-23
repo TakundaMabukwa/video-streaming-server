@@ -19,6 +19,7 @@ const {
   deleteGroupConfigOverride,
   listGroupApplicableCcs,
   listAllGroupApplicableCcs,
+  listGroupComboWarnings,
 } = require('../controllers/alertConfigController');
 
 const router = express.Router();
@@ -47,6 +48,9 @@ router.delete('/groups/:group_id/overrides/:cc_id', deleteGroupConfigOverride);
 // Applicable cost centers for a group (which CCs an override exists for)
 router.get('/groups/applicable-ccs', listAllGroupApplicableCcs);
 router.get('/groups/:id/applicable-ccs', listGroupApplicableCcs);
+
+// Combo health: members that are not in a CC's alert set can never complete.
+router.get('/groups/combo-warnings', listGroupComboWarnings);
 
 // Alert Group Configs (base/global)
 router.get('/groups', listAlertGroupConfigs);

@@ -148,6 +148,26 @@ async function drain() {
 }
 
 let currentRun = null;
+let lastComboSweepAt = 0;
+const COMBO_SWEEP_INTERVAL_MS = 60 * 1000;
+
+// Retire combo-held detections whose window has lapsed. Throttled: the sweep is
+// a single UPDATE, and a combo's window is minutes long, so minute-level
+// precision is plenty. Never throws into the runner.
+async function maybeSweepCombos() {
+  const now = Date.now();
+  if (lastComboSweepAt && now - lastComboSweepAt < COMBO_SWEEP_INTERVAL_MS) return;
+  lastComboSweepAt = now;
+  try {
+    const { sweep } = require('./alertCombos');
+    const result = await sweep();
+    if (result && result.expired > 0) {
+      console.log(`[JOBS] combo sweep retired ${result.expired} staged detection(s)`);
+    }
+  } catch (err) {
+    console.error('[JOBS] combo sweep failed:', err.message);
+  }
+}
 
 async function tick() {
   if (running && currentRun) {
@@ -164,6 +184,7 @@ async function tick() {
   running = true;
   currentRun = (async () => {
     try {
+      await maybeSweepCombos();
       await drain();
     } catch (err) {
       console.error('[JOBS] tick failed:', err.message);

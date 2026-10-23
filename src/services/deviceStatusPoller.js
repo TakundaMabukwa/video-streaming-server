@@ -284,81 +284,126 @@ async function emitDeviceStatusAlert({ deviceId, fleetNumber, licensePlate, sign
       if (feedDup.rows.length > 0) return null;
     }
 
-    const groupRow = await db.upsertAlertGroup({
+    // Combo gate: when this alert type is a member of an enabled AND-combination
+    // group it is held back (stored, evidence captured, nothing on the board)
+    // until every member has fired for this vehicle inside the group's window.
+    // 'pass' means no combo claims it, so the normal path runs unchanged.
+    const alertCombos = require('./alertCombos');
+    const comboResult = await alertCombos.handleDetection({
+      alertId,
       deviceId,
       deviceName,
       alarmType: def.name,
       alarmText: alarmText || def.name,
-      alertId,
       alarmTs,
       lat: lat ?? null,
       lon: lon ?? null,
       speed: speed ?? null,
-      sourceType: 'telematics',
       severity: String(def.severity || 'MEDIUM').toLowerCase(),
       fleetNumber: fleetNumber || null,
-      registration: licensePlate || null,
+      sourceType: 'telematics',
+      costCenterId: ccId,
     });
-    if (!groupRow) return null;
+
+    let groupRows = comboResult.groupRows;
+    if (comboResult.action === 'pass') {
+      const created = await db.upsertAlertGroup({
+        deviceId,
+        deviceName,
+        alarmType: def.name,
+        alarmText: alarmText || def.name,
+        alertId,
+        alarmTs,
+        lat: lat ?? null,
+        lon: lon ?? null,
+        speed: speed ?? null,
+        sourceType: 'telematics',
+        severity: String(def.severity || 'MEDIUM').toLowerCase(),
+        fleetNumber: fleetNumber || null,
+        registration: licensePlate || null,
+      });
+      groupRows = created ? [created] : [];
+    }
 
     // Archive per-event source row for history (alert_groups is the store).
-    await db.query(
-      `INSERT INTO telematics_events (device_id, vehicle_id, license_plate, fleet_number, plate,
-        event_type, event_code, severity, latitude, longitude, speed, description, zone_name, raw_data, event_time)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
-      [
-        deviceId, deviceId, licensePlate || null, fleetNumber || null, licensePlate || null,
-        def.name, signalCode, String(def.severity || 'MEDIUM').toUpperCase(),
-        lat ?? null, lon ?? null, speed ?? null,
-        alarmText || def.name, extra.zoneName || null,
-        JSON.stringify({ signalCode, source: 'deviceStatus', ...extra }),
-        alarmTs,
-      ]
-    ).catch(() => {});
-
-    if (wsBroadcast) {
-      try {
-        const groupCount = Number(groupRow.count || 1) || 1;
-        const baseSeverity = String(def.severity || 'medium').toLowerCase();
-        const escalatedSeverity = escalateSeverity(baseSeverity, groupCount);
-        const groupId = String(groupRow.id);
-        wsBroadcast('new-alert', {
-          alert: {
-            id: groupId,
-            alert_id: groupId,
-            last_alert_id: alertId,
-            alarmId: alertId,
-            alarm_id: alertId,
-            device_id: deviceId,
-            deviceId,
-            vehicleId: deviceId,
-            device_name: deviceName,
-            deviceName,
-            alert_type: def.name,
-            alarm_type: def.name,
-            type: def.name,
-            title: def.name,
-            alarmText: alarmText || def.name,
-            timestamp: new Date(alarmTs).toISOString(),
-            alarmTs: new Date(alarmTs).toISOString(),
-            last_occurrence: new Date(alarmTs).toISOString(),
-            source_type: 'telematics',
-            severity: escalatedSeverity,
-            priority: escalatedSeverity,
-            base_severity: baseSeverity,
-            escalated: escalatedSeverity !== baseSeverity,
-            status: 'new',
-            resolved: false,
-            count: groupCount,
-            group_key: groupRow.group_key || `${deviceId}:${def.name}`.toLowerCase(),
-            lat: lat ?? null,
-            lon: lon ?? null,
-          },
-        });
-      } catch (_) { /* never block alert emission on WS */ }
+    // A combo-held detection is archived here too (it happened, it just has no
+    // group yet). The pre-existing behaviour for a suppressed/unregistered
+    // vehicle is unchanged: nothing is archived when no combo claimed it and
+    // no group was created.
+    if (groupRows.length > 0 || comboResult.action !== 'pass') {
+      await db.query(
+        `INSERT INTO telematics_events (device_id, vehicle_id, license_plate, fleet_number, plate,
+          event_type, event_code, severity, latitude, longitude, speed, description, zone_name, raw_data, event_time)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+        [
+          deviceId, deviceId, licensePlate || null, fleetNumber || null, licensePlate || null,
+          def.name, signalCode, String(def.severity || 'MEDIUM').toUpperCase(),
+          lat ?? null, lon ?? null, speed ?? null,
+          alarmText || def.name, extra.zoneName || null,
+          JSON.stringify({ signalCode, source: 'deviceStatus', ...extra }),
+          alarmTs,
+        ]
+      ).catch(() => {});
     }
-    console.log(`[DEVSTATUS] alert created group=${groupRow.id} (${def.name}) for ${fleetNumber || deviceId}`);
-    return groupRow;
+
+    // Nothing on the board: either the vehicle is not registered, or a combo is
+    // still waiting for its other members.
+    if (groupRows.length === 0) return null;
+
+    for (const groupRow of groupRows) {
+      const isCombo = groupRow.combo_name != null;
+      const broadcastType = isCombo ? String(groupRow.alarm_type || def.name) : def.name;
+      const broadcastText = isCombo
+        ? `${broadcastType} — ${def.name} combined`
+        : (alarmText || def.name);
+      const baseSeverity = isCombo
+        ? String(groupRow.severity || def.severity || 'MEDIUM').toLowerCase()
+        : String(def.severity || 'medium').toLowerCase();
+
+      if (wsBroadcast) {
+        try {
+          const groupCount = Number(groupRow.count || 1) || 1;
+          const escalatedSeverity = escalateSeverity(baseSeverity, groupCount);
+          const groupId = String(groupRow.id);
+          wsBroadcast('new-alert', {
+            alert: {
+              id: groupId,
+              alert_id: groupId,
+              last_alert_id: alertId,
+              alarmId: alertId,
+              alarm_id: alertId,
+              device_id: deviceId,
+              deviceId,
+              vehicleId: deviceId,
+              device_name: deviceName,
+              deviceName,
+              alert_type: broadcastType,
+              alarm_type: broadcastType,
+              type: broadcastType,
+              title: broadcastType,
+              alarmText: broadcastText,
+              timestamp: new Date(alarmTs).toISOString(),
+              alarmTs: new Date(alarmTs).toISOString(),
+              last_occurrence: new Date(alarmTs).toISOString(),
+              source_type: 'telematics',
+              severity: escalatedSeverity,
+              priority: escalatedSeverity,
+              base_severity: baseSeverity,
+              escalated: escalatedSeverity !== baseSeverity,
+              status: 'new',
+              resolved: false,
+              count: groupCount,
+              combo: isCombo ? groupRow.combo_name : undefined,
+              group_key: groupRow.group_key || `${deviceId}:${broadcastType}`.toLowerCase(),
+              lat: lat ?? null,
+              lon: lon ?? null,
+            },
+          });
+        } catch (_) { /* never block alert emission on WS */ }
+      }
+      console.log(`[DEVSTATUS] alert created group=${groupRow.id} (${broadcastType}) for ${fleetNumber || deviceId}`);
+    }
+    return groupRows[0];
   } catch (error) {
     console.error('[DEVSTATUS] alert emit failed:', error.message);
     return null;

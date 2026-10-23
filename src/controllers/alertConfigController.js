@@ -104,6 +104,7 @@ async function updateAlertDefinition(req, res) {
     if (result.rows.length === 0) return sendError(res, 'Not found', 404);
     sendSuccess(res, result.rows[0], 'Alert definition updated');
     invalidateCache();
+    require('../services/alertCombos').invalidate();
   } catch (error) {
     if (error.code === '23505') return sendError(res, 'An alert definition with this signal code already exists', 409);
     sendError(res, error.message, 500);
@@ -117,6 +118,7 @@ async function deleteAlertDefinition(req, res) {
     await db.query('DELETE FROM alert_definitions WHERE id = $1', [id]);
     sendSuccess(res, { id, purged }, 'Alert definition deleted');
     invalidateCache();
+    require('../services/alertCombos').invalidate();
   } catch (error) {
     sendError(res, error.message, 500);
   }
@@ -151,6 +153,7 @@ async function upsertDefinitionOverride(req, res) {
     );
     sendSuccess(res, result.rows[0], 'Override saved');
     invalidateCache();
+    require('../services/alertCombos').invalidate();
   } catch (error) {
     sendError(res, error.message, 500);
   }
@@ -187,6 +190,7 @@ async function bulkUpsertDefinitionOverrides(req, res) {
     }
     sendSuccess(res, results, `${results.length} override(s) saved`);
     invalidateCache();
+    require('../services/alertCombos').invalidate();
   } catch (error) {
     sendError(res, error.message, 500);
   }
@@ -203,6 +207,7 @@ async function deleteDefinitionOverride(req, res) {
     );
     sendSuccess(res, { definition_id: Number(definition_id), cost_center_id: Number(cc_id) }, 'Override deleted');
     invalidateCache();
+    require('../services/alertCombos').invalidate();
   } catch (error) {
     sendError(res, error.message, 500);
   }
@@ -288,6 +293,7 @@ async function deleteAllDefinitionOverrides(req, res) {
       `Removed from ${result.rowCount} cost center set(s), purged ${purged.alerts} alert(s) / ${purged.groups} group(s)`
     );
     invalidateCache();
+    require('../services/alertCombos').invalidate();
   } catch (error) {
     sendError(res, error.message, 500);
   }
@@ -351,18 +357,66 @@ async function listAlertGroupConfigs(req, res) {
 }
 
 const VALID_SEVERITY = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'];
+const MIN_COMBO_WINDOW_SECONDS = 30;
+const MAX_COMBO_WINDOW_SECONDS = 86400;
+
+// A combo only makes sense with at least two members, otherwise it would hold
+// back an alert forever waiting for itself. groupId is null on CREATE, where the
+// member rows do not exist yet, so validate the ids against alert_definitions.
+async function validateComboMembers(groupId, memberIds, comboEnabled) {
+  if (!comboEnabled) return null;
+  const ids = Array.isArray(memberIds) ? memberIds.map(Number).filter(Number.isInteger) : [];
+  if (ids.length < 2) {
+    return 'A combo needs at least 2 alert types. Add another member, or turn the combo off.';
+  }
+  const active = groupId
+    ? await db.query(
+      `SELECT d.id, d.name
+       FROM alert_group_config_members m
+       JOIN alert_definitions d ON d.id = m.alert_definition_id
+       WHERE m.group_config_id = $1 AND d.id = ANY($2::int[]) AND d.is_active IS DISTINCT FROM false`,
+      [groupId, ids]
+    )
+    : await db.query(
+      `SELECT d.id, d.name FROM alert_definitions d
+       WHERE d.id = ANY($1::int[]) AND d.is_active IS DISTINCT FROM false`,
+      [ids]
+    );
+  if (active.rows.length < 2) {
+    return 'A combo needs at least 2 ACTIVE alert types.';
+  }
+  return null;
+}
+
+function normalizeComboWindow(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 300;
+  return Math.min(MAX_COMBO_WINDOW_SECONDS, Math.max(MIN_COMBO_WINDOW_SECONDS, Math.round(n)));
+}
 
 async function createAlertGroupConfig(req, res) {
   try {
-    const { name, severity, description = '', member_ids = [] } = req.body;
+    const {
+      name,
+      severity,
+      description = '',
+      member_ids = [],
+      combo_enabled = false,
+      combo_window_seconds,
+    } = req.body;
     if (!name) return sendError(res, 'name required', 400);
     const sev = (severity || 'MEDIUM').toUpperCase();
     if (!VALID_SEVERITY.includes(sev)) return sendError(res, 'severity must be CRITICAL, HIGH, MEDIUM, or LOW', 400);
 
+    const comboOn = combo_enabled === true || combo_enabled === 'true';
+    const comboWindow = normalizeComboWindow(combo_window_seconds);
+    const comboError = await validateComboMembers(null, member_ids, comboOn);
+    if (comboError) return sendError(res, comboError, 400);
+
     const groupResult = await db.query(
-      `INSERT INTO alert_group_configs (name, severity, description)
-       VALUES ($1, $2, $3) RETURNING *`,
-      [name.trim(), sev, description]
+      `INSERT INTO alert_group_configs (name, severity, description, combo_enabled, combo_window_seconds)
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [name.trim(), sev, description, comboOn, comboWindow]
     );
     const group = groupResult.rows[0];
 
@@ -381,6 +435,7 @@ async function createAlertGroupConfig(req, res) {
       [group.id]
     );
 
+    require('../services/alertCombos').invalidate();
     sendSuccess(res, { ...group, members: members.rows }, 'Alert group config created');
   } catch (error) {
     sendError(res, error.message, 500);
@@ -390,10 +445,42 @@ async function createAlertGroupConfig(req, res) {
 async function updateAlertGroupConfig(req, res) {
   try {
     const { id } = req.params;
-    const { name, severity, description, is_active, member_ids } = req.body;
+    const {
+      name,
+      severity,
+      description,
+      is_active,
+      member_ids,
+      combo_enabled,
+      combo_window_seconds,
+    } = req.body;
     const fields = [];
     const values = [];
     let idx = 1;
+
+    // A combo must keep enough members to ever complete, so validate the member set
+    // that will exist AFTER the update — before anything is written. This runs
+    // whenever members change or the combo is being switched on, and also when
+    // the group is already a combo and only its members are edited.
+    const touchesCombo = combo_enabled !== undefined || Array.isArray(member_ids);
+    if (touchesCombo) {
+      const current = await db.query(
+        'SELECT combo_enabled FROM alert_group_configs WHERE id = $1',
+        [id]
+      );
+      const currentlyOn = current.rows[0]?.combo_enabled === true;
+      const turningOn = combo_enabled === true || combo_enabled === 'true';
+      if (currentlyOn || turningOn) {
+        const nextMembers = Array.isArray(member_ids)
+          ? member_ids
+          : (await db.query(
+            `SELECT alert_definition_id AS id FROM alert_group_config_members WHERE group_config_id = $1`,
+            [id]
+          )).rows.map((r) => r.id);
+        const comboError = await validateComboMembers(id, nextMembers, true);
+        if (comboError) return sendError(res, comboError, 400);
+      }
+    }
 
     if (name !== undefined) { fields.push(`name = $${idx++}`); values.push(name.trim()); }
     if (severity !== undefined) {
@@ -403,6 +490,11 @@ async function updateAlertGroupConfig(req, res) {
     }
     if (description !== undefined) { fields.push(`description = $${idx++}`); values.push(description); }
     if (is_active !== undefined) { fields.push(`is_active = $${idx++}`); values.push(is_active); }
+    if (combo_enabled !== undefined) { fields.push(`combo_enabled = $${idx++}`); values.push(comboOn === true); }
+    if (combo_window_seconds !== undefined) {
+      fields.push(`combo_window_seconds = $${idx++}`);
+      values.push(normalizeComboWindow(combo_window_seconds));
+    }
     fields.push(`updated_at = NOW()`);
 
     if (fields.length > 1) {
@@ -434,6 +526,7 @@ async function updateAlertGroupConfig(req, res) {
     );
 
     if (group.rows.length === 0) return sendError(res, 'Not found', 404);
+    require('../services/alertCombos').invalidate();
     sendSuccess(res, { ...group.rows[0], members: members.rows }, 'Alert group config updated');
   } catch (error) {
     sendError(res, error.message, 500);
@@ -444,7 +537,38 @@ async function deleteAlertGroupConfig(req, res) {
   try {
     const { id } = req.params;
     await db.query('DELETE FROM alert_group_configs WHERE id = $1', [id]);
+    require('../services/alertCombos').invalidate();
     sendSuccess(res, { id }, 'Alert group config deleted');
+  } catch (error) {
+    sendError(res, error.message, 500);
+  }
+}
+
+// Combo health for the settings UI. Reports, per combo, any member that is not
+// in a cost centre's alert set — such a member never produces a detection, so
+// the combo can never complete there. Purely informational: combos are allowed
+// to be enabled anyway.
+async function listGroupComboWarnings(req, res) {
+  try {
+    const { cost_center_id } = req.query;
+    const ccId = cost_center_id === undefined || cost_center_id === '' ? null : Number(cost_center_id);
+    const { listMembersMissingFromCostCenter } = require('../db/combo_groups');
+    const { listEnabledCombos } = require('../services/alertCombos');
+
+    const combos = await listEnabledCombos(ccId);
+    const warnings = [];
+    for (const combo of combos) {
+      const missing = ccId == null ? [] : await listMembersMissingFromCostCenter(combo.id, ccId);
+      warnings.push({
+        id: combo.id,
+        name: combo.name,
+        severity: combo.severity,
+        window_seconds: combo.window_seconds,
+        member_names: combo.member_names,
+        missing_member_names: missing.map((m) => m.name),
+      });
+    }
+    sendSuccess(res, warnings, 'Combo warnings retrieved');
   } catch (error) {
     sendError(res, error.message, 500);
   }
@@ -477,6 +601,7 @@ async function upsertGroupConfigOverride(req, res) {
     );
     sendSuccess(res, result.rows[0], 'Override saved');
     invalidateCache();
+    require('../services/alertCombos').invalidate();
   } catch (error) {
     sendError(res, error.message, 500);
   }
@@ -511,6 +636,7 @@ async function bulkUpsertGroupConfigOverrides(req, res) {
     }
     sendSuccess(res, results, `${results.length} override(s) saved`);
     invalidateCache();
+    require('../services/alertCombos').invalidate();
   } catch (error) {
     sendError(res, error.message, 500);
   }
@@ -555,6 +681,7 @@ async function deleteGroupConfigOverride(req, res) {
     );
     sendSuccess(res, { group_config_id: Number(group_id), cost_center_id: Number(cc_id) }, 'Override deleted');
     invalidateCache();
+    require('../services/alertCombos').invalidate();
   } catch (error) {
     sendError(res, error.message, 500);
   }
@@ -575,6 +702,7 @@ module.exports = {
   createAlertGroupConfig,
   updateAlertGroupConfig,
   deleteAlertGroupConfig,
+  listGroupComboWarnings,
   upsertGroupConfigOverride,
   bulkUpsertGroupConfigOverrides,
   deleteGroupConfigOverride,

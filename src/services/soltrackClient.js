@@ -198,19 +198,47 @@ async function handleFrame(frame) {
       try {
         // No per-event row in `alerts` — alert_groups is the store, and the
         // event archive is telematics_events (written below).
-        const groupRow = await db.upsertAlertGroup({
+        // A member of an enabled AND-combination group is held back until the
+        // whole set fires for this vehicle; then one merged group is raised.
+        const alertCombos = require('./alertCombos');
+        const comboResult = await alertCombos.handleDetection({
+          alertId,
           deviceId: fleetNumber,
           deviceName,
           alarmType: matchedDef.name,
           alarmText,
-          alertId,
           alarmTs: eventTime,
           lat: frame.lat,
           lon: frame.lon,
           speed: speed ?? null,
-          sourceType: 'telematics',
           severity: String(matchedDef.severity || 'MEDIUM').toLowerCase(),
+          fleetNumber,
+          sourceType: 'telematics',
+          costCenterId: ccId,
         });
+        let groupRows = comboResult.groupRows;
+        if (comboResult.action === 'pass') {
+          const created = await db.upsertAlertGroup({
+            deviceId: fleetNumber,
+            deviceName,
+            alarmType: matchedDef.name,
+            alarmText,
+            alertId,
+            alarmTs: eventTime,
+            lat: frame.lat,
+            lon: frame.lon,
+            speed: speed ?? null,
+            sourceType: 'telematics',
+            severity: String(matchedDef.severity || 'MEDIUM').toLowerCase(),
+          });
+          groupRows = created ? [created] : [];
+        }
+        const groupRow = groupRows[0] || null;
+        const isComboRow = comboResult.action === 'raised' && groupRow && groupRow.combo_name != null;
+        const broadcastType = isComboRow ? String(groupRow.alarm_type || matchedDef.name) : matchedDef.name;
+        const broadcastSeverity = isComboRow
+          ? String(groupRow.severity || matchedDef.severity || 'MEDIUM').toLowerCase()
+          : String(severity || 'medium').toLowerCase();
 
         await db.query(
           `INSERT INTO telematics_events (device_id, vehicle_id, license_plate, fleet_number, plate,
@@ -229,7 +257,7 @@ async function handleFrame(frame) {
         if (wsBroadcast) {
           try {
             const groupCount = Number(groupRow?.count || 1) || 1;
-            const baseSeverity = String(severity || 'medium').toLowerCase();
+            const baseSeverity = broadcastSeverity;
             const escalatedSeverity = escalateSeverity(baseSeverity, groupCount);
             // Resolve targets alert_groups.id only — never the stl- event key.
             const groupId = groupRow?.id != null ? String(groupRow.id) : '';
@@ -246,11 +274,11 @@ async function handleFrame(frame) {
                 vehicleId: fleetNumber,
                 device_name: deviceName,
                 deviceName,
-                alert_type: matchedDef.name,
-                alarm_type: matchedDef.name,
-                type: matchedDef.name,
-                title: matchedDef.name,
-                alarmText,
+                alert_type: broadcastType,
+                alarm_type: broadcastType,
+                type: broadcastType,
+                title: broadcastType,
+                alarmText: isComboRow ? `${broadcastType} — ${matchedDef.name} combined` : alarmText,
                 timestamp: new Date(eventTime).toISOString(),
                 alarmTs: new Date(eventTime).toISOString(),
                 last_occurrence: new Date(eventTime).toISOString(),
@@ -262,7 +290,8 @@ async function handleFrame(frame) {
                 status: 'new',
                 resolved: false,
                 count: groupCount,
-                group_key: groupRow?.group_key || `${fleetNumber}:${matchedDef.name}`.toLowerCase(),
+                combo: isComboRow ? groupRow.combo_name : undefined,
+                group_key: groupRow?.group_key || `${fleetNumber}:${broadcastType}`.toLowerCase(),
                 lat: frame.lat,
                 lon: frame.lon,
                 fleet_number: fleetNumber,

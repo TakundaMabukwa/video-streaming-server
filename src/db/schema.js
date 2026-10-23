@@ -79,6 +79,11 @@ const MIGRATIONS_SQL = `
   ALTER TABLE alerts ADD COLUMN IF NOT EXISTS notes TEXT;
   ALTER TABLE alerts ADD COLUMN IF NOT EXISTS documents JSONB DEFAULT '[]'::jsonb;
 
+  -- combo_state marks a detection that is being held back by an enabled
+  -- AND-combination alert group. Declared here (not just in the migrations
+  -- block) because the backfill below reads it.
+  ALTER TABLE alerts ADD COLUMN IF NOT EXISTS combo_state TEXT;
+
   CREATE INDEX IF NOT EXISTS idx_alerts_device_ts ON alerts(device_id, alarm_ts DESC);
   CREATE INDEX IF NOT EXISTS idx_alerts_type_ts ON alerts(alarm_type, alarm_ts DESC);
   CREATE INDEX IF NOT EXISTS idx_alert_media_alert_file ON alert_media(alert_id, file_url);
@@ -135,6 +140,9 @@ const MIGRATIONS_SQL = `
       AND COALESCE(g.source_type, 'video') = COALESCE(a.source_type, 'video')
       AND g.resolved = FALSE AND g.false_alert = FALSE
   )
+  -- A detection held back by a combo must never be backfilled into a group on
+  -- a restart: it only becomes an alert once the whole set fires.
+  AND a.combo_state IS DISTINCT FROM 'pending'
   GROUP BY a.device_id, a.device_name, a.alarm_type, a.alarm_text, a.source_type
   ON CONFLICT (group_key) DO NOTHING;
 
@@ -161,11 +169,18 @@ const MIGRATIONS_SQL = `
     severity TEXT NOT NULL DEFAULT 'MEDIUM',
     description TEXT DEFAULT '',
     is_active BOOLEAN DEFAULT TRUE,
+    -- COMBO MODE: when combo_enabled is true this group stops being a passive
+    -- grouping and becomes an AND-combination trigger — its member alerts are
+    -- held back individually and only surface as ONE merged alert once every
+    -- member has fired for the same vehicle inside combo_window_seconds.
+    combo_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    combo_window_seconds INTEGER NOT NULL DEFAULT 300,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
   );
 
-  -- Junction: which alert definitions belong to which group config
+  -- Junction: which alert definitions belong to which group config.
+  -- A definition may belong to MANY groups (combo or not).
   CREATE TABLE IF NOT EXISTS alert_group_config_members (
     id SERIAL PRIMARY KEY,
     group_config_id INTEGER NOT NULL REFERENCES alert_group_configs(id) ON DELETE CASCADE,
@@ -173,6 +188,28 @@ const MIGRATIONS_SQL = `
     created_at TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE(group_config_id, alert_definition_id)
   );
+
+  -- Combo staging: one row per (combo, detection) held back until the combo
+  -- completes. A detection can be staged in several combos at once, so this is
+  -- a join table rather than a column on alerts. alerts.alert_group_id stays
+  -- NULL while a row is pending — that is what keeps partials off the board.
+  CREATE TABLE IF NOT EXISTS alert_combo_events (
+    id SERIAL PRIMARY KEY,
+    combo_group_config_id INTEGER NOT NULL REFERENCES alert_group_configs(id) ON DELETE CASCADE,
+    alert_id TEXT NOT NULL REFERENCES alerts(id) ON DELETE CASCADE,
+    device_id TEXT NOT NULL,
+    alarm_type TEXT NOT NULL,
+    alarm_ts TIMESTAMPTZ,
+    state TEXT NOT NULL DEFAULT 'pending',
+    alert_group_id INTEGER REFERENCES alert_groups(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(combo_group_config_id, alert_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_alert_combo_events_pending
+    ON alert_combo_events(combo_group_config_id, device_id, state, alarm_ts DESC);
+  CREATE INDEX IF NOT EXISTS idx_alert_combo_events_alert
+    ON alert_combo_events(alert_id);
 
   CREATE INDEX IF NOT EXISTS idx_alert_definitions_category ON alert_definitions(category);
   DO $$
@@ -1200,6 +1237,44 @@ const MIGRATIONS_SQL = `
   CROSS JOIN cost_centers cc
   WHERE cc.is_active IS DISTINCT FROM false
   ON CONFLICT (alert_definition_id, cost_center_id) DO NOTHING;
+
+  -- ── COMBO MODE (AND-combination alert groups) ──
+  -- combo_enabled defaults FALSE, so every existing group config stays a passive
+  -- grouping and detection behaviour is unchanged until a group is explicitly
+  -- turned into a combo.
+  ALTER TABLE alert_group_configs ADD COLUMN IF NOT EXISTS combo_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+  ALTER TABLE alert_group_configs ADD COLUMN IF NOT EXISTS combo_window_seconds INTEGER NOT NULL DEFAULT 300;
+
+  -- alerts.combo_state marks a detection row that is being held back by a combo.
+  -- 'pending' rows are filtered out of every list so a partial never surfaces;
+  -- it is cleared to NULL the moment the detection is linked to a group, which
+  -- makes it a normal row again.
+  ALTER TABLE alerts ADD COLUMN IF NOT EXISTS combo_state TEXT;
+  CREATE INDEX IF NOT EXISTS idx_alerts_combo_state ON alerts(combo_state) WHERE combo_state = 'pending';
+
+  -- Staging join table (see SCHEMA_SQL for the full definition).
+  CREATE TABLE IF NOT EXISTS alert_combo_events (
+    id SERIAL PRIMARY KEY,
+    combo_group_config_id INTEGER NOT NULL REFERENCES alert_group_configs(id) ON DELETE CASCADE,
+    alert_id TEXT NOT NULL REFERENCES alerts(id) ON DELETE CASCADE,
+    device_id TEXT NOT NULL,
+    alarm_type TEXT NOT NULL,
+    alarm_ts TIMESTAMPTZ,
+    state TEXT NOT NULL DEFAULT 'pending',
+    alert_group_id INTEGER REFERENCES alert_groups(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(combo_group_config_id, alert_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_alert_combo_events_pending
+    ON alert_combo_events(combo_group_config_id, device_id, state, alarm_ts DESC);
+  CREATE INDEX IF NOT EXISTS idx_alert_combo_events_alert
+    ON alert_combo_events(alert_id);
+
+  -- One detection must not satisfy two combos at once: when a combo fires, any
+  -- other pending staging row for the same alert is retired.
+  CREATE INDEX IF NOT EXISTS idx_alert_combo_events_by_alert_pending
+    ON alert_combo_events(alert_id) WHERE state = 'pending';
 `;
 
 async function initializeDatabase() {

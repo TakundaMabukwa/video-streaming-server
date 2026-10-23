@@ -963,7 +963,8 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
 
       // No per-event row in `alerts` — alert_groups is the store, and the
       // per-event archive is telematics_events (history reads it directly).
-      const groupRow = await db.upsertAlertGroup({
+      // A member of an enabled combo is held back until the whole set fires.
+      const groupRows = await emitTelematicsAlert({
         deviceId: geotabDeviceId,
         deviceName,
         alarmType: matchedDef.name,
@@ -973,60 +974,68 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
         lat: evtLat,
         lon: evtLon,
         speed: evtSpeed ?? null,
-        sourceType: 'telematics',
-        severity: String(matchedDef.severity || 'MEDIUM').toLowerCase(),
+        severity: String(matchedDef.severity || 'MEDIUM'),
         fleetNumber: fleetNumber || null,
         registration: licensePlate || null,
-      });
-      if (!groupRow) continue; // vehicle not in fleet_vehicles — no alert
-      alerted++;
+        costCenterId: eventCC,
+        onRaised: (groupRow, comboResult) => {
+          if (groupRows.length === 0) return;
+          alerted++;
+          const isCombo = comboResult.action === 'raised' && groupRow.combo_name != null;
+          const broadcastType = isCombo ? String(groupRow.alarm_type || matchedDef.name) : matchedDef.name;
+          const baseSeverity = isCombo
+            ? String(groupRow.severity || matchedDef.severity || 'MEDIUM').toLowerCase()
+            : String(matchedDef.severity || 'medium').toLowerCase();
 
-      if (wsBroadcast) {
-        try {
-          const alarmText = `${eventName}${zoneNameFromEvent ? ' in zone ' + zoneNameFromEvent : ''}`;
-          const groupCount = Number(groupRow?.count || 1) || 1;
-          const baseSeverity = String(matchedDef.severity || 'medium').toLowerCase();
-          const escalatedSeverity = escalateSeverity(baseSeverity, groupCount);
-          // Resolve targets alert_groups.id only — never the tel-/stl- event key.
-          const groupId = groupRow?.id != null ? String(groupRow.id) : '';
-          if (groupId) {
-            wsBroadcast('new-alert', {
-              alert: {
-                id: groupId,
-                alert_id: groupId,
-                last_alert_id: alertId,
-                alarmId: alertId,
-                alarm_id: alertId,
-                device_id: geotabDeviceId,
-                deviceId: geotabDeviceId,
-                vehicleId: geotabDeviceId,
-                device_name: deviceName,
-                deviceName,
-                alert_type: matchedDef.name,
-                alarm_type: matchedDef.name,
-                type: matchedDef.name,
-                title: matchedDef.name,
-                alarmText,
-                timestamp: new Date(eventTime).toISOString(),
-                alarmTs: new Date(eventTime).toISOString(),
-                last_occurrence: new Date(eventTime).toISOString(),
-                source_type: 'telematics',
-                severity: escalatedSeverity,
-                priority: escalatedSeverity,
-                base_severity: baseSeverity,
-                escalated: escalatedSeverity !== baseSeverity,
-                status: 'new',
-                resolved: false,
-                count: groupCount,
-                group_key: groupRow?.group_key || `${geotabDeviceId}:${matchedDef.name}`.toLowerCase(),
-                lat: evtLat,
-                lon: evtLon,
-              },
-            });
+          if (wsBroadcast) {
+            try {
+              const alarmText = `${eventName}${zoneNameFromEvent ? ' in zone ' + zoneNameFromEvent : ''}`;
+              const groupCount = Number(groupRow?.count || 1) || 1;
+              const escalatedSeverity = escalateSeverity(baseSeverity, groupCount);
+              // Resolve targets alert_groups.id only — never the tel-/stl- event key.
+              const groupId = groupRow?.id != null ? String(groupRow.id) : '';
+              if (groupId) {
+                wsBroadcast('new-alert', {
+                  alert: {
+                    id: groupId,
+                    alert_id: groupId,
+                    last_alert_id: alertId,
+                    alarmId: alertId,
+                    alarm_id: alertId,
+                    device_id: geotabDeviceId,
+                    deviceId: geotabDeviceId,
+                    vehicleId: geotabDeviceId,
+                    device_name: deviceName,
+                    deviceName,
+                    alert_type: broadcastType,
+                    alarm_type: broadcastType,
+                    type: broadcastType,
+                    title: broadcastType,
+                    alarmText: isCombo ? `${broadcastType} — ${matchedDef.name} combined` : alarmText,
+                    timestamp: new Date(eventTime).toISOString(),
+                    alarmTs: new Date(eventTime).toISOString(),
+                    last_occurrence: new Date(eventTime).toISOString(),
+                    source_type: 'telematics',
+                    severity: escalatedSeverity,
+                    priority: escalatedSeverity,
+                    base_severity: baseSeverity,
+                    escalated: escalatedSeverity !== baseSeverity,
+                    status: 'new',
+                    resolved: false,
+                    count: groupCount,
+                    combo: isCombo ? groupRow.combo_name : undefined,
+                    group_key: groupRow?.group_key || `${geotabDeviceId}:${broadcastType}`.toLowerCase(),
+                    lat: evtLat,
+                    lon: evtLon,
+                  },
+                });
+              }
+            } catch (_) { /* never block ingest on WS */ }
           }
-        } catch (_) { /* never block ingest on WS */ }
-      }
-      console.log(`[GEOTAB] Telematics alert created: ${alertId} group=${groupRow?.id} (${matchedDef.name}) for device ${geotabDeviceId}`);
+          console.log(`[GEOTAB] Telematics alert created: ${alertId} group=${groupRow?.id} (${broadcastType}) for device ${geotabDeviceId}`);
+        },
+      });
+      if (groupRows.length === 0) continue; // vehicle not in fleet_vehicles, or a combo is still assembling
     } catch (err) {
       // skip individual event errors so one bad event can't stall the batch
     }
@@ -1326,7 +1335,8 @@ async function createZoneEntryAlert({ deviceId, fleetNumber, licensePlate, lat, 
     const alarmText = `${defName} in zone ${zone.name}`;
 
     // No per-event row in `alerts` — alert_groups is the store.
-    const groupRow = await db.upsertAlertGroup({
+    // A member of an enabled combo is held back until the whole set fires.
+    const groupRows = await emitTelematicsAlert({
       deviceId,
       deviceName,
       alarmType: matchedDef.name,
@@ -1336,17 +1346,68 @@ async function createZoneEntryAlert({ deviceId, fleetNumber, licensePlate, lat, 
       lat,
       lon,
       speed: speed ?? null,
-      sourceType: 'telematics',
-      severity: String(matchedDef.severity || 'MEDIUM').toLowerCase(),
+      severity: String(matchedDef.severity || 'MEDIUM'),
       fleetNumber: fleetNumber || null,
       registration: licensePlate || null,
+      costCenterId: eventCC,
+      onRaised: (groupRow, comboResult) => {
+        const isCombo = comboResult.action === 'raised' && groupRow.combo_name != null;
+        const broadcastType = isCombo ? String(groupRow.alarm_type || matchedDef.name) : matchedDef.name;
+        const baseSeverity = isCombo
+          ? String(groupRow.severity || matchedDef.severity || 'MEDIUM').toLowerCase()
+          : String(matchedDef.severity || 'medium').toLowerCase();
+
+        if (wsBroadcast) {
+          try {
+            const groupCount = Number(groupRow.count || 1) || 1;
+            const escalatedSeverity = escalateSeverity(baseSeverity, groupCount);
+            const groupId = String(groupRow.id);
+            wsBroadcast('new-alert', {
+              alert: {
+                id: groupId,
+                alert_id: groupId,
+                last_alert_id: alertId,
+                alarmId: alertId,
+                alarm_id: alertId,
+                device_id: deviceId,
+                deviceId: deviceId,
+                vehicleId: deviceId,
+                device_name: deviceName,
+                deviceName,
+                alert_type: broadcastType,
+                alarm_type: broadcastType,
+                type: broadcastType,
+                title: broadcastType,
+                alarmText: isCombo ? `${broadcastType} — ${matchedDef.name} combined` : alarmText,
+                timestamp: new Date(entryTime).toISOString(),
+                alarmTs: new Date(entryTime).toISOString(),
+                last_occurrence: new Date(entryTime).toISOString(),
+                source_type: 'telematics',
+                severity: escalatedSeverity,
+                priority: escalatedSeverity,
+                base_severity: baseSeverity,
+                escalated: escalatedSeverity !== baseSeverity,
+                status: 'new',
+                resolved: false,
+                count: groupCount,
+                combo: isCombo ? groupRow.combo_name : undefined,
+                group_key: groupRow.group_key || `${deviceId}:${broadcastType}`.toLowerCase(),
+                lat,
+                lon,
+              },
+            });
+          } catch (_) { /* never block zone check on WS */ }
+        }
+        console.log(`[GEOTAB] Zone alert created: ${alertId} group=${groupRow.id} (${broadcastType}) for ${fleetNumber || deviceId} in ${zone.name}`);
+      },
     });
-    if (!groupRow || groupRow.id == null) return null;
+    const groupRow = groupRows[0];
 
     // Archive the polygon-fallback entry in telematics_events — history reads
     // that table as the telematics source now (no `alerts` row is written).
     // Distinct event_code so it is never mistaken for a Geotab-fired event in
-    // the "Geotab already stored" dedup check above.
+    // the "Geotab already stored" dedup check above. Archived before the early
+    // return so a combo-held entry is still recorded, just without a group.
     await db.query(
       `INSERT INTO telematics_events (device_id, vehicle_id, license_plate, fleet_number, plate,
         event_type, event_code, severity, latitude, longitude, speed, description, zone_name, raw_data, event_time)
@@ -1361,53 +1422,82 @@ async function createZoneEntryAlert({ deviceId, fleetNumber, licensePlate, lat, 
       ]
     ).catch((e) => console.error('[GEOTAB] Zone event archive failed:', e.message));
 
-    if (wsBroadcast) {
-      try {
-        const groupCount = Number(groupRow.count || 1) || 1;
-        const baseSeverity = String(matchedDef.severity || 'medium').toLowerCase();
-        const escalatedSeverity = escalateSeverity(baseSeverity, groupCount);
-        const groupId = String(groupRow.id);
-        wsBroadcast('new-alert', {
-          alert: {
-            id: groupId,
-            alert_id: groupId,
-            last_alert_id: alertId,
-            alarmId: alertId,
-            alarm_id: alertId,
-            device_id: deviceId,
-            deviceId,
-            vehicleId: deviceId,
-            device_name: deviceName,
-            deviceName,
-            alert_type: matchedDef.name,
-            alarm_type: matchedDef.name,
-            type: matchedDef.name,
-            title: matchedDef.name,
-            alarmText,
-            timestamp: new Date(entryTime).toISOString(),
-            alarmTs: new Date(entryTime).toISOString(),
-            last_occurrence: new Date(entryTime).toISOString(),
-            source_type: 'telematics',
-            severity: escalatedSeverity,
-            priority: escalatedSeverity,
-            base_severity: baseSeverity,
-            escalated: escalatedSeverity !== baseSeverity,
-            status: 'new',
-            resolved: false,
-            count: groupCount,
-            group_key: groupRow.group_key || `${deviceId}:${matchedDef.name}`.toLowerCase(),
-            lat,
-            lon,
-          },
-        });
-      } catch (_) { /* never block zone check on WS */ }
-    }
-    console.log(`[GEOTAB] Zone alert created: ${alertId} group=${groupRow.id} (${matchedDef.name}) for ${fleetNumber || deviceId} in ${zone.name}`);
+    if (!groupRow || groupRow.id == null) return null;
+
     return groupRow;
   } catch (error) {
     console.error('[GEOTAB] Zone entry alert failed:', error.message);
     return null;
   }
+}
+
+// ── Combo-aware telematics alert emission ──
+//
+// A member of an enabled AND-combination group is held back (stored, evidence
+// captured, nothing on the board) until every member has fired for the vehicle
+// inside the group's window. When a combo completes, one merged group already
+// exists and is broadcast here. Anything not claimed by a combo takes the
+// unchanged single-alert path.
+//
+// Returns the list of alert_groups rows that now represent this detection.
+async function emitTelematicsAlert({
+  deviceId,
+  deviceName,
+  alarmType,
+  alarmText,
+  alertId,
+  alarmTs,
+  lat,
+  lon,
+  speed,
+  severity,
+  fleetNumber,
+  registration,
+  costCenterId,
+  onRaised = null,
+}) {
+  const memberSeverity = String(severity || 'MEDIUM').toLowerCase();
+  const alertCombos = require('./alertCombos');
+  const comboResult = await alertCombos.handleDetection({
+    alertId,
+    deviceId,
+    deviceName,
+    alarmType,
+    alarmText,
+    alarmTs,
+    lat: lat ?? null,
+    lon: lon ?? null,
+    speed: speed ?? null,
+    severity: memberSeverity,
+    fleetNumber: fleetNumber || null,
+    sourceType: 'telematics',
+    costCenterId,
+  });
+
+  let groupRows = comboResult.groupRows;
+  if (comboResult.action === 'pass') {
+    const created = await db.upsertAlertGroup({
+      deviceId,
+      deviceName,
+      alarmType,
+      alarmText,
+      alertId,
+      alarmTs,
+      lat,
+      lon,
+      speed: speed ?? null,
+      sourceType: 'telematics',
+      severity: memberSeverity,
+      fleetNumber: fleetNumber || null,
+      registration: registration || null,
+    });
+    groupRows = created ? [created] : [];
+  }
+
+  for (const groupRow of groupRows) {
+    if (onRaised) onRaised(groupRow, comboResult);
+  }
+  return groupRows;
 }
 
 async function checkZoneBreaches(deviceId, lat, lon, speed, fleetNumber, licensePlate) {
