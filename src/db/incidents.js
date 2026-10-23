@@ -13,7 +13,8 @@ function incidentSelectColumns() {
   return `id, incident_no, alert_id, alert_group_key, alarm_type, source_type, device_id, fleet_number, cost_center_id,
     week, shift, incident_date, incident_time, controller, driver_name, contact_number, id_number, division,
     infringement, infringement_detail, action_taken, outcome, notes, document_link, document_type, status,
-    filled_by, filled_at, resolved_by, resolved_at, closure_type, deduction_applied, created_at, updated_at`;
+    filled_by, filled_at, resolved_by, resolved_at, closure_type, deduction_applied, created_at, updated_at,
+    EXISTS (SELECT 1 FROM ncr_forms nf WHERE nf.incident_id = incidents.id) AS has_ncr`;
 }
 
 // Insert an incident captured from an alert (auto-NCR or manual close).
@@ -171,7 +172,7 @@ async function getIncident(id) {
   return result.rows[0] || null;
 }
 
-async function getIncidents({ cost_center_id, cost_center_ids, fleet_number, status, from, to, pageSize = 50, pageIndex = 1 } = {}) {
+async function getIncidents({ cost_center_id, cost_center_ids, fleet_number, status, from, to, hasNcr = false, pageSize = 50, pageIndex = 1 } = {}) {
   const conditions = [];
   const params = [];
   const limit = Math.min(Math.max(parseInt(pageSize) || 50, 1), 500);
@@ -213,6 +214,12 @@ async function getIncidents({ cost_center_id, cost_center_ids, fleet_number, sta
   } else if (to) {
     params.push(to);
     conditions.push(`incident_date <= $${params.length}`);
+  }
+  // Only incidents that actually have an NCR document. Applied in SQL so the
+  // row set AND the total stay consistent — filtering after the fact would
+  // report the unfiltered total and leave pages half empty.
+  if (hasNcr === true || hasNcr === 'true' || hasNcr === 1 || hasNcr === '1') {
+    conditions.push(`EXISTS (SELECT 1 FROM ncr_forms nf WHERE nf.incident_id = incidents.id)`);
   }
 
   const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';

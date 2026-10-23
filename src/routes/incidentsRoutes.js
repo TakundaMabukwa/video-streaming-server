@@ -5,7 +5,7 @@ const db = require('../db');
 // GET /api/incidents - Incident register list (paginated)
 router.get('/', async (req, res) => {
   try {
-    const { cost_center_id, cost_center_ids, fleet_number, status, from, to, pageSize, pageIndex } = req.query;
+    const { cost_center_id, cost_center_ids, fleet_number, status, from, to, has_ncr, pageSize, pageIndex } = req.query;
     const data = await db.getIncidents({
       cost_center_id,
       cost_center_ids,
@@ -13,6 +13,8 @@ router.get('/', async (req, res) => {
       status,
       from,
       to,
+      // Only incidents that actually have an NCR document attached.
+      hasNcr: has_ncr,
       pageSize: parseInt(pageSize) || 50,
       pageIndex: parseInt(pageIndex) || 1,
     });
