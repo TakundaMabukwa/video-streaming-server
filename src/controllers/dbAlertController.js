@@ -653,6 +653,30 @@ async function getAlertScreenshots(req, res) {
 
     const { group, alertId } = await resolveMediaAlertId(id);
 
+    // Combination group: evidence from every member, tagged with its alert type.
+    const comboMembers = group ? await getDistinctTypeMembers(group.id).catch(() => []) : [];
+    if (comboMembers.length > 0) {
+      const { media: allMedia, partial } = await fetchMediaForMembers(comboMembers);
+      const shots = allMedia
+        .filter((m) => m.file_type === '00' || !m.file_type || m.file_type === '01')
+        .map((m, i) => ({
+          id: m.id || `shot-${i}`,
+          url: m.file_url,
+          storage_url: m.file_url,
+          timestamp: m.created_at || m.alarm_time,
+          alarm_type: m._member_type || null,
+          member_alert_id: m._member_alert_id || null,
+        }));
+      return res.json({
+        success: true,
+        screenshots: shots,
+        count: shots.length,
+        source: 'skycamx',
+        combo: true,
+        partial,
+      });
+    }
+
     // Always live-fetch from skycamx — alert_media is never consulted.
     const rawAlert = await loadRawAlertForSkycam(id, group, alertId);
     if (!rawAlert) {
@@ -725,6 +749,70 @@ async function loadRawAlertForSkycam(id, group, alertId) {
   return null;
 }
 
+// ── Combination media ────────────────────────────────────────────────
+// A normal alert group holds many detections of the SAME alert type, so
+// fetching the newest member is representative and cheap. An AND-combination
+// group holds members of DIFFERENT types (e.g. a telematics fatigue event and
+// a video lane departure), and evidence for only one side would hide the other.
+// When a group's members span more than one alert type, every member is
+// fetched and the results merged, each tagged with the member it came from.
+const COMBO_MEDIA_MAX_MEMBERS = 8;
+const COMBO_MEDIA_CONCURRENCY = 3;
+
+async function getDistinctTypeMembers(groupId, limit = COMBO_MEDIA_MAX_MEMBERS) {
+  const result = await db.query(
+    `SELECT id, device_id, device_name, alarm_type, alarm_text, alarm_ts, alarm_ts_end,
+            lat, lon, speed, severity, fleet_number, source_type
+     FROM alerts
+     WHERE alert_group_id = $1
+     ORDER BY alarm_ts DESC NULLS LAST
+     LIMIT $2`,
+    [groupId, limit]
+  );
+  const members = result.rows || [];
+  if (members.length === 0) return [];
+  const distinctTypes = new Set(members.map((m) => String(m.alarm_type || '').trim()));
+  // Only combinations need multi-member evidence.
+  if (distinctTypes.size < 2) return [];
+  return members;
+}
+
+// Fetches media for each member with bounded concurrency. A member that fails
+// never breaks the group: its evidence is simply missing, and `partial` says so.
+async function fetchMediaForMembers(members) {
+  const collected = [];
+  let failed = 0;
+  let cursor = 0;
+
+  const worker = async () => {
+    while (cursor < members.length) {
+      const member = members[cursor++];
+      try {
+        const media = await syncService.fetchMediaOnDemand(member);
+        for (const m of media || []) {
+          collected.push({ ...m, _member_type: member.alarm_type, _member_alert_id: member.id });
+        }
+      } catch (err) {
+        failed++;
+      }
+    }
+  };
+
+  const workers = Array.from({ length: Math.min(COMBO_MEDIA_CONCURRENCY, members.length) }, () => worker());
+  await Promise.all(workers);
+
+  // Same file can come back for several members of one vehicle — keep the first.
+  const seen = new Set();
+  const unique = collected.filter((m) => {
+    const key = String(m.file_url || m.id || '');
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  return { media: unique, failed, partial: failed > 0 };
+}
+
 async function getAlertMedia(req, res) {
   try {
     const { id } = req.params;
@@ -732,13 +820,18 @@ async function getAlertMedia(req, res) {
 
     const { group, alertId } = await resolveMediaAlertId(id);
 
+    // Combination group: pull every member's evidence, so a telematics + video
+    // combo shows both sides instead of only the completing member.
+    const comboMembers = group ? await getDistinctTypeMembers(group.id).catch(() => []) : [];
+    const comboResult = comboMembers.length > 0 ? await fetchMediaForMembers(comboMembers) : null;
+
     // Always live-fetch from skycamx — alert_media is never consulted.
-    const rawAlert = await loadRawAlertForSkycam(id, group, alertId);
+    const rawAlert = comboResult ? null : await loadRawAlertForSkycam(id, group, alertId);
     if (!rawAlert && !group) {
       return res.status(404).json({ success: false, message: `Alert ${id} not found` });
     }
 
-    const finalMedia = rawAlert ? await syncService.fetchMediaOnDemand(rawAlert) : [];
+    const finalMedia = comboResult ? comboResult.media : (rawAlert ? await syncService.fetchMediaOnDemand(rawAlert) : []);
     const finalImages = finalMedia.filter((m) => m.file_type === '00' || !m.file_type || m.file_type === '01');
     const finalVideoFiles = finalMedia.filter((m) => m.file_type === '02');
 
@@ -762,6 +855,9 @@ async function getAlertMedia(req, res) {
       url: m.file_url ? `/api/video-server/playback/image-proxy?url=${encodeURIComponent(m.file_url)}` : null,
       storage_url: m.file_url,
       timestamp: m.created_at || m.alarm_time,
+      // Set on combination groups so each shot says which alert produced it.
+      alarm_type: m._member_type || null,
+      member_alert_id: m._member_alert_id || null,
     }));
 
     const entries = finalVideoFiles.map((m) => {
@@ -770,13 +866,15 @@ async function getAlertMedia(req, res) {
         : null;
       return {
         id: m.id,
-        label: 'Alert Media',
+        label: m._member_type ? `${m._member_type} clip` : 'Alert Media',
         url: flvProxyUrl || m.file_url,
         flvProxyUrl,
         fileUrl: m.file_url,
         fileType: m.file_type || '02',
         isFlv: true,
         timestamp: m.created_at || m.alarm_time,
+        alarm_type: m._member_type || null,
+        member_alert_id: m._member_alert_id || null,
       };
     });
 
@@ -797,6 +895,9 @@ async function getAlertMedia(req, res) {
         postRaw: primaryUrl,
       },
       source: 'skycamx',
+      // Present only on combination groups, where media spans several members.
+      combo: comboResult ? true : undefined,
+      partial: comboResult ? comboResult.partial : undefined,
     });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
@@ -1591,4 +1692,7 @@ module.exports = {
   setWsBroadcast,
   batchResolveDeviceCC,
   buildStrictAlertFilter,
+  // Combination-media helpers (exported for the regression test).
+  getDistinctTypeMembers,
+  fetchMediaForMembers,
 };
