@@ -125,7 +125,7 @@ async function fleetFromRegistration(value) {
 // geotab_devices, vehicle_status, or the id itself being a fleet code), else
 // null. This is what gets STORED on alert_groups.fleet_number and what every
 // read path joins on — 100% match accuracy, zero guessing.
-async function resolveFleetExact({ deviceId, fleetNumber } = {}) {
+async function resolveFleetExact({ deviceId, fleetNumber, deviceName } = {}) {
   const norm = (v) => String(v || '').trim();
   const fn = norm(fleetNumber);
   // Explicit fleet param wins if it is a real fleet (regex or fleet table).
@@ -136,7 +136,10 @@ async function resolveFleetExact({ deviceId, fleetNumber } = {}) {
   }
   const dev = norm(deviceId);
   if (!dev) return null;
-  const key = `fleetexact:${dev}`;
+  // The result can also come from deviceName, so the cache key must include it:
+  // keying on deviceId alone would serve one vehicle's fleet for a different
+  // name reported against the same device.
+  const key = `fleetexact:${dev}:${norm(deviceName).toUpperCase()}`;
   const cached = fleetCache.get(key);
   if (cached && Date.now() - cached.ts < FLEET_CACHE_TTL) return cached.value;
   let value = null;
@@ -161,12 +164,46 @@ async function resolveFleetExact({ deviceId, fleetNumber } = {}) {
       const vf = norm(vs.rows[0]?.fleet_number);
       if (vf && (looksLikeFleetCode(vf) || await fleetTokenExists(vf))) value = vf;
     }
+    // Camera device ids (long numeric IMEI/camera ids) are not resolvable on
+    // their own, but the detection already carries the vehicle in its name:
+    // "FM10 - LDG067MP", "EX60 - LCZ929MP". Without this, those alerts stored no
+    // fleet_number, resolved no cost centre, and — because the board treats an
+    // unknown cost centre as "never hide it" — showed up under EVERY cost
+    // centre selection. Only a token that really exists in the registry is
+    // accepted, so this can never invent a fleet or attribute an alert to the
+    // wrong cost centre: an unrecognised token simply leaves the fleet
+    // unresolved, which is the safe failure (visible under every cost centre)
+    // rather than visible under the wrong one.
+    if (!value) {
+      for (const token of fleetTokensFromName(deviceName)) {
+        const known = await fleetTokenExists(token);
+        if (known) { value = known; break; }
+      }
+    }
   } catch (err) {
     console.error('[costCenterLookup] resolveFleetExact error:', err.message);
     value = null;
   }
   fleetCache.set(key, { value, ts: Date.now() });
   return value;
+}
+
+// Candidate fleet codes out of a device name such as "FM10 - LDG067MP",
+// "32 - EX55 - LCL660MP" or "PB29 (RAPID)". Long pure-digit camera ids and
+// plates are skipped — only short alphanumeric codes are candidates.
+function fleetTokensFromName(deviceName) {
+  const out = [];
+  const seen = new Set();
+  for (const part of String(deviceName || '').split(/[\s/\-()|,]+/)) {
+    const token = part.trim().toUpperCase();
+    if (!token || token.length < 2 || token.length > 12) continue;
+    if (!/^[A-Z0-9]+$/.test(token)) continue;
+    if (/^\d{6,}$/.test(token)) continue; // camera / IMEI ids
+    if (seen.has(token)) continue;
+    seen.add(token);
+    out.push(token);
+  }
+  return out;
 }
 async function resolveFleetNumber({ deviceId, vehicleRegistration, fleetNumber } = {}) {
   if (fleetNumber && looksLikeFleetCode(fleetNumber)) return String(fleetNumber).trim();

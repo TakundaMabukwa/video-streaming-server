@@ -49,11 +49,14 @@ async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, al
   const baseKey = `${deviceId}:${alarmType}`.toLowerCase();
 
   // Authoritative fleet (exact registries only) — stored on every write so
-  // reads join on a column, never on parsed names.
+  // reads join on a column, never on parsed names. deviceName is passed too:
+  // camera device ids are not resolvable on their own, but the detection name
+  // carries the vehicle ("FM10 - LDG067MP"), and without the fleet the group
+  // would resolve no cost centre and show under every cost centre selection.
   const { resolveFleetExact } = require('../services/costCenterLookup');
   let fleetExact = null;
   try {
-    fleetExact = await resolveFleetExact({ deviceId, fleetNumber: null }) || null;
+    fleetExact = await resolveFleetExact({ deviceId, fleetNumber: null, deviceName }) || null;
   } catch (_) { fleetExact = null; }
 
   // Reuse the current LIVE group for this device+type (open AND genuine):
@@ -212,7 +215,7 @@ async function batchUpsertAlertGroups(groups) {
   const { resolveFleetExact } = require('../services/costCenterLookup');
   for (const g of entries) {
     try {
-      g.fleetExact = await resolveFleetExact({ deviceId: g.deviceId }) || null;
+      g.fleetExact = await resolveFleetExact({ deviceId: g.deviceId, deviceName: g.deviceName }) || null;
     } catch (_) { g.fleetExact = null; }
   }
 
