@@ -1,7 +1,7 @@
 const express = require('express');
 const rateLimit = require('express-rate-limit');
 const { getAlertTypes, getAlarmPage, getAlertFeed, getAlarmFilesById, getAlarmFilesByPage, getDevices } = require('../controllers/alertController');
-const { getActiveAlerts, getActiveAlertsAll, getActivePerVehicleAlerts, getActiveAlertCounts, getClosedSummaryByCC, getResolvedAlerts, getResolvedAlertCount, getAlertById, getAlertScreenshots, getAlertMedia, getAlertMembers, acknowledgeAlert, resolveAlert, escalateAlert, markFalseAlert, uploadDocumentToAlert, followUpAlert, clearFollowUp, getAlertHistory, listAlerts, watchAlert, unwatchAlert, getAlertWatchers, getAllWatchers } = require('../controllers/dbAlertController');
+const { getActiveAlerts, getActiveAlertsAll, getActivePerVehicleAlerts, getActiveAlertCounts, getClosedSummaryByCC, getResolvedAlerts, getResolvedAlertCount, getAlertById, getAlertScreenshots, getAlertMedia, getAlertMembers, acknowledgeAlert, resolveAlert, escalateAlert, markFalseAlert, uploadDocumentToAlert, followUpAlert, clearFollowUp, getAlertHistory, listAlerts, watchAlert, unwatchAlert, getAlertWatchers, getAllWatchers, getActiveCooldowns } = require('../controllers/dbAlertController');
 const db = require('../db');
 const apiClient = require('../helpers/apiClient');
 
@@ -23,6 +23,9 @@ router.get('/active-all', getActiveAlertsAll);
 router.get('/active-counts', getActiveAlertCounts);
 router.get('/resolved', getResolvedAlerts);
 router.get('/resolved-count', getResolvedAlertCount);
+// Active cooldown timers (device_id= required, alarm_type= optional).
+// Registered before /:id so "cooldowns" is never read as an alert id.
+router.get('/cooldowns', getActiveCooldowns);
 router.get('/history', getAlertHistory);
 // GET /alerts?status=new|active|resolved|closed&limit=&offset= — previously fell
 // through to the catch-all below and always answered with an empty list.

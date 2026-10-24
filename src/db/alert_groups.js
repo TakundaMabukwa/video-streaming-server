@@ -108,6 +108,29 @@ async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, al
     return stampMember(result.rows[0], { alertId, deviceId, deviceName, alarmType, alarmText, alarmTs, lat, lon, speed, severity, fleetExact, sourceType });
   }
 
+  // Operator cooldown: while a timer runs for this (vehicle, alert type), a
+  // NEW group is stored in the backup mirrors and nothing reaches the board.
+  // Only reached when no open group exists — an active group above keeps
+  // bumping exactly as always. Lookup failure falls through (never drops
+  // today's alert creation behaviour).
+  try {
+    const { getActiveCooldown, recordSuppressed } = require('../services/alertCooldowns');
+    const cooldown = await getActiveCooldown(deviceId, alarmType);
+    if (cooldown) {
+      const stored = await recordSuppressed(cooldown, {
+        deviceId, deviceName, alarmType, alarmText, alertId, alarmTs,
+        lat, lon, speed, severity, fleetNumber: fleetExact || null, sourceType,
+      }, {
+        id: alertId, deviceId, deviceName, alarmType, alarmText, alarmTs,
+        lat, lon, speed, severity, fleetNumber: fleetExact || null, sourceType,
+      });
+      console.log(`[COOLDOWN] ${fleetExact || deviceId}: "${alarmType}" stored in backup (count ${stored ? stored.count : '?'}) — no board alert`);
+      return null;
+    }
+  } catch (err) {
+    console.error('[COOLDOWN] gate failed:', err.message);
+  }
+
   // No active group. (No resolve cooldown — a new event after a manual
   // resolve always starts a fresh active group immediately.)
   // If the base key is still taken by a resolved (closed) group, the code
@@ -286,6 +309,41 @@ async function batchUpsertAlertGroups(groups) {
       result.rows.push(bumped.rows[0]);
       await stampMember(bumped.rows[0], { alertId: g.alertId, deviceId: g.deviceId, deviceName: g.deviceName, alarmType: g.alarmType, alarmText: g.alarmText, alarmTs: g.alarmTs, lat: g.lat, lon: g.lon, speed: g.speed, severity: g.severity, fleetExact: g.fleetExact, sourceType: g.sourceType });
     } else pending.push(g);
+  }
+  if (pending.length === 0) return result.rows;
+
+  // Operator cooldown (camera/video batch path): entries with no open group to
+  // bump are diverted to the backup mirrors while the timer runs. Open-group
+  // bumps above are untouched — cooldowns only ever block NEW groups.
+  // getActiveCooldown never throws (it returns null on failure), and each
+  // recordSuppressed is individually guarded.
+  {
+    const { getActiveCooldown, recordSuppressed } = require('../services/alertCooldowns');
+    for (let i = pending.length - 1; i >= 0; i--) {
+      const g = pending[i];
+      const cd = await getActiveCooldown(g.deviceId, g.alarmType);
+      if (!cd) continue;
+      try {
+        await recordSuppressed(cd, {
+          deviceId: g.deviceId, deviceName: g.deviceName, alarmType: g.alarmType,
+          alarmText: g.alarmText, alertId: g.alertId, alarmTs: g.alarmTs,
+          lat: g.lat, lon: g.lon, speed: g.speed, severity: g.severity,
+          fleetNumber: g.fleetExact || null, sourceType: g.sourceType || 'video',
+        }, {
+          id: g.alertId, deviceId: g.deviceId, deviceName: g.deviceName,
+          alarmType: g.alarmType, alarmText: g.alarmText, alarmTs: g.alarmTs,
+          lat: g.lat, lon: g.lon, speed: g.speed, severity: g.severity,
+          fleetNumber: g.fleetExact || null, sourceType: g.sourceType || 'video',
+        });
+        logDropOnce(
+          `cool:${g.alarmType}:${g.deviceId}`,
+          `[COOLDOWN] ${g.fleetExact || g.deviceId}: "${g.alarmType}" camera occurrence stored in backup — no board alert`
+        );
+      } catch (cdErr) {
+        console.error('[COOLDOWN] batch gate failed:', cdErr.message);
+      }
+      pending.splice(i, 1);
+    }
   }
   if (pending.length === 0) return result.rows;
 

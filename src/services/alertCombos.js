@@ -243,6 +243,46 @@ async function handleDetection(ctx) {
       const members = await listPendingForComboDevice(combo.id, deviceId, combo.windowSeconds);
       if (members.length === 0) continue;
 
+      // Operator cooldown: the combo completed, but a timer runs for this
+      // vehicle + combo name. Every member is stored in the backup mirrors and
+      // the staging is released (groupId: null) so the combo settles instead of
+      // retrying until the window passes.
+      try {
+        const { getActiveCooldown, recordSuppressed } = require('./alertCooldowns');
+        const cd = await getActiveCooldown(deviceId, combo.name);
+        if (cd) {
+          const labels = Array.from(new Set(members.map((m) => String(m.alarm_type || '').trim()).filter(Boolean)));
+          await recordSuppressed(cd, {
+            deviceId,
+            deviceName: members.find((m) => m.device_name)?.device_name || ctx.deviceName,
+            alarmType: combo.name,
+            alarmText: `${combo.name} — ${labels.join(' + ')}`,
+            alertId, alarmTs: ctx.alarmTs,
+            lat: members.find((m) => m.lat != null)?.lat ?? null,
+            lon: members.find((m) => m.lon != null)?.lon ?? null,
+            speed: members.find((m) => m.speed != null)?.speed ?? null,
+            severity: combo.severity || null,
+            fleetNumber: members.map((m) => String(m.fleet_number || '').trim()).find(Boolean) || null,
+            sourceType: String(combo.source_type || members[0]?.source_type || 'video'),
+          }, members.map((m) => ({
+            id: String(m.alert_id || ''), deviceId,
+            deviceName: m.device_name || null, alarmType: m.alarm_type,
+            alarmText: m.alarm_text || null, alarmTs: m.alarm_ts || null,
+            lat: m.lat ?? null, lon: m.lon ?? null, speed: m.speed ?? null,
+            severity: m.severity || null, fleetNumber: m.fleet_number || null,
+            sourceType: m.source_type || 'video',
+          })).filter((m) => m.id));
+          await linkStagedMembers({
+            comboId: combo.id, deviceId,
+            windowSeconds: combo.windowSeconds, groupId: null,
+          });
+          console.log(`[COOLDOWN] ${deviceId}: combo "${combo.name}" completed during cooldown — members stored in backup`);
+          continue; // suppressed: no board group, staging already released
+        }
+      } catch (cdErr) {
+        console.error('[COOLDOWN] combo gate failed:', cdErr.message);
+      }
+
       const groupRow = await createMergedComboGroup({
         deviceId,
         deviceName: members.find((m) => m.device_name)?.device_name || ctx.deviceName,

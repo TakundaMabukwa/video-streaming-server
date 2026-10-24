@@ -433,6 +433,33 @@ async function emitDeviceStatusAlert({ deviceId, fleetNumber, licensePlate, sign
     const alertId = `dst-${deviceId}-${signalCode}-${Date.now()}`;
     const alarmTs = ts || new Date().toISOString();
 
+    // Operator cooldown: while a timer runs for this vehicle + alert type the
+    // occurrence goes to the backup mirrors and NOTHING reaches the board.
+    // Returns a truthy object so fatigue/speed consume their memory exactly
+    // once (no 15s retry storm) and no broadcast ever runs; zone flows ignore
+    // the return value. After the window the next crossing creates normally.
+    try {
+      const cooldownMod = require('./alertCooldowns');
+      const cooldown = await cooldownMod.getActiveCooldown(deviceId, def.name);
+      if (cooldown) {
+        await cooldownMod.recordSuppressed(cooldown, {
+          deviceId, deviceName, alarmType: def.name, alarmText: alarmText || def.name,
+          alertId, alarmTs, lat, lon, speed,
+          severity: String(def.severity || 'MEDIUM').toLowerCase(),
+          fleetNumber: fleetNumber || null, sourceType: 'telematics',
+        }, {
+          id: alertId, deviceId, deviceName, alarmType: def.name,
+          alarmText: alarmText || def.name, alarmTs, lat, lon, speed,
+          severity: String(def.severity || 'MEDIUM').toLowerCase(),
+          fleetNumber: fleetNumber || null, sourceType: 'telematics',
+        });
+        console.log(`[COOLDOWN] ${fleetNumber || deviceId}: "${def.name}" occurrence stored in backup (ends ${cooldown.cooldown_until}) — no board alert`);
+        return { cooldown_suppressed: true, alarmType: def.name };
+      }
+    } catch (cdErr) {
+      console.error('[COOLDOWN] poller gate failed:', cdErr.message);
+    }
+
     // Speeding: the Geotab feed may already have recorded this spike (tel-*)
     // within 60s. Skip the poller copy so one spike is not counted twice.
     if (signalCode === SPEED_85_CODE || signalCode === SPEED_90_CODE) {

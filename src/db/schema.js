@@ -1284,6 +1284,89 @@ const MIGRATIONS_SQL = `
   -- other pending staging row for the same alert is retired.
   CREATE INDEX IF NOT EXISTS idx_alert_combo_events_by_alert_pending
     ON alert_combo_events(alert_id) WHERE state = 'pending';
+
+  -- ══ Alert cooldown (purely additive) ═══════════════════════════════════════
+  -- Set when an operator resolves with a timer (>0 minutes, max 720). While
+  -- cooldown_until is in the future, NEW groups for that (device_id, alarm_type)
+  -- are diverted to the two backup mirrors instead of alert_groups. Open groups
+  -- keep bumping as always, and with no cooldown row present every code path
+  -- behaves exactly as before.
+  -- MIRROR DISCIPLINE: alert_cooldown_groups mirrors alert_groups and
+  -- alert_cooldown_members mirrors alerts — any column added to the live
+  -- tables must be added to these here, in the same migration.
+  CREATE TABLE IF NOT EXISTS alert_cooldowns (
+    id SERIAL PRIMARY KEY,
+    device_id TEXT NOT NULL,
+    alarm_type TEXT NOT NULL,
+    cooldown_minutes INTEGER NOT NULL DEFAULT 0 CHECK (cooldown_minutes BETWEEN 0 AND 720),
+    cooldown_until TIMESTAMPTZ NOT NULL,
+    alert_group_id INTEGER,
+    set_by TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  );
+  -- Expression unique so 'Cellphone Use' and 'cellphone use' are one cooldown.
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_alert_cooldowns_pair
+    ON alert_cooldowns (device_id, lower(alarm_type));
+  CREATE INDEX IF NOT EXISTS idx_alert_cooldowns_until ON alert_cooldowns (cooldown_until);
+
+  CREATE TABLE IF NOT EXISTS alert_cooldown_groups (
+    id SERIAL PRIMARY KEY,
+    cooldown_id INTEGER NOT NULL REFERENCES alert_cooldowns(id) ON DELETE CASCADE,
+    group_key TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    device_name TEXT,
+    alarm_type TEXT NOT NULL,
+    alarm_text TEXT,
+    count INTEGER DEFAULT 1,
+    last_alert_id TEXT,
+    last_alert_ts TIMESTAMPTZ,
+    lat DOUBLE PRECISION,
+    lon DOUBLE PRECISION,
+    speed DOUBLE PRECISION,
+    status TEXT DEFAULT 'new',
+    resolved BOOLEAN DEFAULT FALSE,
+    false_alert BOOLEAN DEFAULT FALSE,
+    resolved_at TIMESTAMPTZ,
+    resolved_by TEXT,
+    notes TEXT,
+    documents JSONB DEFAULT '[]'::jsonb,
+    source_type TEXT DEFAULT 'video',
+    severity TEXT,
+    fleet_number TEXT,
+    suppressed_at TIMESTAMPTZ DEFAULT NOW(),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (cooldown_id, device_id, alarm_type)
+  );
+  CREATE INDEX IF NOT EXISTS idx_acool_groups_device
+    ON alert_cooldown_groups (device_id, alarm_type);
+
+  CREATE TABLE IF NOT EXISTS alert_cooldown_members (
+    id TEXT PRIMARY KEY,
+    cooldown_id INTEGER NOT NULL REFERENCES alert_cooldowns(id) ON DELETE CASCADE,
+    device_id TEXT NOT NULL,
+    device_name TEXT,
+    alarm_type TEXT,
+    alarm_text TEXT,
+    alarm_ts TIMESTAMPTZ,
+    lat DOUBLE PRECISION,
+    lon DOUBLE PRECISION,
+    speed DOUBLE PRECISION,
+    severity TEXT,
+    fleet_number TEXT,
+    source_type TEXT DEFAULT 'video',
+    serial_no TEXT,
+    fence_id TEXT,
+    alarm_extension TEXT,
+    status TEXT DEFAULT 'new',
+    notes TEXT,
+    documents JSONB DEFAULT '[]'::jsonb,
+    suppressed_at TIMESTAMPTZ DEFAULT NOW(),
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  );
+  CREATE INDEX IF NOT EXISTS idx_acool_members_cooldown
+    ON alert_cooldown_members (cooldown_id, alarm_ts);
 `;
 
 async function initializeDatabase() {

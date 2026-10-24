@@ -1174,12 +1174,28 @@ async function resolveAlert(req, res) {
       close_reason,
       reported_by,
       incident: incidentData = {},
+      cooldownMinutes,
     } = req.body || {};
     const actor = resolveActor(req, userId);
 
     const groupId = Number(id);
     if (!Number.isInteger(groupId) || groupId < 1 || String(id).trim() === '') {
       return res.status(400).json({ success: false, message: 'Alert id must be alert_groups.id (integer)' });
+    }
+
+    // Optional operator cooldown. null = "not asked" (no cooldown action at
+    // all — NCR/report closes and older clients leave running timers alone);
+    // 0 = explicit "none" (cancels a running timer); 1..720 = start one.
+    let cooldownMinutesValue = null;
+    if (cooldownMinutes !== undefined && cooldownMinutes !== null && cooldownMinutes !== '') {
+      const n = Number(cooldownMinutes);
+      if (!Number.isInteger(n) || n < 0 || n > 720) {
+        return res.status(400).json({
+          success: false,
+          message: 'cooldownMinutes must be whole minutes between 0 and 720 (0 = none, max 12 hours)',
+        });
+      }
+      cooldownMinutesValue = n;
     }
 
     const isFalse = closureType === 'false_alert';
@@ -1204,6 +1220,24 @@ async function resolveAlert(req, res) {
     const targetDeviceId = group.device_id;
     const targetAlarmType = group.alarm_type;
     const resolvedGroupKey = group.group_key;
+
+    // Set/cancel the cooldown only after the close succeeded. Affects NEW
+    // groups for this (device, alert type) — see alertCooldowns.js.
+    let cooldown = null;
+    if (cooldownMinutesValue !== null) {
+      try {
+        const { setCooldown } = require('../services/alertCooldowns');
+        cooldown = await setCooldown({
+          deviceId: targetDeviceId,
+          alarmType: targetAlarmType,
+          minutes: cooldownMinutesValue,
+          groupId,
+          by: actor,
+        });
+      } catch (cdErr) {
+        console.error('[ResolveAlert] cooldown failed:', cdErr.message);
+      }
+    }
 
     const docs = [];
     if (docData) {
@@ -1302,6 +1336,7 @@ async function resolveAlert(req, res) {
       documents: docs,
       incident: incident || null,
       deduction,
+      cooldown: cooldown || null,
       count: Number(group.count) || 1,
       group_key: resolvedGroupKey,
       message: `Alert group ${groupId} resolved`,
@@ -1513,11 +1548,27 @@ async function clearFollowUp(req, res) {
 
 async function resolveAlertsBulk(req, res) {
   try {
-    const { alertIds, userId, notes, notesById, closureType = 'resolved' } = req.body || {};
+    const { alertIds, userId, notes, notesById, closureType = 'resolved', cooldownMinutes } = req.body || {};
     const actor = resolveActor(req, userId);
     if (!Array.isArray(alertIds) || alertIds.length === 0) {
       return res.status(400).json({ success: false, message: 'alertIds array is required' });
     }
+
+    // Same contract as the single close: absent = no cooldown action,
+    // 0 = cancel, 1..720 = start one — applied per (device, alert type) pair
+    // of every group actually resolved below.
+    let cooldownMinutesValue = null;
+    if (cooldownMinutes !== undefined && cooldownMinutes !== null && cooldownMinutes !== '') {
+      const n = Number(cooldownMinutes);
+      if (!Number.isInteger(n) || n < 0 || n > 720) {
+        return res.status(400).json({
+          success: false,
+          message: 'cooldownMinutes must be whole minutes between 0 and 720 (0 = none, max 12 hours)',
+        });
+      }
+      cooldownMinutesValue = n;
+    }
+
 
     const isFalse = closureType === 'false_alert';
     const now = new Date().toISOString();
@@ -1563,12 +1614,35 @@ async function resolveAlertsBulk(req, res) {
     const resolvedCount = groupResult.rowCount || 0;
     const resolvedIds = groupResult.rows.map((r) => r.id);
 
+    // Cooldowns after a successful close — one timer per resolved pair.
+    let cooldown = null;
+    if (cooldownMinutesValue !== null && groupResult.rows.length > 0) {
+      try {
+        const { setCooldown } = require('../services/alertCooldowns');
+        cooldown = [];
+        for (const row of groupResult.rows) {
+          const cd = await setCooldown({
+            deviceId: row.device_id,
+            alarmType: row.alarm_type,
+            minutes: cooldownMinutesValue,
+            groupId: row.id,
+            by: actor,
+          });
+          cooldown.push({ device_id: row.device_id, alarm_type: row.alarm_type, ...cd });
+        }
+      } catch (cdErr) {
+        console.error('[ResolveAlertsBulk] cooldown failed:', cdErr.message);
+        cooldown = null;
+      }
+    }
+
     res.json({
       success: resolvedCount > 0,
       resolved: resolvedCount,
       groups: resolvedCount,
       ids: resolvedIds,
       total: alertIds.length,
+      cooldown: cooldown || null,
       message: resolvedCount > 0
         ? `${resolvedCount} group(s) resolved`
         : 'No active groups matched those ids',
@@ -1596,6 +1670,31 @@ async function resolveAlertsBulk(req, res) {
   }
 }
 
+
+// Active cooldown timers for a vehicle (optionally narrowed to one type).
+// No UI consumes this yet — kept for API/debug and future surfaces.
+async function getActiveCooldowns(req, res) {
+  try {
+    const deviceId = String(req.query?.device_id || '').trim();
+    const alarmType = String(req.query?.alarm_type || '').trim();
+    if (!deviceId) {
+      return res.status(400).json({ success: false, message: 'device_id is required' });
+    }
+    const params = [deviceId];
+    let sql = `SELECT id, device_id, alarm_type, cooldown_minutes, cooldown_until, alert_group_id, set_by, updated_at
+                 FROM alert_cooldowns
+                WHERE device_id = $1 AND cooldown_until > NOW()`;
+    if (alarmType) {
+      params.push(alarmType);
+      sql += ' AND lower(alarm_type) = lower($2)';
+    }
+    sql += ' ORDER BY cooldown_until DESC';
+    const r = await db.query(sql, params);
+    res.json({ success: true, cooldowns: r.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+}
 
 async function getResolvedAlertCount(req, res) {
   try {
@@ -1719,6 +1818,7 @@ module.exports = {
   acknowledgeAlert,
   resolveAlert,
   resolveAlertsBulk,
+  getActiveCooldowns,
   watchAlert,
   unwatchAlert,
   getAlertWatchers,
