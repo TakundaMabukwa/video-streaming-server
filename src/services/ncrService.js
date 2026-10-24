@@ -5,7 +5,7 @@ const db = require('../db');
 const { findVehicleCostCenterId } = require('./costCenterLookup');
 
 const ALERT_FORM_KEYS = [
-  'ncrNo', 'driverId', 'driverName', 'contactNumber', 'idNumber', 'idDocumentType',
+  'ncrNo', 'driverId', 'driverName', 'secondDriverId', 'secondDriverName', 'contactNumber', 'idNumber', 'idDocumentType',
   'department', 'section', 'responsibleManager', 'manager', 'investigator',
   'vehicleFleetNumber', 'vehicleRegistration', 'costCenterId', 'costCenterName',
   'date', 'time', 'duration',
