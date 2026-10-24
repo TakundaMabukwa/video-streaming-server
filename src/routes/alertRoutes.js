@@ -1,7 +1,7 @@
 const express = require('express');
 const rateLimit = require('express-rate-limit');
 const { getAlertTypes, getAlarmPage, getAlertFeed, getAlarmFilesById, getAlarmFilesByPage, getDevices } = require('../controllers/alertController');
-const { getActiveAlerts, getActiveAlertsAll, getActivePerVehicleAlerts, getActiveAlertCounts, getClosedSummaryByCC, getResolvedAlerts, getResolvedAlertCount, getAlertById, getAlertScreenshots, getAlertMedia, getAlertMembers, acknowledgeAlert, resolveAlert, escalateAlert, markFalseAlert, uploadDocumentToAlert, followUpAlert, clearFollowUp, getAlertHistory, listAlerts, watchAlert, unwatchAlert, getAlertWatchers, getAllWatchers, getActiveCooldowns } = require('../controllers/dbAlertController');
+const { getActiveAlerts, getActiveAlertsAll, getActivePerVehicleAlerts, getActiveAlertCounts, getClosedSummaryByCC, getResolvedAlerts, getResolvedAlertCount, getClosedAlertsCountQuery, getAlertById, getAlertScreenshots, getAlertMedia, getAlertMembers, acknowledgeAlert, resolveAlert, escalateAlert, markFalseAlert, uploadDocumentToAlert, followUpAlert, clearFollowUp, getAlertHistory, listAlerts, watchAlert, unwatchAlert, getAlertWatchers, getAllWatchers, getActiveCooldowns } = require('../controllers/dbAlertController');
 const db = require('../db');
 const apiClient = require('../helpers/apiClient');
 
@@ -23,6 +23,9 @@ router.get('/active-all', getActiveAlertsAll);
 router.get('/active-counts', getActiveAlertCounts);
 router.get('/resolved', getResolvedAlerts);
 router.get('/resolved-count', getResolvedAlertCount);
+// Reports summary cards: closed alerts for the current cost-centre selection.
+// Registered before /:id so "closed-count" is never read as an alert id.
+router.get('/closed-count', getClosedAlertsCountQuery);
 // Active cooldown timers (device_id= required, alarm_type= optional).
 // Registered before /:id so "cooldowns" is never read as an alert id.
 router.get('/cooldowns', getActiveCooldowns);

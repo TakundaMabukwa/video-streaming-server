@@ -969,6 +969,68 @@ async function getResolvedAlertGroupCount() {
   return parseInt(result.rows[0].count);
 }
 
+/**
+ * Closed-alert count for the Reports summary cards, scoped exactly like the
+ * incident register: cost centres (when given) + a from..to window on the
+ * closure time. Returns GROUP count (same semantics as /alerts/resolved-count).
+ *
+ * alert_groups has no cost_center_id, so attribution is resolved in priority
+ * order: the incident recorded at closure (same source the register filters
+ * on) → driver_scoring → fleet_vehicles (current fleet cost centre), keyed on
+ * the stored fleet_number with the device-name guess as last resort — the
+ * same guess used by getClosedSummaryByCC.
+ */
+async function getClosedAlertsCount({ costCenterIds = [], from = null, to = null } = {}) {
+  const params = [];
+  const conditions = ['g.resolved = TRUE'];
+  if (from) {
+    params.push(from);
+    conditions.push(`COALESCE(g.resolved_at, g.updated_at, g.last_alert_ts) >= $${params.length}::date`);
+  }
+  if (to) {
+    params.push(to);
+    // inclusive of the whole "To" day
+    conditions.push(`COALESCE(g.resolved_at, g.updated_at, g.last_alert_ts) < ($${params.length}::date + INTERVAL '1 day')`);
+  }
+  const ccNums = (Array.isArray(costCenterIds) ? costCenterIds : String(costCenterIds || '').split(','))
+    .map((v) => Number(String(v).trim()))
+    .filter((n) => Number.isFinite(n) && n > 0);
+  let ccWhere = '';
+  if (ccNums.length > 0) {
+    params.push(ccNums);
+    ccWhere = `WHERE cc_id = ANY($${params.length}::int[])`;
+  }
+  const result = await query(
+    `WITH closed AS (
+       SELECT g.group_key,
+              UPPER(TRIM(COALESCE(NULLIF(g.fleet_number, ''),
+                SPLIT_PART(COALESCE(NULLIF(TRIM(g.device_name), ''), g.device_id, ''), ' - ', 1)))) AS fleet_key
+         FROM alert_groups g
+        WHERE ${conditions.join(' AND ')}
+     ),
+     attributed AS (
+       SELECT COALESCE(inc.cc_id, ds.cost_center_id, fv.cost_center_id) AS cc_id
+         FROM closed c
+         LEFT JOIN LATERAL (
+           SELECT i.cost_center_id AS cc_id FROM incidents i
+            WHERE i.alert_group_key = c.group_key AND i.cost_center_id IS NOT NULL
+            ORDER BY i.created_at DESC LIMIT 1
+         ) inc ON TRUE
+         LEFT JOIN LATERAL (
+           SELECT cost_center_id FROM driver_scoring
+            WHERE UPPER(TRIM(fleet_number)) = c.fleet_key LIMIT 1
+         ) ds ON TRUE
+         LEFT JOIN LATERAL (
+           SELECT cost_center_id FROM fleet_vehicles
+            WHERE UPPER(TRIM(fleet_number)) = c.fleet_key LIMIT 1
+         ) fv ON TRUE
+     )
+     SELECT COUNT(*)::int AS count FROM attributed ${ccWhere}`,
+    params
+  );
+  return Number(result.rows[0]?.count) || 0;
+}
+
 async function getAlertGroupStats() {
   const groupCount = await query('SELECT COUNT(*) FROM alert_groups');
   const activeCount = await query('SELECT COUNT(*) FROM alert_groups WHERE resolved = FALSE');
@@ -997,6 +1059,7 @@ module.exports = {
   getClosedSummaryByCC,
   getResolvedAlertGroupsWithMedia,
   getResolvedAlertGroupCount,
+  getClosedAlertsCount,
   resolveAlertGroup,
   resolveAlertGroupById,
   appendAlertGroupDocument,

@@ -1705,6 +1705,25 @@ async function getResolvedAlertCount(req, res) {
   }
 }
 
+// Closed-alert summary count for the Reports cards.
+// Query: cost_center_ids=1,2 (optional) & from=YYYY-MM-DD & to=YYYY-MM-DD
+// (optional, both bound the closure time, inclusive of the To day).
+async function getClosedAlertsCountQuery(req, res) {
+  try {
+    const count = await db.getClosedAlertsCount({
+      costCenterIds: String(req.query?.cost_center_ids || '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean),
+      from: String(req.query?.from || '').trim() || null,
+      to: String(req.query?.to || '').trim() || null,
+    });
+    res.json({ success: true, count });
+  } catch (error) {
+    res.status(500).json({ success: false, count: 0, message: error.message });
+  }
+}
+
 // Watching presence: which operators currently have an alert open. Heartbeat
 // rows older than 90s are treated as gone (closed tab, crashed session).
 const WATCH_STALE_MS = 90 * 1000;
@@ -1810,6 +1829,7 @@ module.exports = {
   getResolvedAlerts,
   listAlerts,
   getResolvedAlertCount,
+  getClosedAlertsCountQuery,
   getAlertById,
   getAlertScreenshots,
   getAlertMedia,

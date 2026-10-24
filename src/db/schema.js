@@ -1367,6 +1367,16 @@ const MIGRATIONS_SQL = `
   );
   CREATE INDEX IF NOT EXISTS idx_acool_members_cooldown
     ON alert_cooldown_members (cooldown_id, alarm_ts);
+
+  -- Reports "Closed Alerts" card: fleet → cost-centre attribution must be an
+  -- index lookup per closed group, never a seq scan (incidents can hold
+  -- thousands of rows and driver_scoring/fleet_vehicles are hit per group).
+  CREATE INDEX IF NOT EXISTS idx_incidents_alert_group_key
+    ON incidents (alert_group_key) WHERE alert_group_key IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_driver_scoring_fleet_trim
+    ON driver_scoring (UPPER(TRIM(fleet_number)));
+  CREATE INDEX IF NOT EXISTS idx_fleet_vehicles_fleet_trim
+    ON fleet_vehicles (UPPER(TRIM(fleet_number)));
 `;
 
 async function initializeDatabase() {
