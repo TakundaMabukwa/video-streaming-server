@@ -65,16 +65,20 @@ function baselineCrossedThresholds(curMinutes) {
 //   rearm — held codes whose threshold the clock has dropped back below
 //           (a genuine new driving run started); remove them from memory.
 //   fire  — not-yet-held thresholds the clock is past while driving; emit each.
+//   Both sides require currDriving: a STOP must never clear the memory. Geotab
+//   can resume with an inflated currentStateDuration (b101: 73s stop, resume
+//   reported 04:24) — if the stop had re-armed, that inflated reading fired the
+//   threshold again minutes after the operator resolved it.
 //   curMinutes === null (unparseable/absent duration) → no change at all.
 function planFatigueThresholds({ codes, curMinutes, currDriving }) {
   const held = new Set(Array.isArray(codes) ? codes : []);
   const rearm = [];
   const fire = [];
-  if (!Number.isFinite(curMinutes) || curMinutes < 0) return { rearm, fire };
+  if (!Number.isFinite(curMinutes) || curMinutes < 0 || !currDriving) return { rearm, fire };
   for (const t of FATIGUE_THRESHOLDS) {
     if (held.has(t.signalCode)) {
       if (curMinutes < t.minutes) rearm.push(t.signalCode);
-    } else if (currDriving && curMinutes >= t.minutes) {
+    } else if (curMinutes >= t.minutes) {
       fire.push(t);
     }
   }
@@ -966,8 +970,9 @@ async function pollDeviceStatus() {
       // Fatigue/duration from the authoritative Geotab clock (currentStateDuration)
       // — the ONLY thing that both fires and re-arms a threshold:
       //   fire:   clock is past a threshold that is not yet alerted, while driving;
-      //   re-arm: clock dropped BELOW an alerted threshold (genuine new run), so
-      //           the next batch fires when that run crosses it again.
+      //   re-arm: while DRIVING, clock dropped BELOW an alerted threshold (a
+      //           genuine new run) — stops and stale readings never clear memory,
+      //           so an inflated clock on resume cannot replay a served batch.
       // A threshold therefore never fires twice while the clock still reads past
       // it, no matter how often the driving flag flaps. Only fresh readings may
       // change the memory (stale/offline payloads are observational only).

@@ -162,10 +162,24 @@ const sessions = async () =>
   check('no 3h group re-created after resolve-equivalent flap', (await fatigueGroups()).length === 0);
   check('speed episode flags survived the flap', row.speed_90_alerted === true && row.speed_85_alerted === true, JSON.stringify([row.speed_85_alerted, row.speed_90_alerted]));
 
-  console.log('== [S5] genuine clock restart: 00:05 → batch re-arms ==');
+  console.log('== [S4b] TRUSTED stop: fresh, speed 0, clock 00:00:30 ==');
+  await tick('stop @ 30s', snap({ driving: false, duration: '00:00:30', speed: 0 }));
+  row = await vs();
+  check('trusted stop applied (is_driving false)', row.is_driving === false, row.is_driving);
+  check('STOP did NOT re-arm fatigue memory', JSON.stringify(await heldCodes(row)) === JSON.stringify([THREE_H]), JSON.stringify(await heldCodes(row)));
+  check('stop raised nothing', (await fatigueGroups()).length === 0, (await fatigueGroups()).length);
+
+  console.log('== [S4c] resume with INFLATED clock (prod b101 shape: 04:10 after a 73s stop) ==');
+  await tick('resume @ 04:10', snap({ driving: true, duration: '04:10:00' }));
+  row = await vs();
+  check('inflated resume did NOT replay the served 3h', (await fatigueGroups()).length === 0, JSON.stringify(await fatigueGroups()));
+  check('memory still held through the resume', JSON.stringify(await heldCodes(row)) === JSON.stringify([THREE_H]), JSON.stringify(await heldCodes(row)));
+  check('new session opened on the trusted resume', (await sessions()) === 2, await sessions());
+
+  console.log('== [S5] genuine clock restart: 00:05 DRIVING → batch re-arms ==');
   await tick('clock reset @ 5m', snap({ driving: true, duration: '00:05:00' }));
   row = await vs();
-  check('3h re-armed because the clock dropped below 180', JSON.stringify(await heldCodes(row)) === '[]', JSON.stringify(await heldCodes(row)));
+  check('3h re-armed because a DRIVING clock dropped below 180', JSON.stringify(await heldCodes(row)) === '[]', JSON.stringify(await heldCodes(row)));
 
   console.log('== [S6] clock crosses 180 again in the new run → ONE new group ==');
   await tick('next batch @ 03:20', snap({ driving: true, duration: '03:20:00' }));
@@ -193,6 +207,7 @@ const sessions = async () =>
 
   console.log('');
   console.log('groups raised for test device:', JSON.stringify(await allGroups()));
+  check('sessions = baseline + resume + re-onboard only (flap added none)', (await sessions()) === 3, await sessions());
   console.log(`fatigue-poller: ${pass} passed, ${fail} failed`);
   process.exit(fail === 0 ? 0 : 1);
 })().catch((err) => {

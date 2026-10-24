@@ -58,11 +58,19 @@ console.log('[2] re-arm (genuine new run)');
 }
 {
   const p = planFatigueThresholds({ codes: [THREE_H], curMinutes: 10, currDriving: false });
-  check('re-arm works while not driving', p.rearm.length === 1 && p.rearm[0] === THREE_H, JSON.stringify(p));
+  check('a STOP (not driving) never re-arms — inflated resume clock cannot replay', p.rearm.length === 0 && p.fire.length === 0, JSON.stringify(p));
+}
+{
+  const p = planFatigueThresholds({ codes: [THREE_H], curMinutes: 10, currDriving: true });
+  check('re-arms on the first DRIVING snapshot below the threshold', p.rearm.length === 1 && p.rearm[0] === THREE_H, JSON.stringify(p));
 }
 {
   const p = planFatigueThresholds({ codes: [THREE_H], curMinutes: 200, currDriving: true });
   check('no re-arm while clock still above the threshold', p.rearm.length === 0 && p.fire.length === 0, JSON.stringify(p));
+}
+{
+  const p = planFatigueThresholds({ codes: [THREE_H], curMinutes: 250, currDriving: false });
+  check('not driving never fires even far past the threshold', p.fire.length === 0, JSON.stringify(p));
 }
 
 console.log('[3] degenerate input');
@@ -95,9 +103,19 @@ console.log('[5] full cycle: serve → reset → next batch');
   const whileDriving = planFatigueThresholds({ codes: held, curMinutes: 560, currDriving: true });
   check('later in the same run: silent', whileDriving.fire.length === 0 && whileDriving.rearm.length === 0, JSON.stringify(whileDriving));
 
-  const afterStop = planFatigueThresholds({ codes: held, curMinutes: 5, currDriving: false });
-  check('clock restarted → whole batch re-armed', afterStop.rearm.length === 4, JSON.stringify(afterStop));
-  for (const c of afterStop.rearm) held.splice(held.indexOf(c), 1);
+  const atStop = planFatigueThresholds({ codes: held, curMinutes: 5, currDriving: false });
+  check('stop does not clear the batch', atStop.rearm.length === 0 && atStop.fire.length === 0, JSON.stringify(atStop));
+
+  const resumeInflated = planFatigueThresholds({ codes: held, curMinutes: 250, currDriving: true });
+  check(
+    'resume with an INFLATED clock never replays the served 3h (in range → held)',
+    !resumeInflated.fire.some((t) => t.signalCode === THREE_H),
+    JSON.stringify(resumeInflated)
+  );
+
+  const resumeReset = planFatigueThresholds({ codes: held, curMinutes: 5, currDriving: true });
+  check('resume with a genuinely reset clock re-arms the batch', resumeReset.rearm.length === 4, JSON.stringify(resumeReset));
+  for (const c of resumeReset.rearm) held.splice(held.indexOf(c), 1);
 
   const run2 = planFatigueThresholds({ codes: held, curMinutes: 181, currDriving: true });
   check('run 2 fires 3h again (next batch works)', codes(run2).length === 1 && codes(run2)[0] === THREE_H, JSON.stringify(run2));
