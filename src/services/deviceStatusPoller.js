@@ -53,6 +53,34 @@ const FATIGUE_THRESHOLDS = [
   { minutes: 900, signalCode: DURATION_15H_CODE }, // 15 Hour Duration Check
 ];
 
+// Thresholds the clock has ALREADY passed at first sighting → recorded as
+// alerted, so a baseline never replays a batch the vehicle already served.
+function baselineCrossedThresholds(curMinutes) {
+  if (!Number.isFinite(curMinutes) || curMinutes <= 0) return [];
+  return FATIGUE_THRESHOLDS.filter((t) => curMinutes >= t.minutes).map((t) => t.signalCode);
+}
+
+// Pure fire/re-arm decision for the fatigue + duration thresholds. Exported so
+// the rule ("once per continuous run") can be tested without a poller or DB.
+//   rearm — held codes whose threshold the clock has dropped back below
+//           (a genuine new driving run started); remove them from memory.
+//   fire  — not-yet-held thresholds the clock is past while driving; emit each.
+//   curMinutes === null (unparseable/absent duration) → no change at all.
+function planFatigueThresholds({ codes, curMinutes, currDriving }) {
+  const held = new Set(Array.isArray(codes) ? codes : []);
+  const rearm = [];
+  const fire = [];
+  if (!Number.isFinite(curMinutes) || curMinutes < 0) return { rearm, fire };
+  for (const t of FATIGUE_THRESHOLDS) {
+    if (held.has(t.signalCode)) {
+      if (curMinutes < t.minutes) rearm.push(t.signalCode);
+    } else if (currDriving && curMinutes >= t.minutes) {
+      fire.push(t);
+    }
+  }
+  return { rearm, fire };
+}
+
 // ── Module state ──
 let pollTimer = null;
 let wsBroadcast = null;
@@ -656,6 +684,24 @@ const WATCHDOG_EVERY_MS = 15000;
 const CAMERA_CHECK_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const cameraCheckCache = new Map(); // deviceId -> last check timestamp
 
+// One line per driving-state flip, rate-limited per device, so prod shows which
+// snapshots were driving the churn (trusted=false ⇒ stale/offline payload that
+// is now ignored) without flooding the log at 15s cadence.
+const DRIVE_STATE_LOG_TTL_MS = 5 * 60 * 1000;
+const driveStateLoggedAt = new Map();
+function logDriveStateTransition({ deviceId, fleetNumber, prevDriving, currDriving, isFresh, communicating, fixAgeMs, durMs }) {
+  const now = Date.now();
+  const last = driveStateLoggedAt.get(deviceId) || 0;
+  if (now - last < DRIVE_STATE_LOG_TTL_MS) return;
+  driveStateLoggedAt.set(deviceId, now);
+  if (driveStateLoggedAt.size > 2000) driveStateLoggedAt.clear();
+  console.log(
+    `[DRIVE-STATE] ${fleetNumber || deviceId}: ${prevDriving}→${currDriving} ` +
+    `trusted=${isFresh} communicating=${communicating} ` +
+    `fixAgeMs=${Number.isFinite(fixAgeMs) ? Math.round(fixAgeMs) : 'na'} durMs=${durMs ?? 'na'}`
+  );
+}
+
 function markStage(name) { pollStage = name; }
 
 function getPollHealth() {
@@ -814,9 +860,14 @@ async function pollDeviceStatus() {
       // An open driving session IS started for vehicles already on the road.
       if (firstSeen) {
         const spd0 = Number(speed) || 0;
-        const curMinutes = durMs !== null ? durMs / 60000 : 0;
-        // Fatigue pre-seed: empty so thresholds always fire on first check
-        const preAlerted = [];
+        const curMinutes = durMs !== null && durMs > 0 ? durMs / 60000 : 0;
+        // Baseline: thresholds the clock has ALREADY crossed are recorded as
+        // alerted, so a vehicle that appears mid-run (new registration, wiped
+        // row, failed vehicle_status load) never replays the batch it already
+        // served — only genuinely new crossings fire later.
+        const preAlerted = baselineCrossedThresholds(curMinutes);
+        // Speed: already speeding → flag set, so the first alert comes only
+        // after a drop-then-recross (matches the block comment above).
         const ccId = await findVehicleCostCenterId(fleetNumber || deviceId).catch(() => null);
         if (currDriving) {
           await db.startDrivingSession({
@@ -829,52 +880,65 @@ async function pollDeviceStatus() {
           drivingSince: currDriving ? dateTime : null,
           currentStateDurationMs: durMs,
           maxSpeed: spd0,
-          speed85Alerted: false,
-          speed90Alerted: false,
+          speed85Alerted: spd0 >= 85,
+          speed90Alerted: spd0 >= 90,
           fatigueAlertedThresholds: preAlerted,
         });
         vsMap.set(deviceId, {
           ...(prevRow || {}), id: deviceId, is_driving: currDriving,
-          speed_85_alerted: false, speed_90_alerted: false,
+          speed_85_alerted: spd0 >= 85, speed_90_alerted: spd0 >= 90,
           fatigue_alerted_thresholds: JSON.stringify(preAlerted),
         });
       } else {
       // Driving transition — only when a stored value FLIPS. Restart-safe:
       // a stored true stays true until a false arrives (and vice versa).
       if (currDriving !== prevDriving) {
-        if (currDriving) {
-          const ccId = await findVehicleCostCenterId(fleetNumber || deviceId).catch(() => null);
-          await db.startDrivingSession({
-            deviceId, fleetNumber, registrationNumber: licensePlate,
-            costCenterId: ccId, startedAt: dateTime,
-          });
-          // Pre-seed thresholds: empty so thresholds always fire on first check
-          const preAlerted = [];
-          await db.updateVehicleStatusDriving(deviceId, {
-            isDriving: true,
-            drivingSince: dateTime,
-            currentStateDurationMs: durMs,
-            maxSpeed: speed ?? 0,
-            speed85Alerted: false,
-            speed90Alerted: false,
-            fatigueAlertedThresholds: preAlerted,
-          });
-        } else {
-          await db.endDrivingSession(deviceId, dateTime);
-          await db.updateVehicleStatusDriving(deviceId, {
-            isDriving: false,
-            drivingSince: null,
-            currentStateDurationMs: durMs,
-          });
+        logDriveStateTransition({ deviceId, fleetNumber, prevDriving, currDriving, isFresh, communicating, fixAgeMs, durMs });
+        // Only a LIVE snapshot (fresh fix + currently communicating) may flip
+        // stored driving state. Stale/offline payloads carry isDriving=false as
+        // a side effect of not talking to Geotab — honouring them churned
+        // driving_sessions AND wiped the fatigue/speed alert memory while the
+        // Geotab clock kept counting, which is what re-fired already-served
+        // 3h/6h/9h thresholds minutes after they were resolved.
+        if (isFresh) {
+          if (currDriving) {
+            const ccId = await findVehicleCostCenterId(fleetNumber || deviceId).catch(() => null);
+            await db.startDrivingSession({
+              deviceId, fleetNumber, registrationNumber: licensePlate,
+              costCenterId: ccId, startedAt: dateTime,
+            });
+            // Deliberately does NOT touch fatigue_alerted_thresholds or the
+            // speed episode flags: fatigue re-arms only when the Geotab clock
+            // drops below an alerted threshold, speed only after its
+            // below-threshold dwell. A transition alone must never make an
+            // alert that already fired fire again.
+            await db.updateVehicleStatusDriving(deviceId, {
+              isDriving: true,
+              drivingSince: dateTime,
+              currentStateDurationMs: durMs,
+              maxSpeed: speed ?? 0,
+            });
+          } else {
+            await db.endDrivingSession(deviceId, dateTime);
+            await db.updateVehicleStatusDriving(deviceId, {
+              isDriving: false,
+              drivingSince: null,
+              currentStateDurationMs: durMs,
+            });
+          }
+          drivingChanged++;
+          vsMap.set(deviceId, { ...prevRow, is_driving: currDriving });
         }
-        drivingChanged++;
-        vsMap.set(deviceId, { ...prevRow, is_driving: currDriving });
       } else {
         // Same state: keep duration + max speed fresh, never touch driving flags.
-        await db.updateVehicleStatusDriving(deviceId, {
-          currentStateDurationMs: durMs,
-          maxSpeed: Math.max(Number(prevRow.max_speed_this_session) || 0, Number(speed) || 0),
-        });
+        // Stale snapshots must not roll the stored duration backwards either —
+        // only a live reading advances it.
+        if (isFresh) {
+          await db.updateVehicleStatusDriving(deviceId, {
+            currentStateDurationMs: durMs,
+            maxSpeed: Math.max(Number(prevRow.max_speed_this_session) || 0, Number(speed) || 0),
+          });
+        }
       }
       }
 
@@ -899,33 +963,41 @@ async function pollDeviceStatus() {
       if (!isRegisteredToken(fleetNumber, licensePlate, fleetSet)) continue;
       if (lat == null || lon == null) continue;
 
-      // Fatigue from authoritative currentStateDuration — driving sessions only,
-      // and only while the vehicle's data is fresh (dateTime recent + communicating).
+      // Fatigue/duration from the authoritative Geotab clock (currentStateDuration)
+      // — the ONLY thing that both fires and re-arms a threshold:
+      //   fire:   clock is past a threshold that is not yet alerted, while driving;
+      //   re-arm: clock dropped BELOW an alerted threshold (genuine new run), so
+      //           the next batch fires when that run crosses it again.
+      // A threshold therefore never fires twice while the clock still reads past
+      // it, no matter how often the driving flag flaps. Only fresh readings may
+      // change the memory (stale/offline payloads are observational only).
       const alertedFatigue = (() => {
         try { return JSON.parse(prevRow.fatigue_alerted_thresholds || '[]'); } catch { return []; }
       })();
-      const newFatigue = [...alertedFatigue];
-      if (isFresh && currDriving && durMs !== null && durMs > 0) {
-        const curMinutes = durMs / 60000;
-        for (const t of FATIGUE_THRESHOLDS) {
-          if (curMinutes >= t.minutes && !newFatigue.includes(t.signalCode)) {
-            const groupRow = await emitDeviceStatusAlert({
-              deviceId, fleetNumber, licensePlate, signalCode: t.signalCode,
-              alarmText: `${defNameFor(t.signalCode)} exceeded (${t.minutes} min)`,
-              lat, lon, speed, ts: dateTime,
-              extra: { drivingMinutes: Math.round(curMinutes) },
-            });
-            // Record the threshold ONLY once its alert exists. A failed emit (gate,
-            // missing definition, DB error) writes nothing, so it is retried on the
-            // next poll instead of being silently consumed.
-            if (groupRow) {
-              newFatigue.push(t.signalCode);
-            } else {
-              const key = `${deviceId}:${t.signalCode}`;
-              if (!fatigueDropLogged.has(key)) {
-                fatigueDropLogged.add(key);
-                console.log(`[FATIGUE] no alert created for ${fleetNumber || deviceId} ${t.minutes}h threshold (will retry); see the reason logged above`);
-              }
+      let newFatigue = [...alertedFatigue];
+      if (isFresh) {
+        const curMinutes = durMs !== null && durMs > 0 ? durMs / 60000 : null;
+        const plan = planFatigueThresholds({ codes: newFatigue, curMinutes, currDriving });
+        for (const code of plan.rearm) {
+          newFatigue = newFatigue.filter((c) => c !== code);
+        }
+        for (const t of plan.fire) {
+          const groupRow = await emitDeviceStatusAlert({
+            deviceId, fleetNumber, licensePlate, signalCode: t.signalCode,
+            alarmText: `${defNameFor(t.signalCode)} exceeded (${t.minutes} min)`,
+            lat, lon, speed, ts: dateTime,
+            extra: { drivingMinutes: Math.round(curMinutes) },
+          });
+          // Record the threshold ONLY once its alert exists. A failed emit (gate,
+          // missing definition, DB error) writes nothing, so it is retried on the
+          // next poll instead of being silently consumed.
+          if (groupRow) {
+            newFatigue.push(t.signalCode);
+          } else {
+            const key = `${deviceId}:${t.signalCode}`;
+            if (!fatigueDropLogged.has(key)) {
+              fatigueDropLogged.add(key);
+              console.log(`[FATIGUE] no alert created for ${fleetNumber || deviceId} ${t.minutes}h threshold (will retry); see the reason logged above`);
             }
           }
         }
@@ -1177,4 +1249,4 @@ async function checkCameraStatus(deviceId, fleetNumber, licensePlate, mettaxDevi
   }
 }
 
-module.exports = { startPoller, stopPoller, runOnce, setWsBroadcast, pollDeviceStatus, parseGeotabDurationMs, invalidateZonesCache, getPollHealth, emitDeviceStatusAlert };
+module.exports = { startPoller, stopPoller, runOnce, setWsBroadcast, pollDeviceStatus, parseGeotabDurationMs, invalidateZonesCache, getPollHealth, emitDeviceStatusAlert, planFatigueThresholds, baselineCrossedThresholds, FATIGUE_THRESHOLDS };
