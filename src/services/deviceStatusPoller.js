@@ -44,6 +44,12 @@ const SPEED_REARM_DWELL_MS = 30 * 1000;
 // own 85 rule: smallest episode it ever produced is exactly 120s). 90 km/h is
 // unchanged — a single fresh sample at/above 90 flags immediately.
 const SPEED_85_SUSTAIN_MS = 120 * 1000;
+// A held fatigue/duration threshold only re-arms after a REAL break. Geotab's
+// clock restarts on any state change — a 4-minute robot/fuel stop used to look
+// like a "genuine new run" and re-fired the 3h batch in the same shift (EX65:
+// fired 10:09, stopped 4m, re-fired 13:24). Off-duty/long stops (> 30 min)
+// qualify; short stops keep the batch held.
+const FATIGUE_MIN_BREAK_MS = 30 * 60 * 1000;
 // Trail gaps longer than this are NOT bridged when summing distance: a stale or
 // failed poll leaves points minutes apart and the straight-line chord across a
 // city would invent distance the path never took.
@@ -258,6 +264,52 @@ async function distanceOverTrail(deviceId, fromIso, toIso, endpoint = null) {
     console.error('[DEVSTATUS] trail distance failed:', err.message);
     return null;
   }
+}
+
+// ── Break qualification for fatigue re-arms ────────────────────────────────
+// Gap between the CURRENT driving session and the one before it. Computed once
+// per session start (primed in the transition branch) and cached per device.
+// No prior session at all → treated as a qualifying break (first trip).
+const sessionBreakCache = new Map(); // deviceId -> { startIso, qualified }
+
+function isoOf(value) {
+  if (!value) return null;
+  const d = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+async function sessionBreakQualified(deviceId, sessionStartIso) {
+  if (!deviceId || !sessionStartIso) return false; // can't prove a break → hold the batch
+  const cached = sessionBreakCache.get(deviceId);
+  if (cached && cached.startIso === sessionStartIso) return cached.qualified;
+  let qualified;
+  try {
+    const res = await db.query(
+      `SELECT MAX(driving_ended_at) AS e
+         FROM driving_sessions
+        WHERE device_id = $1
+          AND driving_ended_at IS NOT NULL
+          AND driving_ended_at <= $2::timestamptz`,
+      [deviceId, sessionStartIso]
+    );
+    const end = res.rows[0] && res.rows[0].e;
+    if (!end) {
+      qualified = true; // no earlier session — first run, nothing to disqualify
+    } else {
+      const gapMs = new Date(sessionStartIso).getTime() - new Date(end).getTime();
+      qualified = gapMs >= FATIGUE_MIN_BREAK_MS;
+      if (!qualified) {
+        console.log(
+          `[FATIGUE] ${deviceId}: break ${Math.round(gapMs / 1000)}s < ${FATIGUE_MIN_BREAK_MS / 1000}s — held thresholds not re-armed`
+        );
+      }
+    }
+  } catch (err) {
+    console.error('[DEVSTATUS] session-break lookup failed:', err.message);
+    qualified = false; // lookup failed → never re-arm on guesswork
+  }
+  sessionBreakCache.set(deviceId, { startIso: sessionStartIso, qualified });
+  return qualified;
 }
 
 // ── Cache loaders ──
@@ -932,6 +984,10 @@ async function pollDeviceStatus() {
       const prevDriving = prevRow?.is_driving ?? null; // null initially / unknown
       const currDriving = d.isDriving === true;
       const durMs = parseGeotabDurationMs(d.currentStateDuration);
+      // Session whose break gates fatigue re-arms. Kept as a local so the tick
+      // that STARTS a session uses its OWN start (prevRow still holds the old
+      // one until the next reload) — the gap must be current-session vs prev.
+      let currentSessionStartIso = isoOf(prevRow?.driving_since);
 
       // First sighting (fresh setup/rebuild or never-seen device): store the
       // observed state + its duration as a SILENT baseline. No alerts fire —
@@ -961,6 +1017,8 @@ async function pollDeviceStatus() {
             deviceId, fleetNumber, registrationNumber: licensePlate,
             costCenterId: ccId, startedAt: dateTime,
           });
+          currentSessionStartIso = dateTime;
+          await sessionBreakQualified(deviceId, dateTime); // prime break cache
         }
         await db.updateVehicleStatusDriving(deviceId, {
           isDriving: currDriving,
@@ -996,11 +1054,14 @@ async function pollDeviceStatus() {
               deviceId, fleetNumber, registrationNumber: licensePlate,
               costCenterId: ccId, startedAt: dateTime,
             });
+            currentSessionStartIso = dateTime;
+            await sessionBreakQualified(deviceId, dateTime); // prime break cache
             // Deliberately does NOT touch fatigue_alerted_thresholds or the
-            // speed episode flags: fatigue re-arms only when the Geotab clock
-            // drops below an alerted threshold, speed only after its
-            // below-threshold dwell. A transition alone must never make an
-            // alert that already fired fire again.
+            // speed episode flags: fatigue re-arms only when BOTH the Geotab
+            // clock drops below an alerted threshold AND the gap before THIS
+            // session was a real break (>= FATIGUE_MIN_BREAK_MS); speed only
+            // after its below-threshold dwell. A transition alone must never
+            // make an alert that already fired fire again.
             await db.updateVehicleStatusDriving(deviceId, {
               isDriving: true,
               drivingSince: dateTime,
@@ -1053,11 +1114,15 @@ async function pollDeviceStatus() {
       if (lat == null || lon == null) continue;
 
       // Fatigue/duration from the authoritative Geotab clock (currentStateDuration)
-      // — the ONLY thing that both fires and re-arms a threshold:
+      // — the thing that both fires and re-arms a threshold:
       //   fire:   clock is past a threshold that is not yet alerted, while driving;
-      //   re-arm: while DRIVING, clock dropped BELOW an alerted threshold (a
-      //           genuine new run) — stops and stale readings never clear memory,
-      //           so an inflated clock on resume cannot replay a served batch.
+      //   re-arm: while DRIVING the clock dropped BELOW an alerted threshold AND
+      //           the gap before the CURRENT session was a REAL break
+      //           (>= FATIGUE_MIN_BREAK_MS). Stops, stale readings and short
+      //           robot/fuel stops never clear memory — Geotab restarts its
+      //           clock on any state change, so without the break gate a
+      //           4-minute stop re-fires the 3h batch inside the same shift
+      //           (EX65: fired 10:09, stopped 4m, re-fired 13:24).
       // A threshold therefore never fires twice while the clock still reads past
       // it, no matter how often the driving flag flaps. Only fresh readings may
       // change the memory (stale/offline payloads are observational only).
@@ -1068,6 +1133,10 @@ async function pollDeviceStatus() {
       if (isFresh) {
         const curMinutes = durMs !== null && durMs > 0 ? durMs / 60000 : null;
         const plan = planFatigueThresholds({ codes: newFatigue, curMinutes, currDriving });
+        if (plan.rearm.length > 0) {
+          const breakOk = await sessionBreakQualified(deviceId, currentSessionStartIso);
+          if (!breakOk) plan.rearm = []; // short stop → keep the served batch held
+        }
         for (const code of plan.rearm) {
           newFatigue = newFatigue.filter((c) => c !== code);
         }
@@ -1076,7 +1145,7 @@ async function pollDeviceStatus() {
         // how far the driver went on this run.
         let sessionKm = null;
         if (plan.fire.length > 0) {
-          sessionKm = await distanceOverTrail(deviceId, prevRow.driving_since, dateTime, { lat, lon });
+          sessionKm = await distanceOverTrail(deviceId, currentSessionStartIso || prevRow.driving_since, dateTime, { lat, lon });
         }
         for (const t of plan.fire) {
           const groupRow = await emitDeviceStatusAlert({
@@ -1392,4 +1461,4 @@ async function checkCameraStatus(deviceId, fleetNumber, licensePlate, mettaxDevi
   }
 }
 
-module.exports = { startPoller, stopPoller, runOnce, setWsBroadcast, pollDeviceStatus, parseGeotabDurationMs, invalidateZonesCache, getPollHealth, emitDeviceStatusAlert, planFatigueThresholds, baselineCrossedThresholds, distanceOverTrail, haversineKm, FATIGUE_THRESHOLDS, SPEED_85_SUSTAIN_MS, SPEED_REARM_DWELL_MS };
+module.exports = { startPoller, stopPoller, runOnce, setWsBroadcast, pollDeviceStatus, parseGeotabDurationMs, invalidateZonesCache, getPollHealth, emitDeviceStatusAlert, planFatigueThresholds, baselineCrossedThresholds, distanceOverTrail, haversineKm, sessionBreakQualified, FATIGUE_THRESHOLDS, SPEED_85_SUSTAIN_MS, SPEED_REARM_DWELL_MS, FATIGUE_MIN_BREAK_MS };

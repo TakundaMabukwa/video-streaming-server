@@ -168,6 +168,13 @@ const sessions = async () =>
   check('trusted stop applied (is_driving false)', row.is_driving === false, row.is_driving);
   check('STOP did NOT re-arm fatigue memory', JSON.stringify(await heldCodes(row)) === JSON.stringify([THREE_H]), JSON.stringify(await heldCodes(row)));
   check('stop raised nothing', (await fatigueGroups()).length === 0, (await fatigueGroups()).length);
+  // Make this stop a QUALIFYING break (40 min) before the resume — the S5
+  // re-arm is only allowed after a real break. The refusal for a SHORT stop is
+  // asserted in S10 (the prod EX65 pattern: 4-min stop re-fired the batch).
+  await query(
+    "UPDATE driving_sessions SET driving_ended_at = NOW() - INTERVAL '40 minutes' WHERE device_id = $1 AND driving_ended_at IS NOT NULL",
+    [DEVICE_ID]
+  );
 
   console.log('== [S4c] resume with INFLATED clock (prod b101 shape: 04:10 after a 73s stop) ==');
   await tick('resume @ 04:10', snap({ driving: true, duration: '04:10:00' }));
@@ -205,9 +212,20 @@ const sessions = async () =>
   await tick('held after restore @ 03:31', snap({ driving: true, duration: '03:31:00' }));
   check('still exactly one 3h group for the whole run', (await fatigueGroups()).length === 1, JSON.stringify(await fatigueGroups()));
 
+  console.log('== [S10] EX65 pattern: SHORT stop must NOT re-arm ==');
+  await tick('stop (seconds long)', snap({ driving: false, duration: '00:00:10', speed: 0 }));
+  await tick('resume @00:05 after a seconds-long stop', snap({ driving: true, duration: '00:05:00' }));
+  row = await vs();
+  check(
+    'short stop did NOT re-arm the held 3h (break < 30 min)',
+    JSON.stringify(await heldCodes(row)) === JSON.stringify([THREE_H]),
+    JSON.stringify(await heldCodes(row))
+  );
+  check('still exactly one 3h group — no same-shift re-fire', (await fatigueGroups()).length === 1, JSON.stringify(await fatigueGroups()));
+
   console.log('');
   console.log('groups raised for test device:', JSON.stringify(await allGroups()));
-  check('sessions = baseline + resume + re-onboard only (flap added none)', (await sessions()) === 3, await sessions());
+  check('sessions = baseline + resume + re-onboard + short-stop resume (no flap churn)', (await sessions()) === 4, await sessions());
   console.log(`fatigue-poller: ${pass} passed, ${fail} failed`);
   process.exit(fail === 0 ? 0 : 1);
 })().catch((err) => {
