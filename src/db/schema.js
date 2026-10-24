@@ -660,6 +660,10 @@ const MIGRATIONS_SQL = `
   -- after the dwell window (see deviceStatusPoller).
   ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS speed_85_dwell_since TIMESTAMPTZ;
   ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS speed_90_dwell_since TIMESTAMPTZ;
+  -- 85 km/h rule: the run must last >= 2 minutes before it flags. episode_since
+  -- is the start of the CURRENT continuous >=85 run (any fresh below-85 sample
+  -- clears it, so the clock restarts on the next crossing).
+  ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS speed_85_episode_since TIMESTAMPTZ;
   -- Fast /vehicles/online: engine-on (is_driving=true) with fresh telematics time.
   CREATE INDEX IF NOT EXISTS idx_vehicle_status_driving_live
     ON vehicle_status (last_log_time DESC) WHERE is_driving = TRUE;

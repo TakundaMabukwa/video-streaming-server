@@ -576,53 +576,70 @@ async function getAlertById(req, res) {
     transformed.notes = alert.notes || null;
     transformed.documents = Array.isArray(alert.documents) ? alert.documents : [];
 
-    // Fetch speed from telematics_events using fleet_number and alert timestamp
-    // Look within 5 minute range of the video alert
-    // Extract fleet_number from vehicle_registration (e.g., "EX69 - LDR067MP" -> "EX69")
+    // Speed/distance context from telematics_events, keyed on fleet + time.
+    //   • VIDEO alerts keep the nearest-event lookup (any type) — they have no
+    //     speed of their own and just need vehicle context.
+    //   • TELEMATICS alerts only borrow from an event of the SAME type (a 90
+    //     alert must never show an 85 event's numbers) and NEVER overwrite the
+    //     group's own speed — enrichment only fills distance / duration.
     let fleetNum = transformed.fleet_number || alert.fleet_number;
     if (!fleetNum && transformed.vehicle_registration) {
       const parts = transformed.vehicle_registration.split(' - ');
       fleetNum = parts[0]?.trim();
     }
     const alertTime = transformed.timestamp || alert.alarm_ts;
-    
+    const isTelematics = String(transformed.source_type || alert.source_type || '').toLowerCase() === 'telematics';
+    const alarmType = String(alert.alarm_type || transformed.alert_type || transformed.type || '').trim();
+    const typeScope = isTelematics && alarmType ? 'AND event_type = $3' : '';
+
     if (fleetNum && alertTime) {
       try {
-        console.log(`[SPEED] Looking up speed for fleet: ${fleetNum}, time: ${alertTime}`);
+        console.log(`[SPEED] Looking up speed for fleet: ${fleetNum}, time: ${alertTime}${typeScope ? ' (same-type only)' : ''}`);
         const speedResult = await db.query(
           `SELECT speed, distance, duration_seconds FROM telematics_events
-           WHERE fleet_number = $1 AND speed IS NOT NULL 
+           WHERE fleet_number = $1
+           ${isTelematics ? '' : 'AND speed IS NOT NULL'}
+           ${typeScope}
            AND event_time >= $2::timestamptz - INTERVAL '5 minutes'
            AND event_time <= $2::timestamptz + INTERVAL '5 minutes'
            ORDER BY ABS(EXTRACT(EPOCH FROM (event_time - $2::timestamptz))) ASC
            LIMIT 1`,
-          [fleetNum, alertTime]
+          typeScope ? [fleetNum, alertTime, alarmType] : [fleetNum, alertTime]
         );
         console.log(`[SPEED] Result: ${speedResult.rows.length} rows`);
-        if (speedResult.rows.length > 0) {
-          transformed.speed = speedResult.rows[0].speed;
-          transformed.distance = speedResult.rows[0].distance;
-          transformed.duration_seconds = speedResult.rows[0].duration_seconds;
-          transformed.metadata = { ...transformed.metadata, speed: speedResult.rows[0].speed };
-          console.log(`[SPEED] Set speed: ${speedResult.rows[0].speed} for fleet ${fleetNum}`);
+        const hit = speedResult.rows[0];
+        if (hit) {
+          if (hit.distance != null) transformed.distance = hit.distance;
+          if (hit.duration_seconds != null) transformed.duration_seconds = hit.duration_seconds;
+          if (hit.speed != null) {
+            if (!isTelematics || transformed.speed == null) {
+              transformed.speed = hit.speed;
+              transformed.metadata = { ...transformed.metadata, speed: hit.speed };
+            }
+          }
+          console.log(`[SPEED] speed=${transformed.speed} distance=${transformed.distance} for fleet ${fleetNum}`);
         }
       } catch (e) { console.log(`[SPEED] Error: ${e.message}`); }
     } else if (fleetNum) {
-      // Fallback: get most recent speed for this fleet
-      try {
-        const speedResult = await db.query(
-          `SELECT speed, distance, duration_seconds FROM telematics_events
-           WHERE fleet_number = $1 AND speed IS NOT NULL
-           ORDER BY event_time DESC LIMIT 1`,
-          [fleetNum]
-        );
-        if (speedResult.rows.length > 0) {
-          transformed.speed = speedResult.rows[0].speed;
-          transformed.distance = speedResult.rows[0].distance;
-          transformed.duration_seconds = speedResult.rows[0].duration_seconds;
-          transformed.metadata = { ...transformed.metadata, speed: speedResult.rows[0].speed };
-        }
-      } catch (e) { /* non-critical */ }
+      // Fallback: get most recent speed for this fleet (video alerts only —
+      // a telematics alert without a timestamp still must not borrow another
+      // type's numbers).
+      if (!isTelematics) {
+        try {
+          const speedResult = await db.query(
+            `SELECT speed, distance, duration_seconds FROM telematics_events
+             WHERE fleet_number = $1 AND speed IS NOT NULL
+             ORDER BY event_time DESC LIMIT 1`,
+            [fleetNum]
+          );
+          if (speedResult.rows.length > 0) {
+            transformed.speed = speedResult.rows[0].speed;
+            transformed.distance = speedResult.rows[0].distance;
+            transformed.duration_seconds = speedResult.rows[0].duration_seconds;
+            transformed.metadata = { ...transformed.metadata, speed: speedResult.rows[0].speed };
+          }
+        } catch (e) { /* non-critical */ }
+      }
     }
 
     const media = alert.media || [];

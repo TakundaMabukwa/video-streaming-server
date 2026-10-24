@@ -92,8 +92,12 @@ async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, al
          device_name = COALESCE(NULLIF($3, ''), alert_groups.device_name),
          lat = COALESCE($4, alert_groups.lat),
          lon = COALESCE($5, alert_groups.lon),
-         speed = COALESCE($6, alert_groups.speed),
-         alarm_text = COALESCE(NULLIF($7, ''), alert_groups.alarm_text),
+         speed = CASE
+                   WHEN $6::float8 IS NULL THEN alert_groups.speed
+                   WHEN alert_groups.speed IS NULL THEN $6::float8
+                   ELSE GREATEST(alert_groups.speed, $6::float8)
+                 END,
+         alarm_text = COALESCE(NULLIF(alert_groups.alarm_text, ''), NULLIF($7, '')),
          severity = COALESCE(NULLIF($8, ''), alert_groups.severity),
          fleet_number = COALESCE(NULLIF($9, ''), alert_groups.fleet_number),
          updated_at = NOW()

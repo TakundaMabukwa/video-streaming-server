@@ -40,6 +40,17 @@ const DATA_FRESH_MS = 5 * 60 * 1000;
 // Speed episode re-arm dwell: after a speed alert fires, the vehicle must stay
 // below the threshold for ~30s (≈2 polls) before the alert can fire again.
 const SPEED_REARM_DWELL_MS = 30 * 1000;
+// 85 km/h must be sustained for >= 2 minutes before it flags (matches Geotab's
+// own 85 rule: smallest episode it ever produced is exactly 120s). 90 km/h is
+// unchanged — a single fresh sample at/above 90 flags immediately.
+const SPEED_85_SUSTAIN_MS = 120 * 1000;
+// Trail gaps longer than this are NOT bridged when summing distance: a stale or
+// failed poll leaves points minutes apart and the straight-line chord across a
+// city would invent distance the path never took.
+const TRAIL_MAX_LEG_MS = 120 * 1000;
+// GPS jitter floor: parked receivers drift a few metres per fix; anything under
+// 5 m between 15s samples is noise, never real movement (5 m / 15 s ≈ 1.2 km/h).
+const TRAIL_MIN_LEG_KM = 0.005;
 
 // Fatigue thresholds (minutes) -> alert_definitions.signal_code.
 // Definition names are resolved at runtime via isAlertActiveForCC — nothing
@@ -181,6 +192,74 @@ function parseGeotabDurationMs(value) {
   return negative ? -ms : ms;
 }
 
+// ── Distance over the GPS trail (haversine) ────────────────────────────────
+// Great-circle distance in km between two fixes. atan2 form — the numerically
+// stable equivalent of the textbook 2·asin(√a).
+function haversineKm(lat1, lon1, lat2, lon2) {
+  if (![lat1, lon1, lat2, lon2].every((v) => Number.isFinite(v))) return 0;
+  const toRad = (deg) => (deg * Math.PI) / 180;
+  const phi1 = toRad(lat1);
+  const phi2 = toRad(lat2);
+  const dPhi = toRad(lat2 - lat1);
+  const dLambda = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dPhi / 2) ** 2 +
+    Math.cos(phi1) * Math.cos(phi2) * Math.sin(dLambda / 2) ** 2;
+  return 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+// Distance actually covered inside [fromIso, toIso], summed from the GPS trail
+// we already store every poll (telemetry_history, indexed device+time).
+// `endpoint` is the CURRENT fix {lat, lon, t?}: the alert fires mid-loop, before
+// this tick's trail row is written, so the final leg is appended explicitly.
+// Returns kilometres, or null when the window holds no points (no data → the
+// value simply isn't recorded, it is never faked as 0).
+async function distanceOverTrail(deviceId, fromIso, toIso, endpoint = null) {
+  if (!deviceId || !fromIso || !toIso) return null;
+  try {
+    const from = new Date(fromIso);
+    const to = new Date(toIso);
+    if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime()) || to <= from) return null;
+    const res = await db.query(
+      `SELECT lat, lon, EXTRACT(EPOCH FROM event_time) * 1000 AS t
+         FROM telemetry_history
+        WHERE device_id = $1
+          AND event_time >= $2::timestamptz
+          AND event_time <= $3::timestamptz
+        ORDER BY event_time ASC`,
+      [deviceId, from.toISOString(), to.toISOString()]
+    );
+    const points = (res.rows || [])
+      .map((r) => ({ lat: Number(r.lat), lon: Number(r.lon), t: Number(r.t) }))
+      .filter((p) => Number.isFinite(p.lat) && Number.isFinite(p.lon) && Number.isFinite(p.t));
+    if (points.length === 0) return null;
+    if (endpoint && Number.isFinite(Number(endpoint.lat)) && Number.isFinite(Number(endpoint.lon))) {
+      const t = endpoint.t != null ? Number(endpoint.t) : to.getTime();
+      if (Number.isFinite(t)) {
+        points.push({ lat: Number(endpoint.lat), lon: Number(endpoint.lon), t });
+      }
+    }
+    let km = 0;
+    let prev = null;
+    for (const pt of points) {
+      if (prev) {
+        const dt = pt.t - prev.t;
+        // Skip stale gaps (would invent a straight line across a city) and
+        // sub-5m legs (GPS drift while parked).
+        if (dt > 0 && dt <= TRAIL_MAX_LEG_MS) {
+          const leg = haversineKm(prev.lat, prev.lon, pt.lat, pt.lon);
+          if (leg >= TRAIL_MIN_LEG_KM) km += leg;
+        }
+      }
+      prev = pt;
+    }
+    return Math.round(km * 1000) / 1000; // metres precision
+  } catch (err) {
+    console.error('[DEVSTATUS] trail distance failed:', err.message);
+    return null;
+  }
+}
+
 // ── Cache loaders ──
 
 async function getZones() {
@@ -274,7 +353,7 @@ function findCurrentZone(zones, lat, lon) {
 // group is created. Definition must be active for the vehicle's cost center
 // (isAlertActiveForCC); a vehicle with no cost center still gets the alert as
 // long as it exists in fleet_vehicles.
-async function emitDeviceStatusAlert({ deviceId, fleetNumber, licensePlate, signalCode, alarmText, lat, lon, speed, ts, extra = {} }) {
+async function emitDeviceStatusAlert({ deviceId, fleetNumber, licensePlate, signalCode, alarmText, lat, lon, speed, ts, extra = {}, distanceKm = null }) {
   try {
     // Vehicle override: this vehicle must not raise this alert (checked
     // before anything is written — no group, no event row, no alert).
@@ -365,8 +444,8 @@ async function emitDeviceStatusAlert({ deviceId, fleetNumber, licensePlate, sign
     if (groupRows.length > 0 || comboResult.action !== 'pass') {
       await db.query(
         `INSERT INTO telematics_events (device_id, vehicle_id, license_plate, fleet_number, plate,
-          event_type, event_code, severity, latitude, longitude, speed, description, zone_name, raw_data, event_time)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+          event_type, event_code, severity, latitude, longitude, speed, description, zone_name, raw_data, event_time, distance)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
         [
           deviceId, deviceId, licensePlate || null, fleetNumber || null, licensePlate || null,
           def.name, signalCode, String(def.severity || 'MEDIUM').toUpperCase(),
@@ -374,6 +453,7 @@ async function emitDeviceStatusAlert({ deviceId, fleetNumber, licensePlate, sign
           alarmText || def.name, extra.zoneName || null,
           JSON.stringify({ signalCode, source: 'deviceStatus', ...extra }),
           alarmTs,
+          Number.isFinite(distanceKm) && distanceKm >= 0 ? distanceKm : null,
         ]
       ).catch(() => {});
     }
@@ -870,8 +950,11 @@ async function pollDeviceStatus() {
         // row, failed vehicle_status load) never replays the batch it already
         // served — only genuinely new crossings fire later.
         const preAlerted = baselineCrossedThresholds(curMinutes);
-        // Speed: already speeding → flag set, so the first alert comes only
-        // after a drop-then-recross (matches the block comment above).
+        // Speed baseline: the 2-minute 85 clock starts NOW when already
+        // speeding — nothing fires on first sighting, and the alert lands only
+        // if the run survives the full sustain window from here. 90 keeps its
+        // baseline silence (drop-then-recross), per "no alerts on first sight".
+        const ep85Baseline = Number.isFinite(spd0) && spd0 >= 85 ? new Date().toISOString() : null;
         const ccId = await findVehicleCostCenterId(fleetNumber || deviceId).catch(() => null);
         if (currDriving) {
           await db.startDrivingSession({
@@ -884,13 +967,15 @@ async function pollDeviceStatus() {
           drivingSince: currDriving ? dateTime : null,
           currentStateDurationMs: durMs,
           maxSpeed: spd0,
-          speed85Alerted: spd0 >= 85,
+          speed85Alerted: false,
           speed90Alerted: spd0 >= 90,
+          speed85EpisodeSince: ep85Baseline,
           fatigueAlertedThresholds: preAlerted,
         });
         vsMap.set(deviceId, {
           ...(prevRow || {}), id: deviceId, is_driving: currDriving,
-          speed_85_alerted: spd0 >= 85, speed_90_alerted: spd0 >= 90,
+          speed_85_alerted: false, speed_90_alerted: spd0 >= 90,
+          speed_85_episode_since: ep85Baseline,
           fatigue_alerted_thresholds: JSON.stringify(preAlerted),
         });
       } else {
@@ -986,12 +1071,20 @@ async function pollDeviceStatus() {
         for (const code of plan.rearm) {
           newFatigue = newFatigue.filter((c) => c !== code);
         }
+        // Km driven in the CURRENT driving session — one trail query per fire,
+        // never per poll. Stored on the archive row so the alert modal can show
+        // how far the driver went on this run.
+        let sessionKm = null;
+        if (plan.fire.length > 0) {
+          sessionKm = await distanceOverTrail(deviceId, prevRow.driving_since, dateTime, { lat, lon });
+        }
         for (const t of plan.fire) {
           const groupRow = await emitDeviceStatusAlert({
             deviceId, fleetNumber, licensePlate, signalCode: t.signalCode,
             alarmText: `${defNameFor(t.signalCode)} exceeded (${t.minutes} min)`,
             lat, lon, speed, ts: dateTime,
             extra: { drivingMinutes: Math.round(curMinutes) },
+            distanceKm: sessionKm,
           });
           // Record the threshold ONLY once its alert exists. A failed emit (gate,
           // missing definition, DB error) writes nothing, so it is retried on the
@@ -1008,23 +1101,47 @@ async function pollDeviceStatus() {
         }
       }
 
-      // Speed alerts — one alert per sustained episode. Fires on the first fresh
-      // crossing; re-arms only after speed stays below the threshold for a dwell
-      // window (~60s ≈ 4 polls) so brief dips don't re-trigger. Only fresh
-      // readings may advance the episode state (stale dips can't re-arm).
+      // Speed alerts — one alert per sustained episode.
+      //   90 km/h: flags on the FIRST fresh sample at/above 90 (unchanged).
+      //   85 km/h: flags only after >= SPEED_85_SUSTAIN_MS (2 min) spent
+      //            continuously at/above 85 — see the episode clock below.
+      // Re-arm: either threshold fires again only after speed stays below it
+      // for SPEED_REARM_DWELL_MS, so brief dips don't re-trigger. Only fresh
+      // readings may advance the episode/re-arm state (stale dips can't).
       const spd = Number(speed);
       let s85 = !!prevRow.speed_85_alerted;
       let s90 = !!prevRow.speed_90_alerted;
+      // Current continuous >=85 run: started when the first fresh sample at/above
+      // 85 landed, cleared by the first fresh sample below 85 (strict — any dip
+      // restarts the 2-minute count). Stale or speedless samples never touch it.
+      let ep85 = prevRow.speed_85_episode_since
+        ? new Date(prevRow.speed_85_episode_since).getTime()
+        : null;
+      if (!Number.isFinite(ep85)) ep85 = null;
       // Speeding diagnostics: log every snapshot at or above 80 km/h so a missed
       // alert can be explained from the data (fresh flag + prior alert state).
       if (spd >= 80) {
-        console.log(`[SPEED-POLL] ${fleetNumber || deviceId} ${licensePlate || ''} spd=${spd} fresh=${isFresh} at=${dateTime} prev85=${s85} prev90=${s90}`);
+        console.log(
+          `[SPEED-POLL] ${fleetNumber || deviceId} ${licensePlate || ''} spd=${spd} fresh=${isFresh} at=${dateTime} ` +
+          `prev85=${s85} prev90=${s90} ep85AgeS=${ep85 === null ? 'none' : Math.max(0, Math.round((Date.now() - ep85) / 1000))}`
+        );
       }
       let dwell85 = prevRow.speed_85_dwell_since ? new Date(prevRow.speed_85_dwell_since).getTime() : null;
       let dwell90 = prevRow.speed_90_dwell_since ? new Date(prevRow.speed_90_dwell_since).getTime() : null;
 
       if (isFresh) {
         const nowMs = Date.now();
+
+        // 85 episode clock (strict): a fresh finite sample >=85 starts/continues
+        // the run; a fresh sample <85 ends it. Non-finite (no speed) samples are
+        // unknowns — they neither advance nor reset the clock.
+        if (Number.isFinite(spd)) {
+          if (spd >= 85) {
+            if (ep85 === null) ep85 = nowMs;
+          } else {
+            ep85 = null;
+          }
+        }
 
         // Re-arm bookkeeping: while alerted, count a continuous below-threshold
         // dwell; a re-crossing resets it (same episode).
@@ -1045,6 +1162,19 @@ async function pollDeviceStatus() {
           dwell85 = null;
         }
 
+        // Distance covered in the CURRENT overspeed run (haversine over the GPS
+        // trail). When the run started this very sample there is no window yet,
+        // so fall back to the previous fix — that leg is the last ~15s at speed.
+        const overspeedRunKm = async () => {
+          const from =
+            ep85 !== null && ep85 < nowMs
+              ? new Date(ep85).toISOString()
+              : prevRow.last_update
+                ? new Date(prevRow.last_update).toISOString()
+                : null;
+          return distanceOverTrail(deviceId, from, dateTime, { lat, lon });
+        };
+
         // Only consume the threshold AFTER a successful emit (mirrors fatigue logic).
         // If emit returns null (no definition, DB error, feed dedupe), we retry next poll.
         if (spd >= 90 && !s90) {
@@ -1053,6 +1183,7 @@ async function pollDeviceStatus() {
             alarmText: `Speed ${spd} km/h exceeded 90 km/h`,
             lat, lon, speed, ts: dateTime,
             extra: { speed: spd },
+            distanceKm: await overspeedRunKm(),
           });
           if (groupRow) {
             s90 = true;
@@ -1063,31 +1194,38 @@ async function pollDeviceStatus() {
             logDropOnce(`speed90:${deviceId}`, `[SPEED] 90 km/h alert dropped for ${fleetNumber || deviceId} (will retry); reason logged above`);
           }
         } else if (spd >= 85 && !s85) {
-          const groupRow = await emitDeviceStatusAlert({
-            deviceId, fleetNumber, licensePlate, signalCode: SPEED_85_CODE,
-            alarmText: `Speed ${spd} km/h exceeded 85 km/h`,
-            lat, lon, speed, ts: dateTime,
-            extra: { speed: spd },
-          });
-          if (groupRow) {
-            s85 = true;
-            dwell85 = null;
-          } else {
-            logDropOnce(`speed85:${deviceId}`, `[SPEED] 85 km/h alert dropped for ${fleetNumber || deviceId} (will retry); reason logged above`);
+          // 2-minute gate: waiting for the run to mature is NOT a drop — the
+          // threshold stays unconsumed and the emit happens on a later poll.
+          if (ep85 !== null && nowMs - ep85 >= SPEED_85_SUSTAIN_MS) {
+            const groupRow = await emitDeviceStatusAlert({
+              deviceId, fleetNumber, licensePlate, signalCode: SPEED_85_CODE,
+              alarmText: `Speed ${spd} km/h exceeded 85 km/h`,
+              lat, lon, speed, ts: dateTime,
+              extra: { speed: spd },
+              distanceKm: await overspeedRunKm(),
+            });
+            if (groupRow) {
+              s85 = true;
+              dwell85 = null;
+            } else {
+              logDropOnce(`speed85:${deviceId}`, `[SPEED] 85 km/h alert dropped for ${fleetNumber || deviceId} (will retry); reason logged above`);
+            }
           }
         }
       }
 
       const dwell85Ms = prevRow.speed_85_dwell_since ? new Date(prevRow.speed_85_dwell_since).getTime() : null;
       const dwell90Ms = prevRow.speed_90_dwell_since ? new Date(prevRow.speed_90_dwell_since).getTime() : null;
+      const ep85Ms = prevRow.speed_85_episode_since ? new Date(prevRow.speed_85_episode_since).getTime() : null;
       if (s85 !== !!prevRow.speed_85_alerted || s90 !== !!prevRow.speed_90_alerted ||
-          dwell85 !== dwell85Ms || dwell90 !== dwell90Ms ||
+          dwell85 !== dwell85Ms || dwell90 !== dwell90Ms || ep85 !== ep85Ms ||
           newFatigue.join(',') !== alertedFatigue.join(',')) {
         await db.updateVehicleStatusDriving(deviceId, {
           speed85Alerted: s85,
           speed90Alerted: s90,
           speed85DwellSince: dwell85 !== null ? new Date(dwell85).toISOString() : null,
           speed90DwellSince: dwell90 !== null ? new Date(dwell90).toISOString() : null,
+          speed85EpisodeSince: ep85 !== null ? new Date(ep85).toISOString() : null,
           fatigueAlertedThresholds: newFatigue,
         });
       }
@@ -1254,4 +1392,4 @@ async function checkCameraStatus(deviceId, fleetNumber, licensePlate, mettaxDevi
   }
 }
 
-module.exports = { startPoller, stopPoller, runOnce, setWsBroadcast, pollDeviceStatus, parseGeotabDurationMs, invalidateZonesCache, getPollHealth, emitDeviceStatusAlert, planFatigueThresholds, baselineCrossedThresholds, FATIGUE_THRESHOLDS };
+module.exports = { startPoller, stopPoller, runOnce, setWsBroadcast, pollDeviceStatus, parseGeotabDurationMs, invalidateZonesCache, getPollHealth, emitDeviceStatusAlert, planFatigueThresholds, baselineCrossedThresholds, distanceOverTrail, haversineKm, FATIGUE_THRESHOLDS, SPEED_85_SUSTAIN_MS, SPEED_REARM_DWELL_MS };
