@@ -545,6 +545,11 @@ async function getAlertById(req, res) {
     if (!alert) {
       alert = await db.getAlertGroupByAlertId(id);
     }
+    if (!alert && String(id).includes(':')) {
+      // group_key seed ("device:alarmtype") — the board's open path carries
+      // these; one indexed lookup instead of the old 2000-row client scan.
+      alert = await db.getAlertGroupByKey(String(id).trim());
+    }
     if (!alert) {
       // Member row direct hit (older members no group points at anymore).
       // Shape matches what the detail modal already normalizes.
