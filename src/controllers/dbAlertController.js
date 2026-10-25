@@ -1162,6 +1162,9 @@ async function acknowledgeAlert(req, res) {
 }
 
 async function resolveAlert(req, res) {
+  const tResolve = Date.now();
+  let tCloseMs = 0;
+  let tIncidentMs = 0;
   try {
     const { id } = req.params;
     const {
@@ -1178,10 +1181,29 @@ async function resolveAlert(req, res) {
     } = req.body || {};
     const actor = resolveActor(req, userId);
 
-    const groupId = Number(id);
-    if (!Number.isInteger(groupId) || groupId < 1 || String(id).trim() === '') {
-      return res.status(400).json({ success: false, message: 'Alert id must be alert_groups.id (integer)' });
+    // C1: the id may be alert_groups.id OR a member alerts.id (skycamx alarm
+    // id) — resolve member ids server-side so the frontend never needs its
+    // 2000-row probe request to translate an id before closing.
+    const rawId = String(id ?? '').trim();
+    if (!rawId) {
+      return res.status(400).json({ success: false, message: 'Alert id is required' });
     }
+    let group = null;
+    if (/^\d+$/.test(rawId)) {
+      group = await db.getAlertGroupById(Number(rawId));
+    }
+    if (!group) {
+      group = await db.getAlertGroupByAlertId(rawId);
+    }
+    if (!group && rawId.includes(':')) {
+      // tel-/camera group keys ("deviceId:alarmType") — same shape the old
+      // frontend probe used to match on.
+      group = await db.getAlertGroupByKey(rawId);
+    }
+    if (!group) {
+      return res.status(404).json({ success: false, message: `Alert group ${rawId} not found` });
+    }
+    const groupId = Number(group.id);
 
     // Optional operator cooldown. null = "not asked" (no cooldown action at
     // all — NCR/report closes and older clients leave running timers alone);
@@ -1201,11 +1223,6 @@ async function resolveAlert(req, res) {
     const isFalse = closureType === 'false_alert';
     const now = new Date().toISOString();
 
-    const group = await db.getAlertGroupById(groupId);
-    if (!group) {
-      return res.status(404).json({ success: false, message: `Alert group ${groupId} not found` });
-    }
-
     const resolved = await db.resolveAlertGroupById(groupId, {
       resolved: true,
       false_alert: isFalse,
@@ -1216,6 +1233,7 @@ async function resolveAlert(req, res) {
     if (!resolved) {
       return res.status(404).json({ success: false, message: `Alert group ${groupId} not found` });
     }
+    tCloseMs = Date.now() - tResolve;
 
     const targetDeviceId = group.device_id;
     const targetAlarmType = group.alarm_type;
@@ -1308,22 +1326,37 @@ async function resolveAlert(req, res) {
         if (isFalse) {
           await db.updateIncidentFields(incident.id, { status: 'FALSE_ALERT', closure_type: closureType });
         } else {
-          try {
-            deduction = await applyNcrDeduction(fleetNumber, group.alarm_type);
-          } catch (deductErr) {
-            console.error('[ResolveAlert] NCR deduction error:', deductErr.message);
-          }
-          const resFields = {
+          // C2: the scoring txn (driver_scoring update + fleet lookup) is
+          // the slow part of an NCR close. The incident status flips now;
+          // the deduction runs right after the response and backfills
+          // incidents.deduction_applied when it deducts.
+          await db.updateIncidentFields(incident.id, {
             status: 'RESOLVED',
             resolved_by: actor,
             resolved_at: now,
             closure_type: closureType,
-          };
-          if (deduction.deducted) resFields.deduction_applied = deduction.weighting;
-          await db.updateIncidentFields(incident.id, resFields);
+          });
+          deduction = { deducted: false, pending: true };
+          const incidentId = incident.id;
+          setImmediate(async () => {
+            try {
+              const d = await applyNcrDeduction(fleetNumber, group.alarm_type);
+              if (d?.deducted) {
+                await db.updateIncidentFields(incidentId, { deduction_applied: d.weighting });
+              }
+              console.log(`[RESOLVE] background deduction ${d?.deducted ? 'applied' : 'skipped'} for incident ${incidentId} (${d?.reason || 'no deduction'})`);
+            } catch (deductErr) {
+              console.error('[RESOLVE] background NCR deduction error:', deductErr.message);
+            }
+          });
         }
       }
     }
+
+    tIncidentMs = Date.now() - tResolve - tCloseMs;
+    // C0: one line per close with stage timings — this is what turns the
+    // "freeze" guesswork into a measured fix (slow stage shows up here).
+    console.log(`[RESOLVE] id=${groupId} close=${tCloseMs}ms incident=${tIncidentMs}ms total=${Date.now() - tResolve}ms actor=${actor || 'none'}`);
 
     res.json({
       success: true,

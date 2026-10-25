@@ -154,6 +154,28 @@ async function upsert(alarmType, alertId) {
   check('batch cooled type has no board group', (await groupCount('Seatbelt Violation')) === 0);
   await cooldowns.setCooldown({ deviceId: DEVICE_ID, alarmType: 'Seatbelt Violation', minutes: 0 });
 
+  console.log('== [7b] sync camera partition (cooled record → backup only, no alerts row) ==');
+  const syncService = require('./src/services/syncService');
+  cd = await cooldowns.setCooldown({ deviceId: DEVICE_ID, alarmType: 'Bang', minutes: 45 });
+  const syncFresh = await syncService.partitionCooledRecords([
+    { id: 'cd-s1', deviceId: DEVICE_ID, deviceName: DEVICE_NAME, alarmType: 'Bang', alarmText: 'bang', alarmTs: new Date().toISOString(), lat: -28.9, lon: 26.4, speed: 10, severity: 'high' },
+    { id: 'cd-s2', deviceId: DEVICE_ID, deviceName: DEVICE_NAME, alarmType: 'Distracted Driving', alarmText: 'phone-2', alarmTs: new Date().toISOString(), lat: -28.9, lon: 26.4, speed: 10, severity: 'high' },
+  ]);
+  check('cooled record removed from the fresh set', syncFresh.length === 1 && syncFresh[0].id === 'cd-s2', JSON.stringify(syncFresh.map((x) => x.id)));
+  check('no alerts detection row for the cooled record', (await query("SELECT count(*)::int n FROM alerts WHERE id = 'cd-s1'")).rows[0].n === 0);
+  const bgBang = await backupGroup('Bang');
+  check('backup group created for the cooled camera record', !!bgBang && Number(bgBang.count) === 1, JSON.stringify(bgBang));
+  check('backup member row stored (cd-s1)', (await query("SELECT count(*)::int n FROM alert_cooldown_members WHERE id = 'cd-s1'")).rows[0].n === 1);
+  check('no board group for the cooled camera record', (await groupCount('Bang')) === 0);
+  await cooldowns.setCooldown({ deviceId: DEVICE_ID, alarmType: 'Bang', minutes: 0 });
+  const syncFresh2 = await syncService.partitionCooledRecords([
+    { id: 'cd-s3', deviceId: DEVICE_ID, deviceName: DEVICE_NAME, alarmType: 'Bang', alarmText: 'bang', alarmTs: new Date().toISOString(), lat: -28.9, lon: 26.4, speed: 10, severity: 'high' },
+  ]);
+  check('after cancel the same record passes through as fresh', syncFresh2.length === 1 && syncFresh2[0].id === 'cd-s3');
+  // Cancel DELETEs the alert_cooldowns row; backup rows cascade away with it
+  // (ON DELETE CASCADE, by design — cancel = forget this cooldown entirely).
+  check('cancel removed the backup group via cascade', (await backupGroup('Bang')) === null);
+
   console.log('== [8] no-cooldown baseline (feature absent = today) ==');
   const before = (await query('SELECT count(*)::int n FROM alert_cooldowns')).rows[0].n;
   r = await upsert('Reckless Driving', 'cd-6');

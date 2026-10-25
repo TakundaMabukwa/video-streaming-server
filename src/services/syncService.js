@@ -29,6 +29,111 @@ const VIDEO_MANDATORY_TYPES = new Set([
   'forwardCollisionWarning', 'pedestrianBang', 'closeProximity',
 ]);
 
+// ── Sync freshness + cooldown partitions ─────────────────────────────────────
+// Anything older than the pull benchmark (HWM - overlap) or older than the
+// absolute age cap is dropped BEFORE storage: a stale detection must never
+// become a "new" alert that shows old data / old media on the board.
+const MAX_ALERT_AGE_MINUTES = (() => {
+  const env = Number(process.env.SYNC_MAX_ALERT_AGE_MINUTES);
+  const n = Number.isFinite(env) && env > 0 ? Math.floor(env) : 120;
+  return Math.min(Math.max(n, 5), 1440);
+})();
+
+/** 'YYYY-MM-DD HH:MM:SS' (UTC, how runSync builds it) → epoch ms, or null. */
+function parseWindowMs(value) {
+  if (!value) return null;
+  const s = String(value).trim();
+  if (!s) return null;
+  const ms = Date.parse(s.includes('T') || s.includes('+') || s.endsWith('Z') ? s : `${s.replace(' ', 'T')}Z`);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/**
+ * Pure freshness partition: keep records inside [startMs, now - maxAgeMs].
+ * Records without a usable alarmTs are KEPT (can't judge — never silently
+ * drop what might be a legitimate new alert).
+ */
+function partitionFreshRecords(records, { startMs = null, maxAgeMs = null, nowMs = Date.now() } = {}) {
+  const kept = [];
+  let stale = 0;
+  let tooOld = 0;
+  for (const r of records || []) {
+    const ts = r?.alarmTs || r?.alarm_ts || null;
+    const t = ts ? Date.parse(ts) : NaN;
+    if (!Number.isFinite(t)) { kept.push(r); continue; }
+    if (startMs != null && t < startMs) { stale++; continue; }
+    if (maxAgeMs != null && nowMs - t > maxAgeMs) { tooOld++; continue; }
+    kept.push(r);
+  }
+  return { kept, stale, tooOld };
+}
+
+/**
+ * Cooldown partition: for records whose (device, alarm type) has a RUNNING
+ * cooldown, store the occurrence in the BACKUP mirrors only and return the
+ * rest. The caller must not touch alerts / alert_groups / combos / WS for a
+ * suppressed record — that is the whole point of the cooldown.
+ */
+async function partitionCooledRecords(records) {
+  if (!records || records.length === 0) return records;
+  const { getActiveCooldown, recordSuppressed } = require('./alertCooldowns');
+  const fresh = [];
+  const cdCache = new Map(); // `${deviceId}:${alarmType}` -> cooldown | null | false(lookup done, none)
+  for (const r of records) {
+    const deviceId = String(r.deviceId || r.device_id || '');
+    const alarmType = String(r.alarmType || r.alarm_type || '');
+    if (!deviceId || !alarmType) { fresh.push(r); continue; }
+    const key = `${deviceId}:${alarmType}`.toLowerCase();
+    let cd = cdCache.get(key);
+    if (cd === undefined) {
+      cd = await getActiveCooldown(deviceId, alarmType) || false;
+      cdCache.set(key, cd);
+    }
+    if (!cd) { fresh.push(r); continue; }
+    try {
+      await recordSuppressed(cd, {
+        deviceId, deviceName: r.deviceName || null, alarmType, alarmText: r.alarmText || null,
+        alertId: r.id, alarmTs: r.alarmTs ? new Date(r.alarmTs) : null,
+        lat: r.lat ?? null, lon: r.lon ?? null, speed: r.speed ?? null,
+        severity: r.severity || null, fleetNumber: null, sourceType: 'video',
+      }, {
+        id: String(r.id), deviceId, deviceName: r.deviceName || null, alarmType,
+        alarmText: r.alarmText || null, alarmTs: r.alarmTs ? new Date(r.alarmTs) : null,
+        lat: r.lat ?? null, lon: r.lon ?? null, speed: r.speed ?? null,
+        severity: r.severity || null, fleetNumber: null, sourceType: 'video',
+      });
+      console.log(`[COOLDOWN] ${deviceId}: "${alarmType}" stored in backup only (cooldown until ${cd.cooldown_until}) — no alerts/alert_groups row`);
+    } catch (err) {
+      // Backup failure must never lose the live alert path silently...
+      // but it also must not create a live row the operator cooled: keep it
+      // suppressed and retry on the next sync (record is re-pulled until stored).
+      console.error('[COOLDOWN] backup store failed (record suppressed anyway):', err.message);
+    }
+  }
+  return fresh;
+}
+
+/** Pure media window filter: keep files whose timestamp is inside the alert's
+ *  own window (±5 min). Timestamp-less files are kept (can't prove staleness). */
+function filterMediaToWindow(files, startMs, endMs, toleranceMs = 5 * 60 * 1000) {
+  if (!startMs || !endMs || !Number.isFinite(startMs) || !Number.isFinite(endMs)) return files || [];
+  const lo = startMs - toleranceMs;
+  const hi = endMs + toleranceMs;
+  let dropped = 0;
+  const kept = (files || []).filter((f) => {
+    const raw = f?.alarm_time || f?.alarmTime || f?.created_at || f?.createdAt || null;
+    if (!raw) return true; // no timestamp — keep (can't judge)
+    const t = Date.parse(raw);
+    if (!Number.isFinite(t)) return true;
+    if (t < lo || t > hi) { dropped++; return false; }
+    return true;
+  });
+  if (dropped > 0) {
+    console.log(`[MEDIA] dropped ${dropped} file(s) outside the alert time window`);
+  }
+  return kept;
+}
+
 async function getAllDeviceIds() {
   const allDevices = [];
   let pageIndex = 1;
@@ -230,7 +335,7 @@ async function fetchMediaOnDemand(alertRecord) {
   }
 
   // Normalize skycamx camelCase rows to the snake_case shape the controllers expect.
-  return files.map((f, i) => ({
+  const normalized = files.map((f, i) => ({
     id: f.id || `skycam-${i}`,
     alert_id: alertId,
     file_url: f.fileUrl || f.file_url || '',
@@ -240,6 +345,18 @@ async function fetchMediaOnDemand(alertRecord) {
     created_at: f.createdAt || f.created_at || null,
     alarm_time: f.alarmTime || f.alarm_time || null,
   }));
+
+  // Media window filter: only return files whose own timestamp is inside the
+  // alert's time window (±5 min). This guarantees a group can never show
+  // images captured for a DIFFERENT alarm, even if /alarm/file/id echoed
+  // back a foreign set. Timestamp-less files (incl. the replay URL we just
+  // fetched, which is already window-anchored) are kept.
+  const startMs = ts ? Date.parse(new Date(ts).toISOString()) : NaN;
+  const endMs = rawEnd ? Date.parse(new Date(rawEnd).toISOString()) : NaN;
+  if (Number.isFinite(startMs) && Number.isFinite(endMs)) {
+    return filterMediaToWindow(normalized, startMs, Math.max(endMs, startMs + 15_000));
+  }
+  return normalized;
 }
 
 async function fetchReplayUrl(deviceId, channelId, startTime, endTime) {
@@ -359,6 +476,10 @@ async function syncAlerts(deviceIds, startTime, endTime) {
     // vehicles). Alerts not configured for that cost center are dropped here
     // and never reach alerts / alert_groups.
     if (newRecords.length > 0) {
+      // STRICT CC GATE: only store video alerts whose signal code is in the
+      // device's cost-center set (CC vehicles), or in the global set (CC-less
+      // vehicles). Alerts not configured for that cost center are dropped here
+      // and never reach alerts / alert_groups.
       try {
         newRecords = await gateVideoRecordsByCostCenter(newRecords);
       } catch (gateErr) {
@@ -368,6 +489,23 @@ async function syncAlerts(deviceIds, startTime, endTime) {
       // alerts/alert_groups match what Alert Config lists (and what the
       // telematics path already stores). Unknown codes pass through unchanged.
       newRecords = await normalizeVideoAlarmTypes(newRecords);
+
+      // Phase B: drop anything older than the pull benchmark (HWM - overlap)
+      // or older than the absolute age cap — a stale detection must never
+      // become a "new" alert with old data/old media.
+      const freshPartition = partitionFreshRecords(newRecords, {
+        startMs: parseWindowMs(startTime),
+        maxAgeMs: MAX_ALERT_AGE_MINUTES * 60 * 1000,
+        nowMs: Date.now(),
+      });
+      if (freshPartition.stale > 0 || freshPartition.tooOld > 0) {
+        console.log(`[SYNC] dropped ${freshPartition.stale} pre-watermark and ${freshPartition.tooOld} pre-age-cap record(s)`);
+      }
+      newRecords = freshPartition.kept;
+
+      // Phase A: a running cooldown diverts the record to the backup mirrors
+      // ONLY — it must never reach batchUpsertAlerts / combos / groups / WS.
+      newRecords = await partitionCooledRecords(newRecords);
     }
 
     if (newRecords.length > 0) {
@@ -765,4 +903,8 @@ module.exports = {
   fetchMediaOnDemand,
   fetchReplayUrl,
   setWsBroadcast,
+  partitionFreshRecords,
+  partitionCooledRecords,
+  filterMediaToWindow,
+  parseWindowMs,
 };
