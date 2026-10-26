@@ -844,7 +844,10 @@ const MIGRATIONS_SQL = `
 
   CREATE TABLE IF NOT EXISTS incidents (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    incident_no TEXT UNIQUE DEFAULT ('INC-' || to_char(now(),'YYYY') || '-' || lpad(nextval('incident_no_seq')::bigint::text, 4, '0')),
+    -- Display number only (sequence-minted); NOT unique — sequence drift on
+    -- manual inserts/restores made the old unique key block real NCR saves.
+    -- alert_id below is the real identity link.
+    incident_no TEXT DEFAULT ('INC-' || to_char(now(),'YYYY') || '-' || lpad(nextval('incident_no_seq')::bigint::text, 4, '0')),
     alert_id TEXT UNIQUE,
     alert_group_key TEXT,
     alarm_type TEXT,
