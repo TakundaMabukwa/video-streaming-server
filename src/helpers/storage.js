@@ -95,6 +95,28 @@ async function createPrivateDocumentUrl(storagePath, ttlSeconds = SIGNED_URL_TTL
 }
 
 /**
+ * A short-lived signed UPLOAD url for a private bucket: the browser PUTs the
+ * file straight to storage, so large documents never pass through the API
+ * body limit. The path is fixed by the caller (scoped to the incident).
+ */
+async function createPrivateUploadUrl(storagePath, ttlSeconds = SIGNED_URL_TTL_SECONDS) {
+  if (!supabase) return null;
+  await ensurePrivateBucket();
+  const { data, error } = await supabase.storage
+    .from(NCR_DOCUMENTS_BUCKET)
+    .createSignedUploadUrl(storagePath, ttlSeconds);
+  if (error) {
+    console.error('[Storage] Signed upload URL failed:', error.message);
+    return null;
+  }
+  return {
+    signedUrl: data?.signedUrl || null,
+    token: data?.token || null,
+    path: data?.path || storagePath,
+  };
+}
+
+/**
  * Upload a file straight from disk. Evidence archives are hundreds of MB, so
  * the body is a stream (undici `duplex: 'half'`) instead of a Buffer — the
  * container never holds the whole ZIP in memory.
@@ -140,5 +162,6 @@ module.exports = {
   SIGNED_URL_TTL_SECONDS,
   uploadPrivateDocument,
   createPrivateDocumentUrl,
+  createPrivateUploadUrl,
   ensurePrivateBucket,
 };

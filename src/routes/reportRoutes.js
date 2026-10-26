@@ -479,14 +479,47 @@ router.get('/driver-stats', async (req, res) => {
   }
 });
 
+// ── POST /eps/reports/incidents/:id/documents/upload-url ────────────────
+// A short-lived signed upload URL for the PRIVATE bucket. The browser PUTs the
+// file straight to storage (no size limit through the API), then posts the
+// metadata to the endpoint below to create the link row.
+router.post('/incidents/:id/documents/upload-url', async (req, res) => {
+  try {
+    const incidentId = String(req.params.id || '').trim();
+    if (!incidentId) return res.status(400).json({ success: false, message: 'Incident id required' });
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(incidentId)) {
+      return res.status(400).json({ success: false, message: 'Invalid incident id' });
+    }
+    const incident = await db.getIncident(incidentId);
+    if (!incident) return res.status(404).json({ success: false, message: 'Incident not found' });
+
+    const rawName = String(req.body?.name || 'document');
+    const safeBase = rawName.replace(/[^a-zA-Z0-9._-]/g, '_').slice(-80) || 'document';
+    const storagePath = `ncr/${incidentId}/${Date.now()}_${safeBase}`;
+    const upload = await storage.createPrivateUploadUrl(storagePath);
+    if (!upload || !upload.signedUrl) {
+      return res.status(500).json({ success: false, message: 'Could not prepare the upload' });
+    }
+    res.json({
+      success: true,
+      signed_url: upload.signedUrl,
+      token: upload.token,
+      storage_path: upload.path,
+      expires_in: storage.SIGNED_URL_TTL_SECONDS,
+    });
+  } catch (err) {
+    console.error('[Reports] upload-url error:', err.message);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 // ── POST /eps/reports/incidents/:id/documents ────────────────────────────
-// Upload a document and link it to the NCR. The file goes to a PRIVATE
-// bucket; only a signed-in user can later download it.
+// Link an uploaded file to the NCR. The path MUST be inside this incident's
+// own folder — nothing else can be attached.
 router.post('/incidents/:id/documents', async (req, res) => {
   try {
     const incidentId = String(req.params.id || '').trim();
     if (!incidentId) return res.status(400).json({ success: false, message: 'Incident id required' });
-    // incidents.id is a UUID — a malformed id is a client error, not a crash.
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(incidentId)) {
       return res.status(400).json({ success: false, message: 'Invalid incident id' });
     }
@@ -494,26 +527,35 @@ router.post('/incidents/:id/documents', async (req, res) => {
     const incident = await db.getIncident(incidentId);
     if (!incident) return res.status(404).json({ success: false, message: 'Incident not found' });
 
-    let fileName = null;
-    let fileBuffer = null;
-    let contentType = null;
-    if (req.files && req.files.file) {
-      fileBuffer = req.files.file.data;
-      fileName = req.files.file.name;
-      contentType = req.files.file.mimetype;
-    } else if (req.body && req.body.file && req.body.file.data) {
-      // JSON base64 upload (used when the browser sends the file as base64).
-      fileBuffer = Buffer.from(req.body.file.data, 'base64');
-      fileName = req.body.file.name || 'document';
-      contentType = req.body.file.contentType || req.body.file.type || null;
-    }
-    if (!fileBuffer || !fileBuffer.length) {
-      return res.status(400).json({ success: false, message: 'A file is required' });
-    }
+    let storagePath = String(req.body?.storage_path || '').trim();
+    let fileName = String(req.body?.name || '').trim() || 'document';
+    let contentType = req.body?.content_type || null;
+    let byteSize = req.body?.byte_size == null ? null : Number(req.body.byte_size);
 
-    const safeBase = String(fileName || 'document').replace(/[^a-zA-Z0-9._-]/g, '_').slice(-80);
-    const storagePath = `ncr/${incidentId}/${Date.now()}_${safeBase}`;
-    await storage.uploadPrivateDocument(fileBuffer, storagePath, contentType);
+    // Path must belong to THIS incident's folder.
+    const prefix = `ncr/${incidentId}/`;
+    if (!storagePath) {
+      // Fallback: a direct (small) upload through the API.
+      let fileBuffer = null;
+      if (req.files && req.files.file) {
+        fileBuffer = req.files.file.data;
+        fileName = req.files.file.name || fileName;
+        contentType = req.files.file.mimetype || contentType;
+      } else if (req.body && req.body.file && req.body.file.data) {
+        fileBuffer = Buffer.from(req.body.file.data, 'base64');
+        fileName = req.body.file.name || fileName;
+        contentType = req.body.file.contentType || req.body.file.type || contentType;
+      }
+      if (!fileBuffer || !fileBuffer.length) {
+        return res.status(400).json({ success: false, message: 'A file is required' });
+      }
+      const safeBase = String(fileName).replace(/[^a-zA-Z0-9._-]/g, '_').slice(-80);
+      storagePath = `${prefix}${Date.now()}_${safeBase}`;
+      await storage.uploadPrivateDocument(fileBuffer, storagePath, contentType);
+      byteSize = fileBuffer.length;
+    } else if (!storagePath.startsWith(prefix)) {
+      return res.status(400).json({ success: false, message: 'Invalid document path' });
+    }
 
     const forms = await db.query(
       `SELECT id FROM ncr_forms WHERE incident_id = $1 ORDER BY created_at DESC LIMIT 1`,
@@ -524,10 +566,10 @@ router.post('/incidents/:id/documents', async (req, res) => {
     const row = await reportStats.insertIncidentDocument({
       incident_id: incidentId,
       ncr_form_id: ncrFormId,
-      name: String(fileName || 'document'),
+      name: fileName,
       storage_path: storagePath,
       content_type: contentType,
-      byte_size: fileBuffer.length,
+      byte_size: byteSize,
       doc_type: String(req.body?.doc_type || req.body?.type || '').trim() || null,
       uploaded_by: String(req.user?.email || '').trim() || null,
     });

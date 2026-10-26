@@ -126,6 +126,18 @@ async function call(method, path, { params = {}, query = {}, body = {}, user = {
   const resDocs = await call('get', '/incidents/:id/documents', { params: { id: '00000000-0000-0000-0000-000000000000' } });
   check('document list for an incident → 200 with an array', resDocs.statusCode === 200 && Array.isArray(resDocs.body?.documents));
 
+  // A storage path from ANOTHER incident must be refused (needs a real id).
+  const realIncident = (await query('SELECT id FROM incidents ORDER BY created_at DESC LIMIT 1')).rows[0];
+  if (realIncident) {
+    const resForeign = await call('post', '/incidents/:id/documents', {
+      params: { id: realIncident.id },
+      body: { name: 'x.pdf', storage_path: 'ncr/11111111-1111-1111-1111-111111111111/x.pdf' },
+    });
+    check('a path outside the incident folder → 400', resForeign.statusCode === 400, String(resForeign.statusCode));
+  } else {
+    check('a path outside the incident folder → 400', false, 'no incident to test with');
+  }
+
   console.log('== [7] PATCH /reports/incidents/:id ==');
   const target = body.incidents.find((i) => i.has_ncr) || body.incidents[0];
   if (target) {
