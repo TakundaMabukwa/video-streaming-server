@@ -16,6 +16,32 @@ function getSupabaseAdmin() {
 const userCostCenterCache = new Map();
 const CC_CACHE_TTL = 5 * 60 * 1000;
 
+// Per-token auth cache (60s TTL). The board polls ~6-10 endpoints every 15s;
+// without this, EVERY proxied request made two Supabase round-trips
+// (auth.getUser + users select), flooding the auth rate limit for the whole
+// droplet IP — including logins. Keyed by the bearer token itself; entries
+// die with the TTL so role/revocation changes apply within a minute.
+const AUTH_CACHE_TTL = 60 * 1000;
+const authCache = new Map(); // token -> { user, role, ccIds, expiresAt }
+
+function jwtExpMs(token) {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
+    return typeof payload.exp === 'number' ? payload.exp * 1000 : null;
+  } catch {
+    return null;
+  }
+}
+
+function sweepAuthCache() {
+  const now = Date.now();
+  for (const [key, entry] of authCache) {
+    if (entry.expiresAt <= now) authCache.delete(key);
+  }
+}
+
 async function getUserCostCenterIds(userId, supabase) {
   const cached = userCostCenterCache.get(userId);
   if (cached && Date.now() - cached.ts < CC_CACHE_TTL) return cached.ids;
@@ -58,9 +84,25 @@ async function requireAuth(req, res, next) {
     return res.status(401).json({ success: false, message: 'Not authenticated' });
   }
 
+  // An expired JWT can never be served from cache (defense in depth even if
+  // a stale entry somehow survived the TTL).
+  const exp = jwtExpMs(token);
+  if (exp && exp <= Date.now()) {
+    return res.status(401).json({ success: false, message: 'Token expired' });
+  }
+
+  const cached = authCache.get(token);
+  if (cached && cached.expiresAt > Date.now()) {
+    req.user = cached.user;
+    req.userRole = cached.role;
+    req.userCostCenterIds = cached.ccIds;
+    return next();
+  }
+
   try {
     const { data: { user }, error } = await supabase.auth.getUser(token);
     if (error || !user) {
+      authCache.delete(token);
       return res.status(401).json({ success: false, message: 'Invalid token' });
     }
 
@@ -75,9 +117,18 @@ async function requireAuth(req, res, next) {
       return res.status(401).json({ success: false, message: 'User not found' });
     }
 
+    const ccIds = await getUserCostCenterIds(user.id, supabase);
+    sweepAuthCache();
+    authCache.set(token, {
+      user,
+      role: userRecord.role,
+      ccIds,
+      // Never outlive the JWT itself.
+      expiresAt: Math.min(Date.now() + AUTH_CACHE_TTL, exp || Infinity),
+    });
     req.user = user;
     req.userRole = userRecord.role;
-    req.userCostCenterIds = await getUserCostCenterIds(user.id, supabase);
+    req.userCostCenterIds = ccIds;
     next();
   } catch (err) {
     console.error('[AUTH] Error:', err.message);
