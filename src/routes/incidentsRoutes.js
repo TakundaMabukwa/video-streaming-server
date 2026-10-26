@@ -37,11 +37,45 @@ router.get('/:id', async (req, res) => {
   }
 });
 
-// PATCH /api/incidents/:id - Update register fields (action_taken / outcome / form data)
+// PATCH /api/incidents/:id - Update register fields. The edit is ALSO mirrored
+// into the stored NCR document (ncr_forms.form_data) so the register and
+// "View NCR" can never disagree — what you edited is what both show.
+const NCR_FORM_MIRROR = {
+  driver_name: 'driverName',
+  contact_number: 'contactNumber',
+  id_number: 'idNumber',
+  fleet_number: 'vehicleFleetNumber',
+  infringement_detail: 'description',
+  action_taken: 'correctiveAction',
+  outcome: 'outcome',
+  notes: 'notes',
+};
 router.patch('/:id', async (req, res) => {
   try {
-    const incident = await db.updateIncidentFields(req.params.id, req.body || {});
+    const body = req.body || {};
+    const incident = await db.updateIncidentFields(req.params.id, body);
     if (!incident) return res.status(404).json({ success: false, message: 'Incident not found or no editable fields' });
+
+    // Mirror edited register fields into the signed NCR document. Only keys
+    // present in the request are touched — fields not edited stay as saved.
+    const mirrorPatch = {};
+    for (const [incKey, formKey] of Object.entries(NCR_FORM_MIRROR)) {
+      if (body[incKey] === undefined) continue;
+      const v = body[incKey];
+      mirrorPatch[formKey] = typeof v === 'string' ? v.trim() || null : (v ?? null);
+    }
+    if (body.infringement !== undefined) {
+      const raw = String(body.infringement ?? '').trim();
+      mirrorPatch.classifications = raw ? raw.split(',').map((s) => s.trim()).filter(Boolean) : [];
+    }
+    if (Object.keys(mirrorPatch).length > 0) {
+      await db.query(
+        `UPDATE ncr_forms SET form_data = form_data || $2::jsonb, updated_at = NOW()
+         WHERE incident_id = $1`,
+        [String(req.params.id), JSON.stringify(mirrorPatch)]
+      ).catch((err) => console.error('[Incidents] NCR form mirror failed:', err.message));
+    }
+
     res.json({ success: true, incident });
   } catch (err) {
     console.error('[Incidents] Update error:', err.message);

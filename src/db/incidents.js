@@ -63,6 +63,11 @@ async function upsertIncidentFromAlert({
            document_type = COALESCE(NULLIF($15, ''), document_type),
            status = COALESCE(NULLIF($16, ''), status),
            filled_by = COALESCE(NULLIF($17, ''), filled_by),
+           -- Re-save identity/attribution follows the form: a corrected fleet
+           -- or cost centre on a second save must land, not stay frozen at
+           -- the first save's values.
+           fleet_number = COALESCE(NULLIF($18, ''), fleet_number),
+           cost_center_id = COALESCE($19, cost_center_id),
            updated_at = NOW()
          WHERE id = $1
          RETURNING ${incidentSelectColumns()}`,
@@ -70,7 +75,8 @@ async function upsertIncidentFromAlert({
          form.contact_number || null, form.id_number || null, form.division || null,
          form.infringement || null, form.infringement_detail || null, form.action_taken || null,
          form.outcome || null, form.notes || null, form.document_link || null,
-         form.document_type || null, status, filledBy]
+         form.document_type || null, status, filledBy,
+         fleetNumber || null, costCenterId ?? null]
       );
       if (filled.rows.length > 0) return filled.rows[0];
     }
@@ -121,7 +127,10 @@ async function upsertIncidentFromAlert({
       alarmType,
       sourceType,
       deviceId,
-      fleetNumber,
+      // Blank is NULL, never '': the fill-path UPDATE uses COALESCE(NULLIF)
+      // semantics, so the insert must match or '' would freeze a blank over
+      // a later correction.
+      String(fleetNumber || '').trim() || null,
       costCenterId,
       form.week || isoWeek(saveTime),
       form.shift || null,
@@ -184,7 +193,12 @@ async function getIncidents({ cost_center_id, cost_center_ids, fleet_number, sta
     const ccNums = [...new Set(ccList.map(Number).filter(n => Number.isFinite(n) && n > 0))];
     if (ccNums.length > 0) {
       params.push(ccNums);
-      conditions.push(`cost_center_id = ANY($${params.length}::int[])`);
+      // Saved paperwork must never vanish under the cost-centre filter:
+      // incidents whose fleet never resolved to a cost centre (NULL cc) stay
+      // visible as long as they carry an NCR document.
+      conditions.push(`(cost_center_id = ANY($${params.length}::int[])
+        OR (cost_center_id IS NULL
+            AND EXISTS (SELECT 1 FROM ncr_forms nf WHERE nf.incident_id = incidents.id)))`);
     }
   }
   if (fleet_number) {

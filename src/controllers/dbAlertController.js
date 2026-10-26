@@ -1289,15 +1289,13 @@ async function resolveAlert(req, res) {
     let deduction = { deducted: false };
 
     if (isNcr) {
-      const fleetNumber = String(incidentData.fleet_number || incidentData.fleetNumber || '').trim()
-        || (await resolveFleetNumber({
-          deviceId: group.device_id,
-          vehicleRegistration: group.device_name,
-          fleetNumber: null,
-        }).catch(() => null))
-        || group.device_id;
-
-      const costCenterId = await findVehicleCostCenterId(fleetNumber).catch(() => null);
+      // Verbatim incident values — no fallback to group.fleet_number /
+      // device_id / alarm_type. Blank stays blank. The deduction lookup may
+      // still use the group's fleet, but that is never stored over form data.
+      const fleetNumber = String(incidentData.fleet_number || incidentData.fleetNumber || '').trim();
+      const costCenterId = fleetNumber
+        ? await findVehicleCostCenterId(fleetNumber).catch(() => null)
+        : null;
 
       incident = await db.upsertIncidentFromAlert({
         alertId: group.last_alert_id || String(groupId),
@@ -1305,7 +1303,7 @@ async function resolveAlert(req, res) {
         alarmType: group.alarm_type,
         sourceType: group.source_type || 'telematics',
         deviceId: group.device_id,
-        fleetNumber,
+        fleetNumber: fleetNumber || null,
         costCenterId,
         filledBy: actor || 'SYSTEM',
         status: isFalse ? 'FALSE_ALERT' : 'OPEN',
@@ -1318,7 +1316,7 @@ async function resolveAlert(req, res) {
         contact_number: incidentData.contact_number || incidentData.contactNumber || null,
         id_number: incidentData.id_number || null,
         division: incidentData.division || null,
-        infringement: ncr_classification || incidentData.infringement || group.alarm_type,
+        infringement: ncr_classification || incidentData.infringement || null,
         infringement_detail: close_reason || incidentData.infringement_detail || notes || null,
         action_taken: action_taken || incidentData.action_taken || null,
         outcome: incidentData.outcome || null,
@@ -1343,9 +1341,13 @@ async function resolveAlert(req, res) {
           });
           deduction = { deducted: false, pending: true };
           const incidentId = incident.id;
+          // Deduction lookup may fall back to the group's fleet when the
+          // form left fleet blank — lookup only, never stored.
+          const deductFleet = fleetNumber || String(group.fleet_number || '').trim();
           setImmediate(async () => {
             try {
-              const d = await applyNcrDeduction(fleetNumber, group.alarm_type);
+              if (!deductFleet) return;
+              const d = await applyNcrDeduction(deductFleet, group.alarm_type);
               if (d?.deducted) {
                 await db.updateIncidentFields(incidentId, { deduction_applied: d.weighting });
               }

@@ -2,7 +2,6 @@
 // the background job runner, so a queued NCR closure behaves exactly like a
 // manual one. The logic was moved verbatim out of dbAlertController.resolveAlert.
 const db = require('../db');
-const { resolveFleetNumber } = require('./costCenterLookup');
 const { findVehicleCostCenterId } = require('./costCenterLookup');
 const { applyNcrDeduction } = require('./driverScoringService');
 
@@ -102,38 +101,26 @@ async function closeAlertGroup(opts = {}) {
   let deduction = { deducted: false };
 
   if (isNcr) {
-    const fleetNumber = String(incidentData.fleet_number || incidentData.fleetNumber || '').trim()
-      || (await resolveFleetNumber({
-        deviceId: group.device_id,
-        vehicleRegistration: group.device_name,
-        fleetNumber: null,
-      }).catch(() => null))
-      || group.device_id;
-
-    const costCenterId = await findVehicleCostCenterId(fleetNumber).catch(() => null);
+    // Verbatim form values — no fallback to group.fleet_number / device_id /
+    // alarm_type. Blank stays blank; the deduction lookup below may still use
+    // the group's fleet, but that is never STORED over what was entered.
+    const fleetNumber = String(incidentData.fleet_number || incidentData.fleetNumber || '').trim();
+    const costCenterId = fleetNumber
+      ? await findVehicleCostCenterId(fleetNumber).catch(() => null)
+      : null;
 
     if (incidentId) {
-      // The NCR flow created the register row up-front (fast save) — fill it in
-      // here instead of creating a second one.
+      // The NCR flow created the register row up-front (fast save) with the
+      // form values. The closure job writes ONLY closure state + alert
+      // identity — never re-touches form fields, so an operator re-save that
+      // lands before this job can never be overwritten by stale payload data.
       incident = await db.updateIncidentFields(incidentId, {
         alert_id: group.last_alert_id || String(groupId),
         alert_group_key: resolvedGroupKey,
         alarm_type: group.alarm_type,
         source_type: group.source_type || 'telematics',
         device_id: group.device_id,
-        fleet_number: fleetNumber,
-        cost_center_id: costCenterId,
-        filled_by: actor || 'SYSTEM',
-        controller: reported_by || incidentData.controller || incidentData.reported_by || null,
-        driver_name: incidentData.driver_name || incidentData.driverName || incidentData['name & surname'] || null,
-        contact_number: incidentData.contact_number || incidentData.contactNumber || null,
-        id_number: incidentData.id_number || null,
-        division: incidentData.division || null,
-        infringement: ncr_classification || incidentData.infringement || group.alarm_type,
-        infringement_detail: close_reason || incidentData.infringement_detail || notes || null,
-        action_taken: action_taken || incidentData.action_taken || null,
-        outcome: incidentData.outcome || null,
-        notes: notes || null,
+        filled_by: actor || null,
       });
     }
 
@@ -144,7 +131,7 @@ async function closeAlertGroup(opts = {}) {
         alarmType: group.alarm_type,
         sourceType: group.source_type || 'telematics',
         deviceId: group.device_id,
-        fleetNumber,
+        fleetNumber: fleetNumber || null,
         costCenterId,
         filledBy: actor || 'SYSTEM',
         status: isFalse ? 'FALSE_ALERT' : 'OPEN',
@@ -157,7 +144,7 @@ async function closeAlertGroup(opts = {}) {
         contact_number: incidentData.contact_number || incidentData.contactNumber || null,
         id_number: incidentData.id_number || null,
         division: incidentData.division || null,
-        infringement: ncr_classification || incidentData.infringement || group.alarm_type,
+        infringement: ncr_classification || incidentData.infringement || null,
         infringement_detail: close_reason || incidentData.infringement_detail || notes || null,
         action_taken: action_taken || incidentData.action_taken || null,
         outcome: incidentData.outcome || null,
@@ -171,8 +158,13 @@ async function closeAlertGroup(opts = {}) {
       if (isFalse) {
         await db.updateIncidentFields(incident.id, { status: 'FALSE_ALERT', closure_type: closureType });
       } else {
+        // Deduction lookup may use the group's fleet when the form left
+        // fleet blank — lookup only, never stored.
+        const deductFleet = fleetNumber || String(group.fleet_number || '').trim();
         try {
-          deduction = await applyNcrDeduction(fleetNumber, group.alarm_type);
+          deduction = deductFleet
+            ? await applyNcrDeduction(deductFleet, group.alarm_type)
+            : { deducted: false, reason: 'no_fleet' };
         } catch (deductErr) {
           console.error('[AlertClosure] NCR deduction error:', deductErr.message);
         }

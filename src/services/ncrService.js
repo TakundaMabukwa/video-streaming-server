@@ -60,19 +60,19 @@ async function createNcrFromAlert(opts = {}) {
   if (!group) return { ok: false, error: `Alert group ${groupId} not found` };
 
   // Keep only the known document keys — the payload may carry extra context.
+  // Form values are stored VERBATIM: no fallback to group.fleet_number,
+  // group.device_id or group.alarm_type. What the operator saw and typed is
+  // what gets stored; a blank field stays blank.
   const formData = {};
   for (const key of ALERT_FORM_KEYS) {
     if (form[key] !== undefined) formData[key] = form[key];
   }
   formData.savedAt = new Date().toISOString();
   formData.alertType = formData.alertType || group.alarm_type || null;
-  formData.fleetNumber = formData.vehicleFleetNumber || group.fleet_number || null;
   formData.createdByEmail = actorEmail;
   formData.createdById = actorId;
 
-  const fleetNumber = String(
-    formData.vehicleFleetNumber || formData.fleetNumber || group.fleet_number || group.device_id || ''
-  ).trim();
+  const fleetNumber = String(formData.vehicleFleetNumber || formData.fleetNumber || '').trim();
   const costCenterId = await findVehicleCostCenterId(fleetNumber).catch(() => null);
   // Always keep the vehicle's cost centre on the stored document too, not only
   // on the incident row. When the id resolves, the authoritative name wins.
@@ -89,7 +89,7 @@ async function createNcrFromAlert(opts = {}) {
     alarmType: group.alarm_type,
     sourceType: group.source_type || 'telematics',
     deviceId: group.device_id,
-    fleetNumber,
+    fleetNumber: fleetNumber || null,
     costCenterId,
     filledBy: actorEmail,
     status: 'OPEN',
@@ -98,7 +98,9 @@ async function createNcrFromAlert(opts = {}) {
     contact_number: formData.contactNumber || null,
     id_number: formData.idNumber || null,
     division: [formData.department, formData.section].filter(Boolean).join(' - ') || null,
-    infringement: (formData.classifications || []).join(', ') || group.alarm_type,
+    // Classifications verbatim: blank stays blank — never substituted with
+    // the group's alarm type.
+    infringement: (formData.classifications || []).join(', ') || null,
     infringement_detail: formData.description || null,
     action_taken: formData.correctiveAction || null,
     outcome: formData.outcome || formData.preventiveAction || null,
