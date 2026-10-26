@@ -18,6 +18,7 @@ const presenceRoutes = require('./presenceRoutes');
 const vehicleOverrideRoutes = require('./vehicleOverrideRoutes');
 const adminRoutes = require('./adminRoutes');
 const ncrRoutes = require('./ncrRoutes');
+const reportRoutes = require('./reportRoutes');
 
 const router = express.Router();
 
@@ -40,5 +41,9 @@ router.use('/ncr', ncrRoutes);
 router.use('/presence', presenceRoutes);
 router.use('/vehicle-overrides', vehicleOverrideRoutes);
 router.use('/admin', adminRoutes);
+// Reports: register + cost-centre stats + driver stats + NCR documents.
+// Returns COMPLETE sets (no cost-centre/date/status filtering server-side)
+// so nothing can be hidden by a WHERE clause.
+router.use('/reports', reportRoutes);
 
 module.exports = router;

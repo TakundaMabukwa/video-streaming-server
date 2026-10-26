@@ -36,6 +36,64 @@ function publicUrl(fileName) {
   return data?.publicUrl || null;
 }
 
+// ── Private bucket for NCR documents ───────────────────────────────────────
+// Uploaded paperwork is only downloadable by signed-in users: the bucket is
+// private and every download goes through a short-lived signed URL minted by
+// the API after the auth check. No public link is ever stored or returned.
+const NCR_DOCUMENTS_BUCKET = 'ncr-documents';
+const SIGNED_URL_TTL_SECONDS = 60 * 60;
+
+let privateBucketReady = null;
+
+async function ensurePrivateBucket() {
+  if (!supabase) return false;
+  if (privateBucketReady) return privateBucketReady;
+  privateBucketReady = (async () => {
+    try {
+      const { data, error } = await supabase.storage.getBucket(NCR_DOCUMENTS_BUCKET);
+      if (!error && data) return true;
+      const { error: createErr } = await supabase.storage.createBucket(NCR_DOCUMENTS_BUCKET, {
+        public: false,
+        fileSizeLimit: 25 * 1024 * 1024,
+      });
+      if (createErr && !/already exists/i.test(createErr.message || '')) {
+        console.error('[Storage] Could not create private bucket:', createErr.message);
+        return false;
+      }
+      return true;
+    } catch (err) {
+      console.error('[Storage] Private bucket check failed:', err.message);
+      return false;
+    }
+  })();
+  return privateBucketReady;
+}
+
+async function uploadPrivateDocument(buffer, fileName, contentType) {
+  if (!supabase) throw new Error('Supabase not configured');
+  await ensurePrivateBucket();
+  const { error } = await supabase.storage
+    .from(NCR_DOCUMENTS_BUCKET)
+    .upload(fileName, buffer, {
+      contentType: contentType || 'application/pdf',
+      upsert: false,
+    });
+  if (error) throw error;
+  return fileName;
+}
+
+async function createPrivateDocumentUrl(storagePath, ttlSeconds = SIGNED_URL_TTL_SECONDS) {
+  if (!supabase) return null;
+  const { data, error } = await supabase.storage
+    .from(NCR_DOCUMENTS_BUCKET)
+    .createSignedUrl(storagePath, ttlSeconds);
+  if (error) {
+    console.error('[Storage] Signed URL failed:', error.message);
+    return null;
+  }
+  return data?.signedUrl || null;
+}
+
 /**
  * Upload a file straight from disk. Evidence archives are hundreds of MB, so
  * the body is a stream (undici `duplex: 'half'`) instead of a Buffer — the
@@ -72,4 +130,15 @@ function localFileNameFor(fileName) {
   return path.basename(fileName);
 }
 
-module.exports = { uploadDocument, uploadLocalFile, publicUrl, localFileNameFor, REPORTS_BUCKET };
+module.exports = {
+  uploadDocument,
+  uploadLocalFile,
+  publicUrl,
+  localFileNameFor,
+  REPORTS_BUCKET,
+  NCR_DOCUMENTS_BUCKET,
+  SIGNED_URL_TTL_SECONDS,
+  uploadPrivateDocument,
+  createPrivateDocumentUrl,
+  ensurePrivateBucket,
+};

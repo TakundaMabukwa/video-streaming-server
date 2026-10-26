@@ -958,6 +958,27 @@ const MIGRATIONS_SQL = `
   CREATE INDEX IF NOT EXISTS idx_ncr_evidence_form ON ncr_evidence(ncr_form_id);
   CREATE INDEX IF NOT EXISTS idx_ncr_evidence_alert ON ncr_evidence(alert_id);
 
+  -- ── Documents uploaded against an NCR ────────────────────────────────
+  -- User-supplied paperwork (signed PDF, licence, photos) linked to the NCR
+  -- it belongs to. The bytes live in a PRIVATE Supabase Storage bucket
+  -- (ncr-documents); this table is only the link + metadata, so the file
+  -- can be downloaded later by a signed-in user through a short-lived
+  -- signed URL (never a public link).
+  CREATE TABLE IF NOT EXISTS ncr_documents (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    incident_id UUID REFERENCES incidents(id) ON DELETE CASCADE,
+    ncr_form_id UUID REFERENCES ncr_forms(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    storage_path TEXT NOT NULL,
+    content_type TEXT,
+    byte_size INTEGER,
+    doc_type TEXT,
+    uploaded_by TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  );
+  CREATE INDEX IF NOT EXISTS idx_ncr_documents_incident ON ncr_documents(incident_id);
+  CREATE INDEX IF NOT EXISTS idx_ncr_documents_form ON ncr_documents(ncr_form_id);
+
   -- ── Generic background job queue ───────────────────────────────────
   -- Drives the parts of the NCR flow the user should never wait on:
   --   resolve  → close the alert group (+ members) for a saved NCR
