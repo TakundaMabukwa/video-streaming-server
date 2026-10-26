@@ -883,6 +883,12 @@ const MIGRATIONS_SQL = `
   CREATE INDEX IF NOT EXISTS idx_incidents_cc_date ON incidents(cost_center_id, incident_date DESC);
   CREATE INDEX IF NOT EXISTS idx_incidents_fleet ON incidents(fleet_number);
 
+  -- incident_no is a DISPLAY number minted from a sequence; sequence drift
+  -- (manual inserts / restores) made the unique constraint block real NCR
+  -- saves with "duplicate key value violates incidents_incident_no_key".
+  -- alert_id stays UNIQUE — that is the real identity link.
+  ALTER TABLE incidents DROP CONSTRAINT IF EXISTS incidents_incident_no_key;
+
   -- ── NCR document store ──────────────────────────────────────────────
   -- ncr_forms holds the SIGNED NCR document exactly as it was submitted
   -- (every field, as displayed). The register renders from this instead of
