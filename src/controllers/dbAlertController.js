@@ -251,14 +251,17 @@ async function getActiveAlerts(req, res) {
     // resolved ones. The board loads full once, then polls this.
     if (since) {
       const asOf = new Date().toISOString();
-      const [changedGroups, removed] = await Promise.all([
+      const [changedGroups, resolvedResult] = await Promise.all([
         db.getActiveAlertChanges({ since }),
         db.getResolvedSince({ since }),
       ]);
-      if (changedGroups.length > 5000) {
+      if (changedGroups.length > 5000 || resolvedResult.truncated) {
         // Window too wide (client was away too long) — tell it to full-reload.
+        // Never return a partial tombstone set: a missing tombstone would
+        // resurrect a resolved card on the client.
         return res.json({ success: true, truncated: true, asOf, source: 'eps-db' });
       }
+      const removed = resolvedResult.rows;
       const batch = forceAll ? { deviceCC: new Map(), fleetMap: new Map() } : await batchResolveDeviceCC(changedGroups);
       const filter = await buildStrictAlertFilter(batch.deviceCC);
       const alwaysPass = { ...filter, passes: () => true };

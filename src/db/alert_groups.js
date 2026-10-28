@@ -11,6 +11,15 @@ function logDropOnce(key, message) {
   console.log(message);
 }
 
+// One definition of an OPEN alert group, shared by every board/count/delta
+// query. resolved/false_alert are the authoritative flags; status is included
+// as a defensive guard so a row that was closed through another path can
+// never leak back onto an active surface.
+function activeGroupPredicate(alias = '') {
+  const p = alias ? `${alias}.` : '';
+  return `${p}resolved = FALSE AND ${p}false_alert = FALSE AND lower(coalesce(${p}status, '')) NOT IN ('resolved', 'closed')`;
+}
+
 // Member stamp: link the detection's alert row to its group (insert-or-fill,
 // never overwrites member data). Guarded — member linkage must never break
 // the hot detection path.
@@ -486,7 +495,7 @@ async function batchUpsertAlertGroups(groups) {
 async function getActiveAlertGroups({ limit = 2000 } = {}) {
   const result = await query(
     `SELECT g.* FROM alert_groups g
-     WHERE g.resolved = FALSE
+     WHERE ${activeGroupPredicate('g')}
      ORDER BY g.last_alert_ts DESC NULLS LAST
      LIMIT $1`,
     [limit]
@@ -535,7 +544,7 @@ async function getActiveAlertGroupsWithMedia({ limit = 2000 } = {}) {
   const result = await query(
     `SELECT ${BOARD_COLUMNS}
      FROM alert_groups g
-     WHERE g.resolved = FALSE AND g.false_alert = FALSE
+     WHERE ${activeGroupPredicate('g')}
      ORDER BY g.last_alert_ts DESC NULLS LAST
      ${bounded ? 'LIMIT $1' : ''}`,
     bounded ? [limit] : []
@@ -548,7 +557,7 @@ async function getActiveAlertGroupsAll({ limit = 2000 } = {}) {
   const result = await query(
     `SELECT ${BOARD_COLUMNS}
      FROM alert_groups g
-     WHERE g.resolved = FALSE AND g.false_alert = FALSE
+     WHERE ${activeGroupPredicate('g')}
      ORDER BY g.last_alert_ts DESC NULLS LAST
      ${bounded ? 'LIMIT $1' : ''}`,
     bounded ? [limit] : []
@@ -564,7 +573,7 @@ async function getActivePerVehicleGroups() {
   const result = await query(
     `SELECT DISTINCT ON (g.device_id) ${BOARD_COLUMNS}
      FROM alert_groups g
-     WHERE g.resolved = FALSE AND g.false_alert = FALSE
+     WHERE ${activeGroupPredicate('g')}
        AND g.device_id IS NOT NULL AND g.device_id <> ''
      ORDER BY g.device_id, g.last_alert_ts DESC NULLS LAST`,
     []
@@ -599,7 +608,7 @@ async function getActiveAlertGroupsPage({ limit = 10000, cursorTs = null, cursor
   const result = await query(
     `SELECT ${BOARD_COLUMNS}
      FROM alert_groups g
-     WHERE g.resolved = FALSE AND g.false_alert = FALSE
+     WHERE ${activeGroupPredicate('g')}
      ${cursorSql}
      ORDER BY g.last_alert_ts DESC NULLS LAST, g.id DESC
      LIMIT $${limitIdx}`,
@@ -623,7 +632,7 @@ async function getActiveAlertCountRows() {
   const result = await query(
     `SELECT device_id, device_name, alarm_type, source_type, severity, count, follow_up, follow_up_at, last_alert_ts
      FROM alert_groups
-     WHERE resolved = FALSE AND false_alert = FALSE`
+     WHERE ${activeGroupPredicate()}`
   );
   return result.rows;
 }
@@ -637,7 +646,7 @@ async function getActiveAlertChanges({ since }) {
   const result = await query(
     `SELECT ${BOARD_COLUMNS}
      FROM alert_groups g
-     WHERE g.resolved = FALSE AND g.false_alert = FALSE
+     WHERE ${activeGroupPredicate('g')}
        AND g.updated_at > $1::timestamptz
      ORDER BY g.updated_at ASC`,
     [since]
@@ -648,15 +657,16 @@ async function getActiveAlertChanges({ since }) {
 // Ids resolved since a cursor — lets delta clients drop cards without a
 // full reload. Resolved groups never reappear (resolve sticks), so a
 // tombstone is final for that group id.
-async function getResolvedSince({ since }) {
+async function getResolvedSince({ since, limit = 5000 }) {
+  const cap = Number.isFinite(Number(limit)) && Number(limit) > 0 ? Math.floor(Number(limit)) : 5000;
   const result = await query(
     `SELECT id, resolved_at FROM alert_groups
      WHERE resolved = TRUE AND COALESCE(resolved_at, updated_at) > $1::timestamptz
      ORDER BY COALESCE(resolved_at, updated_at) ASC
-     LIMIT 5000`,
-    [since]
+     LIMIT $2`,
+    [since, cap + 1]
   );
-  return result.rows;
+  return { rows: result.rows.slice(0, cap), truncated: result.rows.length > cap };
 }
 
 // Compact serialization: shared column header + positional rows. Kills the
@@ -675,9 +685,9 @@ async function listAlertGroups({ status = '', limit = null, offset = 0 } = {}) {
   const s = String(status || '').trim().toLowerCase();
   const where = [];
   if (s === 'active' || s === 'open') {
-    where.push('g.resolved = FALSE');
+    where.push(activeGroupPredicate('g'));
   } else if (s === 'new') {
-    where.push('g.resolved = FALSE', "g.status = 'new'");
+    where.push(activeGroupPredicate('g'), "g.status = 'new'");
   } else if (s === 'resolved' || s === 'closed') {
     where.push('g.resolved = TRUE');
   }
@@ -1041,6 +1051,7 @@ async function getAlertGroupStats() {
 }
 
 module.exports = {
+  activeGroupPredicate,
   upsertAlertGroup,
   requestIncidentFootage,
   batchUpsertAlertGroups,

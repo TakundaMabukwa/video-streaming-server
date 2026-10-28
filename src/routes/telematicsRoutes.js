@@ -637,7 +637,7 @@ router.get('/vehicle-alerts', async (req, res) => {
               MAX(last_alert_ts) as latest_alert_ts,
               ARRAY_AGG(DISTINCT alarm_type) as alert_types
        FROM alert_groups
-       WHERE resolved = FALSE AND false_alert = FALSE
+       WHERE ${db.activeGroupPredicate()}
        GROUP BY device_id`
     );
     res.json({ success: true, data: result.rows });
@@ -658,7 +658,7 @@ router.get('/vehicle-alerts/:deviceId', async (req, res) => {
     const { deviceId } = req.params;
     const { fleet, fleets, deviceIds, includeAll, cursorTs, cursorId, limit } = req.query;
 
-    let where = `WHERE ag.resolved = FALSE AND ag.false_alert = FALSE`;
+    let where = `WHERE ${db.activeGroupPredicate('ag')}`;
     const params = [];
     let idx = 1;
 
@@ -841,7 +841,7 @@ router.get('/vehicle-status-all-enriched', async (req, res) => {
                  MAX(last_alert_ts) as latest_alert_ts,
                  ARRAY_AGG(DISTINCT alarm_type) as alert_types
          FROM alert_groups
-         WHERE resolved = FALSE AND false_alert = FALSE
+         WHERE ${db.activeGroupPredicate()}
          GROUP BY device_id
        ) a ON vs.device_id = a.device_id
        ORDER BY vs.fleet_number`
