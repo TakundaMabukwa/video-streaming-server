@@ -7,9 +7,32 @@ const { isRegisteredVehicle } = require('../services/fleetRegistryGuard');
 // GET /api/driver-scoring - Get all driver scores
 router.get('/', async (req, res) => {
   try {
-    const result = await query(
-      'SELECT id, registration_number, fleet_number, driver, score, alert_types, created_at, updated_at FROM driver_scoring ORDER BY fleet_number'
-    );
+    const hasCostCenterFilter = req.query.costCenterIds !== undefined;
+    const costCenterIds = String(req.query.costCenterIds || '')
+      .split(',')
+      .map((id) => Number(id))
+      .filter((id) => Number.isFinite(id) && id > 0);
+
+    if (hasCostCenterFilter && costCenterIds.length === 0) {
+      return res.json({ success: true, scores: [] });
+    }
+
+    const result = hasCostCenterFilter
+      ? await query(
+          `SELECT ds.id, ds.registration_number, ds.fleet_number, ds.driver, ds.score, ds.alert_types, ds.created_at, ds.updated_at
+           FROM driver_scoring ds
+           WHERE EXISTS (
+             SELECT 1 FROM fleet_vehicles fv
+             WHERE upper(trim(fv.fleet_number)) = upper(trim(ds.fleet_number))
+               AND fv.cost_center_id = ANY($1::int[])
+           )
+           ORDER BY ds.fleet_number`,
+          [costCenterIds]
+        )
+      : await query(
+          'SELECT id, registration_number, fleet_number, driver, score, alert_types, created_at, updated_at FROM driver_scoring ORDER BY fleet_number'
+        );
+
     res.json({ success: true, scores: result.rows });
   } catch (err) {
     console.error('[DriverScoring] Get all error:', err.message);
