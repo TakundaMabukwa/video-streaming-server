@@ -1,4 +1,5 @@
 const { query } = require('./pool');
+const { flagsFor, normalizeCategory } = require('../alerts/zoneCategory');
 
 // ── Helpers ──
 
@@ -513,6 +514,7 @@ async function upsertGeotabZones(zones) {
     const isNoStopping = hasNoStop;
     const isNoGo = !hasNoStop && hasNoGo;
     const isHighRisk = !hasNoStop && !hasNoGo && hasHighRisk;
+    const zoneCategory = isNoStopping ? 'no_stopping' : isNoGo ? 'no_go' : isHighRisk ? 'high_risk' : 'normal';
     let points = zone.points || [];
     if (typeof points === 'string') {
       try { points = JSON.parse(points); } catch { points = []; }
@@ -526,11 +528,12 @@ async function upsertGeotabZones(zones) {
       }
     }
     await query(
-      `INSERT INTO geotab_zones (id, name, points, zone_types, comment, is_high_risk, is_no_go, is_no_stopping, raw_data, last_synced)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+      `INSERT INTO geotab_zones (id, name, points, zone_types, comment, is_high_risk, is_no_go, is_no_stopping, zone_category, raw_data, last_synced)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
        ON CONFLICT (id) DO UPDATE SET
          name = EXCLUDED.name, points = EXCLUDED.points, zone_types = EXCLUDED.zone_types,
          comment = EXCLUDED.comment, is_high_risk = EXCLUDED.is_high_risk, is_no_go = EXCLUDED.is_no_go, is_no_stopping = EXCLUDED.is_no_stopping,
+         zone_category = EXCLUDED.zone_category,
          raw_data = EXCLUDED.raw_data, last_synced = NOW()
        WHERE geotab_zones.locally_modified IS NULL`,
       [
@@ -542,6 +545,7 @@ async function upsertGeotabZones(zones) {
         isHighRisk,
         isNoGo,
         isNoStopping,
+        zoneCategory,
         JSON.stringify(zone),
       ]
     );
@@ -562,7 +566,7 @@ async function getHighRiskZones() {
 // does not write this column, so it survives every sync.
 async function setZoneNoStopping(zoneId, flag) {
   const result = await query(
-    'UPDATE geotab_zones SET is_no_stopping = $2 WHERE id = $1 RETURNING id, name, is_no_stopping',
+    "UPDATE geotab_zones SET is_no_stopping = $2, zone_category = CASE WHEN $2 THEN 'no_stopping' ELSE zone_category END WHERE id = $1 RETURNING id, name, is_no_stopping, zone_category",
     [zoneId, !!flag]
   );
   return result.rows[0] || null;
@@ -570,29 +574,37 @@ async function setZoneNoStopping(zoneId, flag) {
 
 // Local zone edits (Stops UI). locally_modified pins the row so the 5-min
 // Geotab sync skips it on conflict instead of overwriting the edit.
-async function updateGeotabZone(id, { name, points, comment, isHighRisk, isNoGo }) {
+async function updateGeotabZone(id, { name, points, comment, isHighRisk, isNoGo, zoneCategory }) {
+  const category = normalizeCategory(zoneCategory)
+    || (isNoGo ? 'no_go' : isHighRisk ? 'high_risk' : 'normal');
+  const flags = flagsFor(category);
   const result = await query(
     `UPDATE geotab_zones
      SET name = $2, points = $3, comment = $4, is_high_risk = $5, is_no_go = $6,
+         is_no_stopping = $7, zone_category = $8,
          locally_modified = NOW(), last_synced = NOW()
      WHERE id = $1 AND is_deleted IS NOT TRUE
      RETURNING *`,
-    [id, name, JSON.stringify(points), comment, isHighRisk, isNoGo]
+    [id, name, JSON.stringify(points), comment, flags.is_high_risk, flags.is_no_go, flags.is_no_stopping, category]
   );
   return result.rows[0] || null;
 }
 
-async function createGeotabZone({ id, name, points, comment, isHighRisk, isNoGo }) {
+async function createGeotabZone({ id, name, points, comment, isHighRisk, isNoGo, zoneCategory }) {
+  const category = normalizeCategory(zoneCategory)
+    || (isNoGo ? 'no_go' : isHighRisk ? 'high_risk' : 'normal');
+  const flags = flagsFor(category);
   const result = await query(
-    `INSERT INTO geotab_zones (id, name, points, zone_types, comment, is_high_risk, is_no_go, raw_data, locally_modified, last_synced)
-     VALUES ($1, $2, $3, '[]', $4, $5, $6, '{}', NOW(), NOW())
+    `INSERT INTO geotab_zones (id, name, points, zone_types, comment, is_high_risk, is_no_go, is_no_stopping, zone_category, raw_data, locally_modified, last_synced)
+     VALUES ($1, $2, $3, '[]', $4, $5, $6, $7, $8, '{}', NOW(), NOW())
      ON CONFLICT (id) DO UPDATE SET
        name = EXCLUDED.name, points = EXCLUDED.points, comment = EXCLUDED.comment,
        is_high_risk = EXCLUDED.is_high_risk, is_no_go = EXCLUDED.is_no_go,
+       is_no_stopping = EXCLUDED.is_no_stopping, zone_category = EXCLUDED.zone_category,
        is_deleted = FALSE, locally_modified = NOW(), last_synced = NOW()
      WHERE geotab_zones.locally_modified IS NULL
      RETURNING *`,
-    [id, name, JSON.stringify(points), comment, isHighRisk, isNoGo]
+    [id, name, JSON.stringify(points), comment, flags.is_high_risk, flags.is_no_go, flags.is_no_stopping, category]
   );
   return result.rows[0] || null;
 }
@@ -647,8 +659,8 @@ async function upsertVehicleStatus(deviceId, data) {
   // Upsert only the fields provided in `data`. Because all dynamic fields use COALESCE,
   // missing/null values keep the last known value instead of blanking the row.
   await query(
-    `INSERT INTO vehicle_status (device_id, plate, license_plate, fleet_number, engine_on, ignition_on, speed, latitude, longitude, last_log_time, last_update)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+    `INSERT INTO vehicle_status (device_id, plate, license_plate, fleet_number, engine_on, ignition_on, speed, latitude, longitude, bearing, last_log_time, last_update)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
      ON CONFLICT (device_id) DO UPDATE SET
        plate = COALESCE(EXCLUDED.plate, vehicle_status.plate),
        license_plate = COALESCE(EXCLUDED.license_plate, vehicle_status.license_plate),
@@ -658,8 +670,12 @@ async function upsertVehicleStatus(deviceId, data) {
        speed = COALESCE(EXCLUDED.speed, vehicle_status.speed),
        latitude = COALESCE(EXCLUDED.latitude, vehicle_status.latitude),
        longitude = COALESCE(EXCLUDED.longitude, vehicle_status.longitude),
+       bearing = COALESCE(EXCLUDED.bearing, vehicle_status.bearing),
        last_log_time = COALESCE(EXCLUDED.last_log_time, vehicle_status.last_log_time),
-       last_update = NOW()`,
+       last_update = NOW()
+     WHERE vehicle_status.last_log_time IS NULL
+        OR EXCLUDED.last_log_time IS NULL
+        OR EXCLUDED.last_log_time >= vehicle_status.last_log_time`,
     [
       deviceId,
       data.plate || null,
@@ -670,6 +686,7 @@ async function upsertVehicleStatus(deviceId, data) {
       data.speed ?? null,
       data.latitude ?? null,
       data.longitude ?? null,
+      data.bearing ?? null,
       data.lastLogTime || null,
     ]
   ).catch(() => {});
@@ -771,6 +788,94 @@ async function endDrivingSession(deviceId, endedAt) {
   return result.rows[0] || null;
 }
 
+// ── Rest periods ───────────────────────────────────────────────────────────
+// One row per observed isDriving=false interval. rest_start/last_seen_at are
+// the device event times at which the vehicle was first/last seen not driving;
+// rest_end is the first fresh driving sample after it. A break qualifies when
+// rest_end - rest_start >= minBreakSeconds (5 minutes by default).
+
+async function startRestPeriod({
+  deviceId, sourceDeviceId, fleetNumber, registrationNumber,
+  restStart, beforeSessionId = null, reason = 'driving_stopped',
+}) {
+  const at = restStart || new Date();
+  const result = await query(
+    `INSERT INTO vehicle_rest_periods
+       (device_id, source_device_id, fleet_number, registration_number, rest_start, last_seen_at, before_session_id, reason)
+     VALUES ($1, $2, $3, $4, $5, $5, $6, $7)
+     ON CONFLICT (device_id) WHERE rest_end IS NULL
+     DO UPDATE SET
+       last_seen_at = GREATEST(COALESCE(vehicle_rest_periods.last_seen_at, EXCLUDED.last_seen_at), EXCLUDED.last_seen_at),
+       source_device_id = COALESCE(EXCLUDED.source_device_id, vehicle_rest_periods.source_device_id),
+       fleet_number = COALESCE(EXCLUDED.fleet_number, vehicle_rest_periods.fleet_number),
+       registration_number = COALESCE(EXCLUDED.registration_number, vehicle_rest_periods.registration_number),
+       updated_at = NOW()
+     RETURNING *`,
+    [deviceId, sourceDeviceId || null, fleetNumber || null, registrationNumber || null, at,
+      beforeSessionId, reason]
+  );
+  return result.rows[0] || null;
+}
+
+async function endRestPeriod({
+  deviceId, restEnd, afterSessionId = null, minBreakSeconds = 300, reason = 'driving_resumed',
+}) {
+  const at = restEnd || new Date();
+  const result = await query(
+    `UPDATE vehicle_rest_periods SET
+       rest_end = $2,
+       last_seen_at = $2,
+       duration_seconds = GREATEST(0, EXTRACT(EPOCH FROM ($2::timestamptz - rest_start))::int),
+       qualifies_for_fatigue_rearm =
+         (EXTRACT(EPOCH FROM ($2::timestamptz - rest_start)) >= $3::int),
+       classification = CASE
+         WHEN EXTRACT(EPOCH FROM ($2::timestamptz - rest_start)) >= $3::int THEN 'qualified'
+         ELSE 'short'
+       END,
+       after_session_id = COALESCE($4, after_session_id),
+       reason = COALESCE($5, reason),
+       updated_at = NOW()
+     WHERE device_id = $1 AND rest_end IS NULL
+     RETURNING *`,
+    [deviceId, at, Math.max(0, Number(minBreakSeconds) || 300), afterSessionId, reason]
+  );
+  return result.rows[0] || null;
+}
+
+async function getOpenRestPeriod(deviceId) {
+  const result = await query(
+    'SELECT * FROM vehicle_rest_periods WHERE (device_id = $1 OR source_device_id = $1) AND rest_end IS NULL ORDER BY rest_start DESC LIMIT 1',
+    [deviceId]
+  );
+  return result.rows[0] || null;
+}
+
+async function getLatestClosedRestPeriod(deviceId, beforeIso = null) {
+  const result = await query(
+    `SELECT * FROM vehicle_rest_periods
+      WHERE (device_id = $1 OR source_device_id = $1)
+        AND rest_end IS NOT NULL
+        AND ($2::timestamptz IS NULL OR rest_end <= $2::timestamptz)
+      ORDER BY rest_end DESC LIMIT 1`,
+    [deviceId, beforeIso]
+  );
+  return result.rows[0] || null;
+}
+
+async function listRestPeriods({ deviceId, from = null, to = null, limit = 100 } = {}) {
+  if (!deviceId) return [];
+  const n = Math.min(Math.max(Number(limit) || 100, 1), 500);
+  const result = await query(
+    `SELECT * FROM vehicle_rest_periods
+      WHERE (device_id = $1 OR source_device_id = $1)
+        AND ($2::timestamptz IS NULL OR rest_start >= $2::timestamptz)
+        AND ($3::timestamptz IS NULL OR rest_start <= $3::timestamptz)
+      ORDER BY rest_start DESC LIMIT $4`,
+    [deviceId, from, to, n]
+  );
+  return result.rows;
+}
+
 // Track the authoritative driving duration + per-session speed/fatigue flags.
 // Only fields provided get updated; nulls keep the last known value except for the
 // explicitly-passed boolean flags which are always written when defined.
@@ -796,6 +901,9 @@ async function updateVehicleStatusDriving(deviceId, data) {
   if (data.speed85EpisodeSince !== undefined) push('speed_85_episode_since', data.speed85EpisodeSince);
   if (data.fatigueAlertedThresholds !== undefined) {
     push('fatigue_alerted_thresholds', JSON.stringify(data.fatigueAlertedThresholds));
+  }
+  if (data.fatigueAlertedSessionStart !== undefined) {
+    push('fatigue_alerted_session_start', data.fatigueAlertedSessionStart);
   }
   if (sets.length === 0) return null;
   sets.push(`last_update = NOW()`);
@@ -908,4 +1016,9 @@ module.exports = {
   endZoneStopEvent,
   endZoneStopEventsByDevice,
   markZoneStopAlertSent,
+  startRestPeriod,
+  endRestPeriod,
+  getOpenRestPeriod,
+  getLatestClosedRestPeriod,
+  listRestPeriods,
 };

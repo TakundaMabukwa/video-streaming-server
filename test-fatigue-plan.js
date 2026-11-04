@@ -36,7 +36,7 @@ console.log('[1] fire decisions');
 }
 {
   const p = planFatigueThresholds({ codes: [THREE_H], curMinutes: 500, currDriving: true });
-  check('500m fires only the not-yet-served 6h + 8h', JSON.stringify(codes(p)) === JSON.stringify([EIGHT_H, SIX_H].sort()), JSON.stringify(p));
+  check('500m catch-up fires the highest (8h) and holds the lower 6h', JSON.stringify(codes(p)) === JSON.stringify([EIGHT_H]) && JSON.stringify(p.skip) === JSON.stringify([SIX_H]), JSON.stringify(p));
 }
 {
   const p = planFatigueThresholds({ codes: [], curMinutes: 500, currDriving: false });
@@ -97,8 +97,11 @@ console.log('[5] full cycle: serve → reset → next batch');
 {
   const held = [];
   const first = planFatigueThresholds({ codes: held, curMinutes: 545, currDriving: true });
+  for (const c of first.skip) held.push(c);
   for (const t of first.fire) held.push(t.signalCode);
-  check('run 1 serves 3h+6h+8h+9h together', first.fire.length === 4, JSON.stringify(first));
+  check('run 1 catch-up serves only the highest (9h) and holds 3h/6h/8h',
+    first.fire.length === 1 && first.fire[0].signalCode === NINE_H && first.skip.length === 3,
+    JSON.stringify(first));
 
   const whileDriving = planFatigueThresholds({ codes: held, curMinutes: 560, currDriving: true });
   check('later in the same run: silent', whileDriving.fire.length === 0 && whileDriving.rearm.length === 0, JSON.stringify(whileDriving));
@@ -119,6 +122,27 @@ console.log('[5] full cycle: serve → reset → next batch');
 
   const run2 = planFatigueThresholds({ codes: held, curMinutes: 181, currDriving: true });
   check('run 2 fires 3h again (next batch works)', codes(run2).length === 1 && codes(run2)[0] === THREE_H, JSON.stringify(run2));
+}
+
+console.log('[6] continuous run: no break → 3h, then 6h, then 8h, then 9h');
+{
+  const held = [];
+  let p = planFatigueThresholds({ codes: held, curMinutes: 181, currDriving: true });
+  check('first crossing is 3h', p.fire.length === 1 && p.fire[0].signalCode === THREE_H, JSON.stringify(p));
+  held.push(THREE_H);
+
+  p = planFatigueThresholds({ codes: held, curMinutes: 361, currDriving: true });
+  check('no break: next crossing is 6h, never 3h again',
+    p.fire.length === 1 && p.fire[0].signalCode === SIX_H && !p.rearm.includes(THREE_H),
+    JSON.stringify(p));
+  held.push(SIX_H);
+
+  p = planFatigueThresholds({ codes: held, curMinutes: 481, currDriving: true });
+  check('then 8h', p.fire.length === 1 && p.fire[0].signalCode === EIGHT_H, JSON.stringify(p));
+  held.push(EIGHT_H);
+
+  p = planFatigueThresholds({ codes: held, curMinutes: 541, currDriving: true });
+  check('then 9h', p.fire.length === 1 && p.fire[0].signalCode === NINE_H, JSON.stringify(p));
 }
 
 console.log('');

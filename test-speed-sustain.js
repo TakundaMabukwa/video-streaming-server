@@ -55,9 +55,9 @@ const REG = 'JGV566FS';
 const SPEED85 = 'aURw7fNBdxEGWY3NXil_yIg';
 const SPEED90 = 'aLv1Bv53LBkClq5rSQ5QPkQ';
 const FATIGUE3H = 'a43F6lFwgIUq_gkgmgSX08g';
-const S85_NAME = 'Speeding 85km/h';          // local alert_definitions names
-const S90_NAME = 'Speeding 90km/h';
-const F3_NAME = 'Driver Fatigue - 3 hours';
+const S85_NAME = 'Heavy Duty Max Speeding 85km/h';          // local alert_definitions names
+const S90_NAME = 'Heavy Duty Max Speeding 90KM/H';
+const F3_NAME = 'Driver Fatigue 3h (Low)';
 
 const BASE_LAT = 48.8566;
 const BASE_LON = 2.3522;
@@ -92,27 +92,43 @@ async function tick(label, status) {
   console.log(`  · ${label}`);
 }
 
+async function setNextEpisodeAge(secondsAgo) {
+  const sampleIso = new Date(T0 + tickIdx * 15_000).toISOString();
+  await query(
+    "UPDATE vehicle_status SET speed_85_episode_since = $2::timestamptz - ($3 || ' seconds')::interval WHERE device_id = $1",
+    [DEVICE_ID, sampleIso, secondsAgo]
+  );
+}
+
 const vs = async () => (await query('SELECT * FROM vehicle_status WHERE device_id = $1', [DEVICE_ID])).rows[0] || null;
 const groupsByType = async () => {
   const r = await query(
-    'SELECT alarm_type, count(*)::int n, max(count)::int cnt FROM alert_groups WHERE device_id = $1 GROUP BY 1',
+    'SELECT alarm_type, count(*)::int n, max(count)::int cnt FROM alert_groups WHERE (device_id = $1 OR source_device_id = $1) GROUP BY 1',
     [DEVICE_ID]
   );
   return Object.fromEntries(r.rows.map((x) => [x.alarm_type, { n: x.n, cnt: x.cnt }]));
 };
-const lastEventDistance = async (code) => {
+const lastEvent = async (code) => {
   const r = await query(
-    'SELECT distance FROM telematics_events WHERE device_id = $1 AND event_code = $2 ORDER BY event_time DESC LIMIT 1',
+    'SELECT distance, duration_seconds FROM telematics_events WHERE (device_id = $1 OR source_device_id = $1) AND event_code = $2 ORDER BY event_time DESC LIMIT 1',
     [DEVICE_ID, code]
   );
-  return r.rows[0]?.distance ?? null;
+  return r.rows[0] || null;
+};
+const lastEventDistance = async (code) => (await lastEvent(code))?.distance ?? null;
+const latestGroup = async (type) => {
+  const r = await query(
+    'SELECT speed, distance_km, duration_seconds FROM alert_groups WHERE (device_id = $1 OR source_device_id = $1) AND alarm_type = $2 ORDER BY last_alert_ts DESC LIMIT 1',
+    [DEVICE_ID, type]
+  );
+  return r.rows[0] || null;
 };
 
 (async () => {
   console.log('== prep ==');
-  await query('DELETE FROM alerts WHERE device_id = $1', [DEVICE_ID]).catch(() => {});
-  await query('DELETE FROM alert_groups WHERE device_id = $1', [DEVICE_ID]).catch(() => {});
-  await query('DELETE FROM telematics_events WHERE device_id = $1', [DEVICE_ID]).catch(() => {});
+  await query('DELETE FROM alerts WHERE (device_id = $1 OR source_device_id = $1)', [DEVICE_ID]).catch(() => {});
+  await query('DELETE FROM alert_groups WHERE (device_id = $1 OR source_device_id = $1)', [DEVICE_ID]).catch(() => {});
+  await query('DELETE FROM telematics_events WHERE (device_id = $1 OR source_device_id = $1)', [DEVICE_ID]).catch(() => {});
   await query('DELETE FROM telemetry_history WHERE device_id = $1', [DEVICE_ID]).catch(() => {});
   await query('DELETE FROM driving_sessions WHERE device_id = $1', [DEVICE_ID]).catch(() => {});
   await query('DELETE FROM vehicle_status WHERE device_id = $1', [DEVICE_ID]).catch(() => {});
@@ -133,13 +149,20 @@ const lastEventDistance = async (code) => {
   await tick('tick1 @86 (age ~15s)', snap({ spd: 86 }));
   check('still no group before 2 min', Object.keys(await groupsByType()).length === 0);
 
-  await query('UPDATE vehicle_status SET speed_85_episode_since = NOW() - INTERVAL \'121 seconds\' WHERE device_id = $1', [DEVICE_ID]);
+  await setNextEpisodeAge(121);
   await tick('tick2 @86 (episode stamped 121s ago)', snap({ spd: 86 }));
   let g = await groupsByType();
   check('85 group fired after 121s', (g[S85_NAME]?.n || 0) === 1, JSON.stringify(g));
-  const d85 = await lastEventDistance(SPEED85);
+  const e85 = await lastEvent(SPEED85);
+  const d85 = e85?.distance ?? null;
   check('distance recorded on the 85 event', d85 != null && Number(d85) > 0, d85);
-  check('distance ≈ one leg up to the alert fix (~0.36km)', Number(d85) > 0.2 && Number(d85) < 0.6, d85);
+  check('distance covers the ~2 min episode (~0.7km)', Number(d85) > 0.5 && Number(d85) < 1.0, d85);
+  check('85 archive duration >= 120s', Number(e85?.duration_seconds) >= 120, e85?.duration_seconds);
+  const g85 = await latestGroup(S85_NAME);
+  check('85 group keeps latest duration >= 120s', Number(g85?.duration_seconds) >= 120, g85?.duration_seconds);
+  check('85 group keeps distance', Number(g85?.distance_km) === Number(d85), JSON.stringify(g85));
+  const m85 = (await query('SELECT distance_km, duration_seconds FROM alerts WHERE alarm_type = $1 AND device_id = $2 ORDER BY alarm_ts DESC LIMIT 1', [S85_NAME, FLEET])).rows[0];
+  check('85 member keeps distance and duration', Number(m85?.distance_km) === Number(d85) && Number(m85?.duration_seconds) >= 120, JSON.stringify(m85));
 
   await tick('tick3 @86 (still speeding)', snap({ spd: 86 }));
   g = await groupsByType();
@@ -163,7 +186,7 @@ const lastEventDistance = async (code) => {
   // Mirror the operator: the first group is resolved before the next run matures,
   // so the next fire must create a NEW group (not bump the old one).
   await query(
-    "UPDATE alert_groups SET resolved = TRUE, resolved_at = NOW() WHERE device_id = $1 AND alarm_type = $2 AND resolved = FALSE",
+    "UPDATE alert_groups SET resolved = TRUE, resolved_at = NOW() WHERE (device_id = $1 OR source_device_id = $1) AND alarm_type = $2 AND resolved = FALSE",
     [DEVICE_ID, S85_NAME]
   );
   await tick('tick7 @86 (new run starts)', snap({ spd: 86 }));
@@ -171,7 +194,7 @@ const lastEventDistance = async (code) => {
   check('new run: no instant fire at 15s (sustain required)', row?.speed_85_alerted === false);
   g = await groupsByType();
   check('resolved group stays alone (no resurrection)', (g[S85_NAME]?.n || 0) === 1, JSON.stringify(g));
-  await query('UPDATE vehicle_status SET speed_85_episode_since = NOW() - INTERVAL \'121 seconds\' WHERE device_id = $1', [DEVICE_ID]);
+  await setNextEpisodeAge(121);
   await tick('tick8 @86 (2nd run matured)', snap({ spd: 86 }));
   g = await groupsByType();
   check('second run raises a SECOND 85 group (after resolve)', (g[S85_NAME]?.n || 0) === 2, JSON.stringify(g));
@@ -182,8 +205,11 @@ const lastEventDistance = async (code) => {
   await tick('tick9 @92 (first 90 sample)', snap({ spd: 92 }));
   g = await groupsByType();
   check('90 group created on the FIRST sample', (g[S90_NAME]?.n || 0) === 1, JSON.stringify(g));
-  const d90 = await lastEventDistance(SPEED90);
-  check('90 event carries distance from the run (>1km)', Number(d90) > 1, d90);
+  const e90 = await lastEvent(SPEED90);
+  check('90 event stores zero distance at fire', Number(e90?.distance) === 0, e90?.distance);
+  check('90 event stores zero duration at fire', Number(e90?.duration_seconds) === 0, e90?.duration_seconds);
+  const g90 = await latestGroup(S90_NAME);
+  check('90 group stores zero distance/duration', Number(g90?.distance_km) === 0 && Number(g90?.duration_seconds) === 0, JSON.stringify(g90));
   check('90 superseded 85 (still two 85 groups)', (g[S85_NAME]?.n || 0) === 2, JSON.stringify(g));
 
   console.log('== [E] fatigue alert carries session distance ==');
@@ -214,9 +240,9 @@ const lastEventDistance = async (code) => {
   check('one driving session only (no churn)', sessions === 1, sessions);
 
   // cleanup (local DB only)
-  await query('DELETE FROM alerts WHERE device_id = $1', [DEVICE_ID]).catch(() => {});
-  await query('DELETE FROM alert_groups WHERE device_id = $1', [DEVICE_ID]).catch(() => {});
-  await query('DELETE FROM telematics_events WHERE device_id = $1', [DEVICE_ID]).catch(() => {});
+  await query('DELETE FROM alerts WHERE (device_id = $1 OR source_device_id = $1)', [DEVICE_ID]).catch(() => {});
+  await query('DELETE FROM alert_groups WHERE (device_id = $1 OR source_device_id = $1)', [DEVICE_ID]).catch(() => {});
+  await query('DELETE FROM telematics_events WHERE (device_id = $1 OR source_device_id = $1)', [DEVICE_ID]).catch(() => {});
   await query('DELETE FROM telemetry_history WHERE device_id = $1', [DEVICE_ID]).catch(() => {});
   await query('DELETE FROM driving_sessions WHERE device_id = $1', [DEVICE_ID]).catch(() => {});
   await query('DELETE FROM vehicle_status WHERE device_id = $1', [DEVICE_ID]).catch(() => {});

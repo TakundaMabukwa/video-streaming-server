@@ -62,7 +62,7 @@ async function getVideoSeverityMap(costCenterIds) {
     try {
       const result = await db.query(
         `SELECT signal_code, name, severity FROM alert_definitions
-         WHERE category = 'video' AND is_active = true`
+         WHERE category = 'video' AND is_active = true AND is_global = TRUE`
       );
       cachedMap = buildMap(result.rows);
       cacheTime = now;
@@ -109,7 +109,7 @@ async function getTelematicsSeverityMap(costCenterIds) {
     try {
       const result = await db.query(
         `SELECT signal_code, name, severity FROM alert_definitions
-         WHERE category = 'telematics' AND is_active = true`
+         WHERE category = 'telematics' AND is_active = true AND is_global = TRUE`
       );
       cachedTelematicsMap = buildMap(result.rows);
       telematicsCacheTime = now;
@@ -224,22 +224,7 @@ async function getTelematicsNameMap(costCenterIds) {
         `SELECT name, signal_code, severity FROM alert_definitions d
          WHERE category = 'telematics' AND is_active = true AND name IS NOT NULL AND name != ''
            AND signal_code IS DISTINCT FROM 'exceptionEvent'
-           AND (
-             -- genuinely global: no per-CC override rows at all
-             NOT EXISTS (
-               SELECT 1 FROM alert_definition_overrides o
-               JOIN cost_centers cc ON cc.id = o.cost_center_id
-               WHERE o.alert_definition_id = d.id AND cc.is_active IS DISTINCT FROM false
-             )
-             OR
-             -- in-set for at least one active cost center
-             EXISTS (
-               SELECT 1 FROM alert_definition_overrides o
-               JOIN cost_centers cc ON cc.id = o.cost_center_id
-               WHERE o.alert_definition_id = d.id AND cc.is_active IS DISTINCT FROM false
-                 AND o.is_active IS DISTINCT FROM false
-             )
-           )`
+           AND d.is_global = TRUE`
       );
       const map = {};
       const signalCodeMap = {};
@@ -308,22 +293,7 @@ async function getTelematicsNameSeverityMap(costCenterIds) {
         `SELECT name, signal_code, severity FROM alert_definitions d
          WHERE category = 'telematics' AND is_active = true AND name IS NOT NULL AND name != ''
            AND signal_code IS DISTINCT FROM 'exceptionEvent'
-           AND (
-             -- genuinely global: no per-CC override rows at all
-             NOT EXISTS (
-               SELECT 1 FROM alert_definition_overrides o
-               JOIN cost_centers cc ON cc.id = o.cost_center_id
-               WHERE o.alert_definition_id = d.id AND cc.is_active IS DISTINCT FROM false
-             )
-             OR
-             -- in-set for at least one active cost center
-             EXISTS (
-               SELECT 1 FROM alert_definition_overrides o
-               JOIN cost_centers cc ON cc.id = o.cost_center_id
-               WHERE o.alert_definition_id = d.id AND cc.is_active IS DISTINCT FROM false
-                 AND o.is_active IS DISTINCT FROM false
-             )
-           )`
+           AND d.is_global = TRUE`
       );
       const map = {};
       for (const row of result.rows) {
@@ -415,6 +385,7 @@ function invalidateCache() {
   ccTelematicsNameCache.clear();
   ccTelematicsNameSevCache.clear();
   singleDefCache.clear();
+  try { require('../alerts/authorization').invalidate(); } catch (_) { /* optional */ }
 }
 
 /**

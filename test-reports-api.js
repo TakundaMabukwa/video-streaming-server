@@ -119,6 +119,13 @@ const REG = 'LDG368MP';
   check('unknown vehicle still returns a row', !!unknown);
 
   console.log('== [4] incident + document round trip ==');
+  // Model A fixture: make sure the alert type exists in the global set.
+  await db.query(
+    `INSERT INTO alert_definitions (name, category, signal_code, severity, is_active, is_global)
+     VALUES ('Cellphone Use', 'video', 'handheldPhoneCall', 'HIGH', true, true)
+     ON CONFLICT (signal_code) DO UPDATE SET is_active = true, is_global = true`
+  );
+  require('./src/alerts/authorization').invalidate();
   const group = await db.upsertAlertGroup({
     deviceId: DEVICE_ID,
     deviceName: `${FLEET} - ${REG}`,

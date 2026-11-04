@@ -617,8 +617,8 @@ async function getAlertById(req, res) {
         console.log(`[SPEED] Result: ${speedResult.rows.length} rows`);
         const hit = speedResult.rows[0];
         if (hit) {
-          if (hit.distance != null) transformed.distance = hit.distance;
-          if (hit.duration_seconds != null) transformed.duration_seconds = hit.duration_seconds;
+          if (hit.distance != null && transformed.distance == null) transformed.distance = hit.distance;
+          if (hit.duration_seconds != null && transformed.duration_seconds == null) transformed.duration_seconds = hit.duration_seconds;
           if (hit.speed != null) {
             if (!isTelematics || transformed.speed == null) {
               transformed.speed = hit.speed;
@@ -642,8 +642,8 @@ async function getAlertById(req, res) {
           );
           if (speedResult.rows.length > 0) {
             transformed.speed = speedResult.rows[0].speed;
-            transformed.distance = speedResult.rows[0].distance;
-            transformed.duration_seconds = speedResult.rows[0].duration_seconds;
+            if (transformed.distance == null) transformed.distance = speedResult.rows[0].distance;
+            if (transformed.duration_seconds == null) transformed.duration_seconds = speedResult.rows[0].duration_seconds;
             transformed.metadata = { ...transformed.metadata, speed: speedResult.rows[0].speed };
           }
         } catch (e) { /* non-critical */ }

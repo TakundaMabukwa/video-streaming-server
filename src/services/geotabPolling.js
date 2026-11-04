@@ -3,7 +3,7 @@ const https = require('https');
 const { fetchVehiclesFromSupabase } = require('../helpers/supabaseClient');
 const { getTelematicsNameMap } = require('../db/alert_definitions');
 const { matchAlertDefinition } = require('../helpers/alertMatching');
-const { isPollerOwnedAlert, SPEED_85_CODE, SPEED_90_CODE } = require('../helpers/pollerOwnedAlerts');
+const { isPollerOwnedAlert, SPEED_85_CODE, SPEED_90_CODE, geotabSpeedingPolicy } = require('../helpers/pollerOwnedAlerts');
 const overrides = require('./vehicleAlertOverrides');
 const { processAlertDeduction } = require('./driverScoringService');
 const { escalateSeverity } = require('../helpers/transform');
@@ -14,6 +14,7 @@ const GEOTAB_URL = 'https://my.geotab.com/apiv1';
 
 let pollingInterval = null;
 let eventPollingInterval = null;
+let deviceRefreshInterval = null;
 let cachedCredentials = null;
 let credentialsExpiry = null;
 
@@ -609,6 +610,8 @@ async function syncGeotabDevices() {
         raw_data: d,
       }));
       await db.upsertGeotabDevices(enriched);
+      deviceDirectoryCache = null;
+      deviceDirectoryCacheAt = 0;
       console.log(`[GEOTAB] Synced ${devices.length} devices`);
     }
   } catch (error) {
@@ -654,6 +657,22 @@ async function getEventCursor() {
 // no events are being processed).
 let eventsSyncInFlight = false;
 
+let deviceDirectoryCache = null;
+let deviceDirectoryCacheAt = 0;
+const DEVICE_DIRECTORY_TTL_MS = 5 * 60 * 1000;
+
+async function getEventDeviceDirectory() {
+  if (deviceDirectoryCache && Date.now() - deviceDirectoryCacheAt < DEVICE_DIRECTORY_TTL_MS) {
+    return deviceDirectoryCache;
+  }
+  const rows = (await db.query(
+    'SELECT id, name, fleet_number, license_plate FROM geotab_devices'
+  )).rows;
+  deviceDirectoryCache = rows;
+  deviceDirectoryCacheAt = Date.now();
+  return rows;
+}
+
 async function syncGeotabEvents() {
   if (eventsSyncInFlight) {
     console.log('[GEOTAB] ExceptionEvent sync already in flight, skipping cycle');
@@ -669,7 +688,7 @@ async function syncGeotabEvents() {
     const credentials = await geotabAuthenticate(database, username, password);
 
     // Build a device map once per cycle (avoids a DB hit per event).
-    const allDevices = await db.getAllGeotabDevices().catch(() => []);
+    const allDevices = await getEventDeviceDirectory().catch(() => []);
     const deviceMap = new Map(allDevices.map(d => [d.id, d]));
     console.log(`[GEOTAB] Cached ${deviceMap.size} devices for event processing`);
 
@@ -819,16 +838,38 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
       let evtSpeed = event.speed || null;
       let evtAddress = event.address || null;
 
-      if (!evtLat || !evtLon) {
-        const vehiclePos = await db.getVehicleStatus(geotabDeviceId);
+      if (!evtLat || !evtLon || evtSpeed == null) {
+        const vehiclePos = await db.getVehicleStatus(geotabDeviceId).catch(() => null);
         if (vehiclePos) {
           evtLat = evtLat || vehiclePos.latitude;
           evtLon = evtLon || vehiclePos.longitude;
-          evtSpeed = evtSpeed || vehiclePos.speed;
+          evtSpeed = evtSpeed == null ? vehiclePos.speed : evtSpeed;
         }
       }
 
       const eventTime = event.activeFrom || event.lastModifiedDateTime || new Date();
+
+      // Resolve canonical fleet identity and the effective CC before writing.
+      const identityMod = require('../vehicles/identity');
+      let identity = null;
+      try {
+        identity = await identityMod.resolveVehicle({ deviceId: geotabDeviceId, fleetNumber });
+      } catch (_) { identity = null; }
+      const canonicalId = identity?.fleetNumber || fleetNumber || geotabDeviceId;
+      const sourceId = geotabDeviceId;
+      const { findVehicleCostCenterId } = require('./costCenterLookup');
+      const eventCC = identity?.costCenterId == null
+        ? await findVehicleCostCenterId(canonicalId).catch(() => null)
+        : identity.costCenterId;
+      const telematicsNameMap = await getTelematicsNameMap(eventCC ? [eventCC] : []).catch(() => ({}));
+      const matchedDef = matchAlertDefinition(eventName || '', telematicsNameMap.nameMap || {}, telematicsNameMap.signalCodeMap || {}, eventCode || '');
+
+      const speedingPolicy = geotabSpeedingPolicy(matchedDef || { name: eventName, signalCode: eventCode });
+      if (speedingPolicy === 'drop') {
+        suppressed++;
+        continue;
+      }
+      const archiveOnlySpeeding = speedingPolicy === 'archive_only';
 
       // Vehicle override: this vehicle must not raise this alert. Checked
       // BEFORE anything is written — the event is not archived, no group is
@@ -849,16 +890,17 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
         `INSERT INTO telematics_events
          (device_id, vehicle_id, license_plate, fleet_number, plate,
           event_type, event_code, severity, latitude, longitude, speed,
-          address, driver_name, description, distance, duration_seconds, zone_name, raw_data, event_time)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+          address, driver_name, description, distance, duration_seconds, zone_name, raw_data, event_time,
+          source_device_id, geotab_device_id, mettax_device_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
          ON CONFLICT (device_id, event_code, event_time) DO NOTHING
          RETURNING id`,
         [
-          geotabDeviceId,
-          geotabDeviceId,
+          canonicalId,
+          canonicalId,
           licensePlate,
-          fleetNumber,
-          fleetNumber,
+          identity?.fleetNumber || fleetNumber,
+          identity?.fleetNumber || fleetNumber,
           eventName,
           eventCode,
           severity,
@@ -873,6 +915,9 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
           zoneNameFromEvent,
           JSON.stringify(event),
           eventTime,
+          sourceId,
+          identity?.geotabDeviceId || sourceId,
+          identity?.mettaxDeviceId || null,
         ]
       );
 
@@ -885,24 +930,20 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
 
       // Process automatic deduction (NCR = no path) — fire-and-forget so the
       // FOR UPDATE lock in driver_scoring never blocks the ingest loop.
-      if (fleetNumber && eventName) {
-        processAlertDeduction(fleetNumber, eventName).catch((deductErr) => {
+      if (!archiveOnlySpeeding && (identity?.fleetNumber || fleetNumber) && eventName) {
+        processAlertDeduction(identity?.fleetNumber || fleetNumber, eventName).catch((deductErr) => {
           console.error('[Geotab] Deduction error:', deductErr.message);
         });
       }
 
-      // Dynamically match the Geotab event name against alert_definitions.name
-      const { findVehicleCostCenterId } = require('./costCenterLookup');
-      const eventCC = await findVehicleCostCenterId(fleetNumber || geotabDeviceId).catch(() => null);
-      const telematicsNameMap = await getTelematicsNameMap(eventCC ? [eventCC] : []).catch(() => ({}));
-      const matchedDef = matchAlertDefinition(eventName || '', telematicsNameMap.nameMap || {}, telematicsNameMap.signalCodeMap || {}, eventCode || '');
-
-      // Gate: only push telematics events that match an active alert_definition
-      if (wsBroadcast && matchedDef && !isUnknownDevice) {
+      // Gate: only push telematics events that match an active definition.
+      // Geotab 85/90 are archived but never broadcast as events.
+      if (wsBroadcast && matchedDef && !isUnknownDevice && !archiveOnlySpeeding) {
         const row = insertResult.rows[0];
         wsBroadcast('new_event', {
           id: row.id,
-          deviceId: geotabDeviceId,
+          deviceId: canonicalId,
+          sourceDeviceId: sourceId,
           fleetNumber,
           licensePlate,
           eventType: eventName,
@@ -924,28 +965,12 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
         continue;
       }
 
-      // Our DeviceStatusInfo poller owns alert_group creation for these
-      // telematics types. The event has already been archived to
-      // telematics_events above (kept for comparing our detection vs what
-      // Geotab sent) — the feed must NOT create an alert_group / new-alert.
-      // Speeding is the exception: the feed also creates these groups, because
-      // the poller's 15s snapshots can miss short speed spikes. Skip the feed
-      // copy when the poller already recorded a speeding alert for this vehicle
-      // within 60s of the event, so one spike is not counted twice.
-      const isSpeedingEvent = eventCode === SPEED_85_CODE || eventCode === SPEED_90_CODE;
-      if (isPollerOwnedAlert(matchedDef) && !isSpeedingEvent) {
+      // Geotab 85/90 were archived above but never create a board alert: the
+      // DeviceStatusInfo poller owns speeding. Other poller-owned types are
+      // archived only as well.
+      if (archiveOnlySpeeding) continue;
+      if (isPollerOwnedAlert(matchedDef)) {
         continue;
-      }
-      if (isSpeedingEvent) {
-        const pollerDup = await db.query(
-          `SELECT 1 FROM alert_groups
-           WHERE device_id = $1 AND alarm_type = $2 AND source_type = 'telematics'
-             AND last_alert_id LIKE 'dst-%'
-             AND ABS(EXTRACT(EPOCH FROM (last_alert_ts - $3::timestamptz))) <= 60
-           LIMIT 1`,
-          [geotabDeviceId, matchedDef.name, new Date(eventTime).toISOString()]
-        ).catch(() => ({ rows: [] }));
-        if (pollerDup.rows.length > 0) continue;
       }
 
       // Zone monitoring rule: if the same zone alert already exists for this
@@ -961,20 +986,23 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
                AND alarm_type IN ('Entering High Risk Area', 'No-Go Zone Entry')
                AND last_alert_ts >= NOW() - interval '2 minutes'
              LIMIT 1`,
-            [geotabDeviceId]
+            [canonicalId]
           );
           if (zoneRecent.rows.length > 0) continue; // seen in last 2 min — skip
         } catch (_) { /* if in doubt, let the Geotab alert through */ }
       }
 
-      const alertId = `tel-${geotabDeviceId}-${event.id || `${Date.now()}-${i}`}`;
-      const deviceName = fleetNumber ? `${fleetNumber}${licensePlate ? ' - ' + licensePlate : ''}` : geotabDeviceId;
+      const alertId = `tel-${canonicalId}-${event.id || `${Date.now()}-${i}`}`;
+      const deviceName = (identity?.fleetNumber || fleetNumber) ? `${identity?.fleetNumber || fleetNumber}${licensePlate ? ' - ' + licensePlate : ''}` : canonicalId;
 
       // No per-event row in `alerts` — alert_groups is the store, and the
       // per-event archive is telematics_events (history reads it directly).
       // A member of an enabled combo is held back until the whole set fires.
       const groupRows = await emitTelematicsAlert({
-        deviceId: geotabDeviceId,
+        deviceId: canonicalId,
+        sourceDeviceId: sourceId,
+        geotabDeviceId: identity?.geotabDeviceId || sourceId,
+        mettaxDeviceId: identity?.mettaxDeviceId || null,
         deviceName,
         alarmType: matchedDef.name,
         alarmText: `${eventName}${zoneNameFromEvent ? ' in zone ' + zoneNameFromEvent : ''}`,
@@ -984,9 +1012,11 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
         lon: evtLon,
         speed: evtSpeed ?? null,
         severity: String(matchedDef.severity || 'MEDIUM'),
-        fleetNumber: fleetNumber || null,
+        fleetNumber: identity?.fleetNumber || fleetNumber || null,
         registration: licensePlate || null,
         costCenterId: eventCC,
+        distanceKm: distance,
+        durationSeconds,
         onRaised: (groupRow, comboResult) => {
           if (groupRows.length === 0) return;
           alerted++;
@@ -1011,9 +1041,10 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
                     last_alert_id: alertId,
                     alarmId: alertId,
                     alarm_id: alertId,
-                    device_id: geotabDeviceId,
-                    deviceId: geotabDeviceId,
-                    vehicleId: geotabDeviceId,
+                    device_id: canonicalId,
+                    deviceId: canonicalId,
+                    vehicleId: canonicalId,
+                    source_device_id: sourceId || null,
                     device_name: deviceName,
                     deviceName,
                     alert_type: broadcastType,
@@ -1033,7 +1064,7 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
                     resolved: false,
                     count: groupCount,
                     combo: isCombo ? groupRow.combo_name : undefined,
-                    group_key: groupRow?.group_key || `${geotabDeviceId}:${broadcastType}`.toLowerCase(),
+                    group_key: groupRow?.group_key || `${canonicalId}:${broadcastType}`.toLowerCase(),
                     lat: evtLat,
                     lon: evtLon,
                   },
@@ -1041,7 +1072,7 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
               }
             } catch (_) { /* never block ingest on WS */ }
           }
-          console.log(`[GEOTAB] Telematics alert created: ${alertId} group=${groupRow?.id} (${broadcastType}) for device ${geotabDeviceId}`);
+          console.log(`[GEOTAB] Telematics alert created: ${alertId} group=${groupRow?.id} (${broadcastType}) for device ${canonicalId}`);
         },
       });
       if (groupRows.length === 0) continue; // vehicle not in fleet_vehicles, or a combo is still assembling
@@ -1463,6 +1494,11 @@ async function emitTelematicsAlert({
   fleetNumber,
   registration,
   costCenterId,
+  sourceDeviceId = null,
+  geotabDeviceId = null,
+  mettaxDeviceId = null,
+  distanceKm = null,
+  durationSeconds = null,
   onRaised = null,
 }) {
   const memberSeverity = String(severity || 'MEDIUM').toLowerCase();
@@ -1481,6 +1517,8 @@ async function emitTelematicsAlert({
     fleetNumber: fleetNumber || null,
     sourceType: 'telematics',
     costCenterId,
+    distanceKm,
+    durationSeconds,
   });
 
   let groupRows = comboResult.groupRows;
@@ -1499,6 +1537,11 @@ async function emitTelematicsAlert({
       severity: memberSeverity,
       fleetNumber: fleetNumber || null,
       registration: registration || null,
+      sourceDeviceId,
+      geotabDeviceId,
+      mettaxDeviceId,
+      distanceKm,
+      durationSeconds,
     });
     groupRows = created ? [created] : [];
   }
@@ -1719,7 +1762,6 @@ function startPolling(intervalMs = 60000, eventIntervalMs = 15000) {
 
   initialSync().then(() => {
     fetchAndStoreEvents();
-    fetchAndStoreVehicleStatus();
     syncLogRecords();
     syncIgnitionStatus();
 
@@ -1737,7 +1779,6 @@ function startPolling(intervalMs = 60000, eventIntervalMs = 15000) {
     // board presence and the 15s coordinate trail. ~3 API calls.
     pollingInterval = setInterval(async () => {
       await syncIgnitionStatus();
-      await fetchAndStoreVehicleStatus();
     }, intervalMs);
 
     // Warm loop (every 5 min): trip history. Read-only history, no need
@@ -1749,6 +1790,13 @@ function startPolling(intervalMs = 60000, eventIntervalMs = 15000) {
     // No cold loop: reference data is DB-owned. Zones are never fetched
     // from Geotab; rules/groups/devices/diagnostics sync once at boot only
     // when their tables are empty (see initialSync).
+
+    // Reference data is DB-owned; only the device directory gets a slow
+    // refresh so newly installed Geotab units eventually appear. Timer only,
+    // never at boot (the empty-table initialSync remains unchanged).
+    deviceRefreshInterval = setInterval(async () => {
+      await syncGeotabDevices();
+    }, 6 * 60 * 60 * 1000);
 
     // Exception events are the time-critical feed — poll frequently so new
     // telematics alerts arrive as they happen. The in-flight guard prevents
@@ -1773,6 +1821,10 @@ function stopPolling() {
   if (eventPollingInterval) {
     clearInterval(eventPollingInterval);
     eventPollingInterval = null;
+  }
+  if (deviceRefreshInterval) {
+    clearInterval(deviceRefreshInterval);
+    deviceRefreshInterval = null;
   }
   try {
     const deviceStatusPoller = require('./deviceStatusPoller');

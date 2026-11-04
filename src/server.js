@@ -11,7 +11,10 @@ const { requireAuth } = require('./middleware/auth');
 const db = require('./db');
 const app = express();
 
-app.use(compression());
+app.use(compression({
+  // SSE must never be buffered/compressed by the compression middleware.
+  filter: (req, res) => req.path !== '/api/alerts/stream' && compression.filter(req, res),
+}));
 
 app.use(helmet({
   contentSecurityPolicy: false,
@@ -96,6 +99,12 @@ async function shutdown(signal) {
     const { stopMidnightCron } = require('./services/driverScoringService');
     stopMidnightCron();
   } catch {}
+  try {
+    require('./workers/registry').stopAll();
+  } catch {}
+  try {
+    await require('./live/sseHub').stop();
+  } catch {}
   server.close(async () => {
     await db.closePool();
     console.log('[SERVER] Shutdown complete');
@@ -112,6 +121,13 @@ async function start() {
   try {
     await waitForDb();
 
+    // Start the live SSE listener before any poller can emit changes.
+    try {
+      require('./live/sseHub').start();
+    } catch (err) {
+      console.error(`[LIVE] SSE hub failed to start: ${err.message}`);
+    }
+
     // Initialize driver scoring from vehiclesc + drivers
     try {
       const { initializeDriverScoring, startMidnightCron } = require('./services/driverScoringService');
@@ -121,23 +137,19 @@ async function start() {
       console.error(`[DriverScoring] Init failed: ${err.message}`);
     }
 
-    // Sweep stale alert-watch heartbeats every 5 minutes (90s TTL).
+    // Logical workers: one scheduler per responsibility. The registry gives
+    // each job an in-flight guard and health without extra processes.
     try {
+      const workers = require('./workers/registry');
       const dbAlertController = require('./controllers/dbAlertController');
-      setInterval(() => { dbAlertController.sweepStaleWatchers(); }, 5 * 60 * 1000).unref?.();
+      workers.registerWorker({
+        name: 'watch-sweep',
+        intervalMs: 5 * 60 * 1000,
+        runOnce: () => dbAlertController.sweepStaleWatchers(),
+      });
+      workers.startAll();
     } catch (err) {
-      console.error(`[WATCH] Sweep init failed: ${err.message}`);
-    }
-
-    // Start RTMS driving time monitoring
-    try {
-      const rtmsService = require('./services/rtmsService');
-      rtmsService.startMonitoring(60000);
-      // Pass broadcast to RTMS after websocket starts
-      const { broadcast } = require('./services/websocket');
-      rtmsService.setBroadcast(broadcast);
-    } catch (err) {
-      console.error(`[RTMS] Init failed: ${err.message}`);
+      console.error(`[WORKERS] init failed: ${err.message}`);
     }
 
     // Start WebSocket server

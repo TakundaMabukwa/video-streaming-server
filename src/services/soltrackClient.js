@@ -4,6 +4,7 @@ const { getTelematicsNameMap } = require('../db/alert_definitions');
 const { matchAlertDefinition } = require('../helpers/alertMatching');
 const { checkZoneBreaches } = require('./geotabPolling');
 const { escalateSeverity } = require('../helpers/transform');
+const sseHub = require('../live/sseHub');
 
 let ws = null;
 let reconnectTimer = null;
@@ -37,7 +38,7 @@ async function loadFleetDict() {
   let rows;
   try {
     rows = (await db.query(
-      `SELECT fleet_number, registration_number, cost_center_id FROM fleet_vehicles
+      `SELECT fleet_number, registration_number, cost_center_id, mettax_device_id FROM fleet_vehicles
        WHERE fleet_number IS NOT NULL AND fleet_number <> ''`
     )).rows;
   } catch (err) {
@@ -49,7 +50,7 @@ async function loadFleetDict() {
   for (const r of rows) {
     if (!r || !r.fleet_number) continue;
     fleets.add(r.fleet_number);
-    const entry = { fleetNumber: r.fleet_number, ccId: r.cost_center_id == null ? null : r.cost_center_id };
+    const entry = { fleetNumber: r.fleet_number, ccId: r.cost_center_id == null ? null : r.cost_center_id, mettaxDeviceId: r.mettax_device_id || null };
     if (r.registration_number) next.set(normalizeReg(r.registration_number), entry);
     next.set(normalizeReg(r.fleet_number), entry);
   }
@@ -147,7 +148,7 @@ async function handleFrame(frame) {
     return { matched: false, reason: 'unknown_vehicle' };
   }
 
-  const { fleetNumber, ccId } = vehicle;
+  const { fleetNumber, ccId, mettaxDeviceId } = vehicle;
   const plate = frame.reg;
   const eventTime = parseEventTime(frame.locTime);
   const speed = frame.speed || 0;
@@ -170,6 +171,7 @@ async function handleFrame(frame) {
   if (wsBroadcast) {
     try { wsBroadcast('vehicle_position', position); } catch (_) {}
   }
+  try { sseHub.publishTelemetry(position); } catch (_) {}
   try {
     await db.upsertVehicleStatus(fleetNumber, {
       plate,
@@ -215,6 +217,8 @@ async function handleFrame(frame) {
           fleetNumber,
           sourceType: 'telematics',
           costCenterId: ccId,
+          sourceDeviceId: plate,
+          mettaxDeviceId,
         });
         let groupRows = comboResult.groupRows;
         if (comboResult.action === 'pass') {
@@ -230,6 +234,8 @@ async function handleFrame(frame) {
             speed: speed ?? null,
             sourceType: 'telematics',
             severity: String(matchedDef.severity || 'MEDIUM').toLowerCase(),
+            sourceDeviceId: plate,
+            mettaxDeviceId,
           });
           groupRows = created ? [created] : [];
         }
@@ -242,15 +248,16 @@ async function handleFrame(frame) {
 
         await db.query(
           `INSERT INTO telematics_events (device_id, vehicle_id, license_plate, fleet_number, plate,
-            event_type, event_code, severity, latitude, longitude, speed, description, driver_name, zone_name, raw_data, event_time)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+            event_type, event_code, severity, latitude, longitude, speed, description, driver_name, zone_name, raw_data, event_time,
+            source_device_id, mettax_device_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
            ON CONFLICT DO NOTHING`,
           [
             fleetNumber, fleetNumber, plate, fleetNumber, plate,
             matchedDef.name, null, severity,
             frame.lat, frame.lon, speed,
             frame.status, frame.driver || null, frame.geoZone || null,
-            JSON.stringify(frame), eventTime,
+            JSON.stringify(frame), eventTime, plate, mettaxDeviceId,
           ]
         );
 

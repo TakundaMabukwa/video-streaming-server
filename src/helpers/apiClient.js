@@ -38,31 +38,21 @@ class ApiClient {
         apiKey: config.videoApiKey,
         apiSecret: config.videoApiSecret
       };
-      console.log('[METTAX AUTH] Request URL:', `${this.baseURL}/system/createToken`);
-      console.log('[METTAX AUTH] Request Body:', JSON.stringify(requestBody, null, 2));
-      console.log('[METTAX AUTH] Request Headers:', { 'Content-Type': 'application/json' });
-      
       const response = await axios.post(`${this.baseURL}/system/createToken`, requestBody, {
         headers: { 'Content-Type': 'application/json' },
         timeout: 15000,
         httpsAgent
       });
 
-      console.log('[METTAX AUTH] Response Status:', response.status);
-      console.log('[METTAX AUTH] Response Data:', JSON.stringify(response.data, null, 2));
-
       if (response.data.code === 0) {
         this.token = response.data.data;
         this.tokenExpiry = Date.now() + (4 * 60 * 60 * 1000); // 4 hours
-        console.log('[METTAX AUTH] Token obtained successfully, expires in 4 hours');
         return this.token;
       }
       throw new Error(response.data.msg || 'Token creation failed');
     } catch (error) {
       if (error.response) {
-        console.error('[METTAX AUTH] Error Response Status:', error.response.status);
-        console.error('[METTAX AUTH] Error Response Data:', JSON.stringify(error.response.data, null, 2));
-        console.error('[METTAX AUTH] Error Response Headers:', JSON.stringify(error.response.headers, null, 2));
+        console.error('[METTAX AUTH] failed:', error.response.status, error.response.data?.msg || error.message);
       }
       throw new Error(`Authentication failed: ${error.message}`);
     }
@@ -70,10 +60,6 @@ class ApiClient {
 
   async makeRequest(endpoint, data = {}, timeout = 20000) {
     const token = await this.getToken();
-    console.log('[METTAX API] Request URL:', `${this.baseURL}${endpoint}`);
-    console.log('[METTAX API] Request Body:', JSON.stringify(data, null, 2));
-    console.log('[METTAX API] Request Headers:', { 'Authorization': token, 'Content-Type': 'application/json' });
-    
     try {
       const response = await axios.post(`${this.baseURL}${endpoint}`, data, {
         headers: {
@@ -83,14 +69,10 @@ class ApiClient {
         timeout,
         httpsAgent
       });
-      console.log('[METTAX API] Response Status:', response.status);
-      console.log('[METTAX API] Response Data:', JSON.stringify(response.data, null, 2));
       return response.data;
     } catch (error) {
       if (error.response) {
-        console.error('[METTAX API] Error Response Status:', error.response.status);
-        console.error('[METTAX API] Error Response Data:', JSON.stringify(error.response.data, null, 2));
-        console.error('[METTAX API] Error Response Headers:', JSON.stringify(error.response.headers, null, 2));
+        console.error('[METTAX API]', endpoint, 'failed:', error.response.status, error.response.data?.msg || error.message);
       }
       if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
         throw new Error('Connection timed out. The device may be offline or unreachable.');

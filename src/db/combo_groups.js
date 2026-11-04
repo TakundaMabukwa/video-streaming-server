@@ -49,7 +49,7 @@ async function listPendingForComboDevice(comboId, deviceId, windowSeconds) {
   const result = await query(
     `SELECT ce.id, ce.alert_id, ce.alarm_type, ce.alarm_ts,
             a.device_id, a.device_name, a.alarm_text, a.lat, a.lon, a.speed,
-            a.severity, a.fleet_number, a.source_type
+            a.severity, a.fleet_number, a.source_type, a.distance_km, a.duration_seconds
      FROM alert_combo_events ce
      JOIN alerts a ON a.id = ce.alert_id
      WHERE ce.combo_group_config_id = $1
@@ -92,6 +92,8 @@ async function createMergedComboGroup({ deviceId, deviceName, combo, members, la
   const lat = memberList.find((m) => m.lat != null)?.lat ?? null;
   const lon = memberList.find((m) => m.lon != null)?.lon ?? null;
   const speed = memberList.find((m) => m.speed != null)?.speed ?? null;
+  const distanceKm = [...memberList].reverse().find((m) => m.distance_km != null)?.distance_km ?? null;
+  const durationSeconds = [...memberList].reverse().find((m) => m.duration_seconds != null)?.duration_seconds ?? null;
 
   // Reuse the vehicle's open combo group for this combo when there is one, so
   // repeated bursts count up instead of stacking duplicate cards.
@@ -116,6 +118,8 @@ async function createMergedComboGroup({ deviceId, deviceName, combo, members, la
          speed = COALESCE($6, alert_groups.speed),
          severity = COALESCE(NULLIF($7, ''), alert_groups.severity),
          fleet_number = COALESCE(NULLIF($8, ''), alert_groups.fleet_number),
+         distance_km = COALESCE($10, alert_groups.distance_km),
+         duration_seconds = COALESCE($11, alert_groups.duration_seconds),
          updated_at = NOW()
        WHERE group_key = $9
        RETURNING id, group_key, count, alarm_type`,
@@ -129,6 +133,8 @@ async function createMergedComboGroup({ deviceId, deviceName, combo, members, la
         String(combo.severity || 'MEDIUM').toLowerCase(),
         fleetNumber,
         active.rows[0].group_key,
+        distanceKm,
+        durationSeconds,
       ]
     );
     return updated.rows[0] || null;
@@ -142,8 +148,8 @@ async function createMergedComboGroup({ deviceId, deviceName, combo, members, la
 
   const inserted = await query(
     `INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count,
-                               last_alert_id, last_alert_ts, lat, lon, speed, source_type, severity, fleet_number)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                               last_alert_id, last_alert_ts, lat, lon, speed, source_type, severity, fleet_number, distance_km, duration_seconds)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
      ON CONFLICT (group_key) DO NOTHING
      RETURNING id, group_key, count, device_name, device_id, alarm_type, severity, source_type`,
     [
@@ -161,6 +167,8 @@ async function createMergedComboGroup({ deviceId, deviceName, combo, members, la
       sourceType,
       String(combo.severity || 'MEDIUM').toLowerCase(),
       fleetNumber,
+      distanceKm,
+      durationSeconds,
     ]
   );
   return inserted.rows[0] || null;

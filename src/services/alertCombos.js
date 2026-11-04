@@ -194,6 +194,11 @@ async function handleDetection(ctx) {
         fleetNumber: ctx.fleetNumber || null,
         sourceType: ctx.sourceType || 'video',
         groupId: null,
+        sourceDeviceId: ctx.sourceDeviceId || null,
+        geotabDeviceId: ctx.geotabDeviceId || null,
+        mettaxDeviceId: ctx.mettaxDeviceId || null,
+        distanceKm: ctx.distanceKm ?? null,
+        durationSeconds: ctx.durationSeconds ?? null,
       });
     } catch (err) {
       console.error('[COMBOS] member row write failed:', err.message);

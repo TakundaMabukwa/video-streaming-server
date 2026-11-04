@@ -1,10 +1,12 @@
 const https = require('https');
 const db = require('../db');
 const turf = require('@turf/turf');
-const { findVehicleCostCenterId } = require('./costCenterLookup');
+const { findVehicleCostCenterId, resolveFleetNumber, normalizeFleetString } = require('./costCenterLookup');
 const { isAlertActiveForCC } = require('../db/alert_definitions');
 const { isRegisteredVehicle } = require('./fleetRegistryGuard');
 const { escalateSeverity } = require('../helpers/transform');
+const { categoryOf, entryLabel, riskLevel, stopSignalCodes } = require('../alerts/zoneCategory');
+const sseHub = require('../live/sseHub');
 const {
   FATIGUE_3H_CODE,
   FATIGUE_6H_CODE,
@@ -32,6 +34,8 @@ const STOP_SPEED = 5;
 const STOP_SPEED_NO_STOPPING = 10;
 const ZONES_CACHE_TTL = 5 * 60 * 1000;
 const META_CACHE_TTL = 60 * 1000;
+const telemetryFleetMissLogged = new Set();
+let telemetrySequence = 0;
 
 // Freshness gate: a vehicle only counts as live when Geotab reports it as
 // currently communicating AND its own event time (dateTime) is recent. Anything
@@ -41,15 +45,16 @@ const DATA_FRESH_MS = 5 * 60 * 1000;
 // below the threshold for ~30s (≈2 polls) before the alert can fire again.
 const SPEED_REARM_DWELL_MS = 30 * 1000;
 // 85 km/h must be sustained for >= 2 minutes before it flags (matches Geotab's
-// own 85 rule: smallest episode it ever produced is exactly 120s). 90 km/h is
+// own 85 rule: smallest episode it ever produced is exactly 120s; Geotab
+// reports the 85 cutoff as 86, so the episode uses speed >= 86). 90 km/h is
 // unchanged — a single fresh sample at/above 90 flags immediately.
 const SPEED_85_SUSTAIN_MS = 120 * 1000;
 // A held fatigue/duration threshold only re-arms after a REAL break. Geotab's
 // clock restarts on any state change — a 4-minute robot/fuel stop used to look
 // like a "genuine new run" and re-fired the 3h batch in the same shift (EX65:
-// fired 10:09, stopped 4m, re-fired 13:24). Off-duty/long stops (> 30 min)
-// qualify; short stops keep the batch held.
-const FATIGUE_MIN_BREAK_MS = 30 * 60 * 1000;
+// fired 10:09, stopped 4m, re-fired 13:24). A 5-minute break or longer
+// qualifies as a genuine new run; shorter stops keep the batch held.
+const FATIGUE_MIN_BREAK_MS = 5 * 60 * 1000;
 // Trail gaps longer than this are NOT bridged when summing distance: a stale or
 // failed poll leaves points minutes apart and the straight-line chord across a
 // city would invent distance the path never took.
@@ -90,16 +95,21 @@ function baselineCrossedThresholds(curMinutes) {
 function planFatigueThresholds({ codes, curMinutes, currDriving }) {
   const held = new Set(Array.isArray(codes) ? codes : []);
   const rearm = [];
-  const fire = [];
-  if (!Number.isFinite(curMinutes) || curMinutes < 0 || !currDriving) return { rearm, fire };
+  const skipped = [];
+  if (!Number.isFinite(curMinutes) || curMinutes < 0 || !currDriving) return { rearm, fire: [], skip: skipped };
+  const crossed = [];
   for (const t of FATIGUE_THRESHOLDS) {
     if (held.has(t.signalCode)) {
       if (curMinutes < t.minutes) rearm.push(t.signalCode);
     } else if (curMinutes >= t.minutes) {
-      fire.push(t);
+      crossed.push(t);
     }
   }
-  return { rearm, fire };
+  // Catch-up policy: after a gap fire only the highest crossed threshold and
+  // mark the lower ones held, so a reconnect cannot replay 3/6/8/9 together.
+  const fire = crossed.length > 0 ? [crossed[crossed.length - 1]] : [];
+  for (const t of crossed.slice(0, -1)) skipped.push(t.signalCode);
+  return { rearm, fire, skip: skipped };
 }
 
 // ── Module state ──
@@ -284,24 +294,37 @@ async function sessionBreakQualified(deviceId, sessionStartIso) {
   if (cached && cached.startIso === sessionStartIso) return cached.qualified;
   let qualified;
   try {
-    const res = await db.query(
-      `SELECT MAX(driving_ended_at) AS e
-         FROM driving_sessions
-        WHERE device_id = $1
-          AND driving_ended_at IS NOT NULL
-          AND driving_ended_at <= $2::timestamptz`,
-      [deviceId, sessionStartIso]
-    );
-    const end = res.rows[0] && res.rows[0].e;
-    if (!end) {
-      qualified = true; // no earlier session — first run, nothing to disqualify
-    } else {
-      const gapMs = new Date(sessionStartIso).getTime() - new Date(end).getTime();
-      qualified = gapMs >= FATIGUE_MIN_BREAK_MS;
+    // Prefer the observed rest record. It is the explicit audit trail of what
+    // we treated as rest (fresh isDriving=false -> next fresh isDriving=true).
+    const observed = await db.getLatestClosedRestPeriod(deviceId, sessionStartIso).catch(() => null);
+    if (observed && observed.classification) {
+      qualified = observed.qualifies_for_fatigue_rearm === true;
       if (!qualified) {
         console.log(
-          `[FATIGUE] ${deviceId}: break ${Math.round(gapMs / 1000)}s < ${FATIGUE_MIN_BREAK_MS / 1000}s — held thresholds not re-armed`
+          `[FATIGUE] ${deviceId}: observed rest ${observed.duration_seconds || 0}s < ${FATIGUE_MIN_BREAK_MS / 1000}s — held thresholds not re-armed`
         );
+      }
+    } else {
+      // Legacy fallback for rows written before rest-period logging existed.
+      const res = await db.query(
+        `SELECT MAX(driving_ended_at) AS e
+           FROM driving_sessions
+          WHERE device_id = $1
+            AND driving_ended_at IS NOT NULL
+            AND driving_ended_at <= $2::timestamptz`,
+        [deviceId, sessionStartIso]
+      );
+      const end = res.rows[0] && res.rows[0].e;
+      if (!end) {
+        qualified = false; // no observed rest and no prior session — do not guess
+      } else {
+        const gapMs = new Date(sessionStartIso).getTime() - new Date(end).getTime();
+        qualified = gapMs >= FATIGUE_MIN_BREAK_MS;
+        if (!qualified) {
+          console.log(
+            `[FATIGUE] ${deviceId}: break ${Math.round(gapMs / 1000)}s < ${FATIGUE_MIN_BREAK_MS / 1000}s — held thresholds not re-armed`
+          );
+        }
       }
     }
   } catch (err) {
@@ -335,7 +358,7 @@ async function getZones() {
     }
     try {
       const poly = turf.cleanCoords(turf.polygon([ring]));
-      built.push({ id: z.id, name: z.name, is_high_risk: !!z.is_high_risk, is_no_go: !!z.is_no_go, is_no_stopping: !!z.is_no_stopping, polygon: poly });
+      built.push({ id: z.id, name: z.name, is_high_risk: !!z.is_high_risk, is_no_go: !!z.is_no_go, is_no_stopping: !!z.is_no_stopping, zone_category: z.zone_category || null, polygon: poly });
     } catch (err) {
       console.error(`[ZONE] invalid polygon for ${z.name} (${z.id}): ${err.message}`);
       continue;
@@ -405,7 +428,7 @@ function findCurrentZone(zones, lat, lon) {
 // group is created. Definition must be active for the vehicle's cost center
 // (isAlertActiveForCC); a vehicle with no cost center still gets the alert as
 // long as it exists in fleet_vehicles.
-async function emitDeviceStatusAlert({ deviceId, fleetNumber, licensePlate, signalCode, alarmText, lat, lon, speed, ts, extra = {}, distanceKm = null }) {
+async function emitDeviceStatusAlert({ deviceId, fleetNumber, licensePlate, signalCode, alarmText, lat, lon, speed, ts, extra = {}, distanceKm = null, durationSeconds = null }) {
   try {
     // Vehicle override: this vehicle must not raise this alert (checked
     // before anything is written — no group, no event row, no alert).
@@ -414,10 +437,20 @@ async function emitDeviceStatusAlert({ deviceId, fleetNumber, licensePlate, sign
       logDropOnce(`ovr:${signalCode}:${fleetNumber || deviceId}`, `[DEVSTATUS] suppressed ${signalCode} for ${fleetNumber || deviceId}: vehicle alert override`);
       return null;
     }
-    const ccId = await findVehicleCostCenterId(fleetNumber || deviceId).catch(() => null);
-    const def = await isAlertActiveForCC(signalCode, ccId).catch(() => null);
+    const identityMod = require('../vehicles/identity');
+    let identity = null;
+    try {
+      identity = await identityMod.resolveVehicle({ deviceId, fleetNumber, registration: licensePlate });
+    } catch (_) { identity = null; }
+    const canonicalId = identity?.fleetNumber || fleetNumber || deviceId;
+    const sourceId = deviceId;
+    const ccId = identity?.costCenterId == null
+      ? await findVehicleCostCenterId(canonicalId).catch(() => null)
+      : identity.costCenterId;
+    const authz = require('../alerts/authorization');
+    const def = await authz.resolveDefinitionForVehicle({ costCenterId: ccId, signalCode }).catch(() => null);
     if (!def) {
-      logDropOnce(`def:${signalCode}:${ccId}`, `[DEVSTATUS] dropped ${signalCode} for ${fleetNumber || deviceId}: no active definition for cost centre ${ccId}`);
+      logDropOnce(`def:${signalCode}:${ccId}`, `[DEVSTATUS] dropped ${signalCode} for ${canonicalId}: no active definition for cost centre ${ccId}`);
       return null;
     }
 
@@ -425,12 +458,12 @@ async function emitDeviceStatusAlert({ deviceId, fleetNumber, licensePlate, sign
       ? `${fleetNumber}${licensePlate ? ' - ' + licensePlate : ''}`
       : (licensePlate || deviceId);
 
-    if (!(await isRegisteredVehicle({ deviceId, deviceName }))) {
+    if (!(await isRegisteredVehicle({ deviceId: canonicalId, deviceName }))) {
       logDropOnce(`reg:${deviceId}`, `[DEVSTATUS] dropped alerts for ${deviceName}: not in fleet_vehicles (registry guard)`);
       return null;
     }
 
-    const alertId = `dst-${deviceId}-${signalCode}-${Date.now()}`;
+    const alertId = `dst-${canonicalId}-${signalCode}-${Date.now()}`;
     const alarmTs = ts || new Date().toISOString();
 
     // Operator cooldown: while a timer runs for this vehicle + alert type the
@@ -440,15 +473,18 @@ async function emitDeviceStatusAlert({ deviceId, fleetNumber, licensePlate, sign
     // the return value. After the window the next crossing creates normally.
     try {
       const cooldownMod = require('./alertCooldowns');
-      const cooldown = await cooldownMod.getActiveCooldown(deviceId, def.name);
+      let cooldown = await cooldownMod.getActiveCooldown(canonicalId, def.name);
+      if (!cooldown && sourceId && sourceId !== canonicalId) {
+        cooldown = await cooldownMod.getActiveCooldown(sourceId, def.name);
+      }
       if (cooldown) {
         await cooldownMod.recordSuppressed(cooldown, {
-          deviceId, deviceName, alarmType: def.name, alarmText: alarmText || def.name,
+          deviceId: canonicalId, deviceName, alarmType: def.name, alarmText: alarmText || def.name,
           alertId, alarmTs, lat, lon, speed,
           severity: String(def.severity || 'MEDIUM').toLowerCase(),
           fleetNumber: fleetNumber || null, sourceType: 'telematics',
         }, {
-          id: alertId, deviceId, deviceName, alarmType: def.name,
+          id: alertId, deviceId: canonicalId, deviceName, alarmType: def.name,
           alarmText: alarmText || def.name, alarmTs, lat, lon, speed,
           severity: String(def.severity || 'MEDIUM').toLowerCase(),
           fleetNumber: fleetNumber || null, sourceType: 'telematics',
@@ -469,7 +505,7 @@ async function emitDeviceStatusAlert({ deviceId, fleetNumber, licensePlate, sign
            AND last_alert_id LIKE 'tel-%'
            AND ABS(EXTRACT(EPOCH FROM (last_alert_ts - $3::timestamptz))) <= 60
          LIMIT 1`,
-        [deviceId, def.name, alarmTs]
+        [canonicalId, def.name, alarmTs]
       ).catch(() => ({ rows: [] }));
       if (feedDup.rows.length > 0) return null;
     }
@@ -481,7 +517,7 @@ async function emitDeviceStatusAlert({ deviceId, fleetNumber, licensePlate, sign
     const alertCombos = require('./alertCombos');
     const comboResult = await alertCombos.handleDetection({
       alertId,
-      deviceId,
+      deviceId: canonicalId,
       deviceName,
       alarmType: def.name,
       alarmText: alarmText || def.name,
@@ -493,12 +529,18 @@ async function emitDeviceStatusAlert({ deviceId, fleetNumber, licensePlate, sign
       fleetNumber: fleetNumber || null,
       sourceType: 'telematics',
       costCenterId: ccId,
+      sourceDeviceId: sourceId,
+      distanceKm: distanceKm ?? null,
+      durationSeconds: durationSeconds ?? null,
     });
 
     let groupRows = comboResult.groupRows;
     if (comboResult.action === 'pass') {
       const created = await db.upsertAlertGroup({
-        deviceId,
+        deviceId: canonicalId,
+        sourceDeviceId: sourceId,
+        geotabDeviceId: identity?.geotabDeviceId || sourceId,
+        mettaxDeviceId: identity?.mettaxDeviceId || null,
         deviceName,
         alarmType: def.name,
         alarmText: alarmText || def.name,
@@ -511,6 +553,8 @@ async function emitDeviceStatusAlert({ deviceId, fleetNumber, licensePlate, sign
         severity: String(def.severity || 'MEDIUM').toLowerCase(),
         fleetNumber: fleetNumber || null,
         registration: licensePlate || null,
+        distanceKm: distanceKm ?? null,
+        durationSeconds: durationSeconds ?? null,
       });
       groupRows = created ? [created] : [];
     }
@@ -523,16 +567,19 @@ async function emitDeviceStatusAlert({ deviceId, fleetNumber, licensePlate, sign
     if (groupRows.length > 0 || comboResult.action !== 'pass') {
       await db.query(
         `INSERT INTO telematics_events (device_id, vehicle_id, license_plate, fleet_number, plate,
-          event_type, event_code, severity, latitude, longitude, speed, description, zone_name, raw_data, event_time, distance)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+          event_type, event_code, severity, latitude, longitude, speed, description, zone_name, raw_data, event_time, distance, duration_seconds,
+          source_device_id, geotab_device_id, mettax_device_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
         [
-          deviceId, deviceId, licensePlate || null, fleetNumber || null, licensePlate || null,
+          canonicalId, canonicalId, licensePlate || null, fleetNumber || null, licensePlate || null,
           def.name, signalCode, String(def.severity || 'MEDIUM').toUpperCase(),
           lat ?? null, lon ?? null, speed ?? null,
           alarmText || def.name, extra.zoneName || null,
           JSON.stringify({ signalCode, source: 'deviceStatus', ...extra }),
           alarmTs,
           Number.isFinite(distanceKm) && distanceKm >= 0 ? distanceKm : null,
+          Number.isFinite(durationSeconds) && durationSeconds >= 0 ? Math.round(durationSeconds) : null,
+          sourceId || null, identity?.geotabDeviceId || sourceId || null, identity?.mettaxDeviceId || null,
         ]
       ).catch(() => {});
     }
@@ -563,9 +610,10 @@ async function emitDeviceStatusAlert({ deviceId, fleetNumber, licensePlate, sign
               last_alert_id: alertId,
               alarmId: alertId,
               alarm_id: alertId,
-              device_id: deviceId,
-              deviceId,
-              vehicleId: deviceId,
+              device_id: canonicalId,
+              deviceId: canonicalId,
+              vehicleId: canonicalId,
+              source_device_id: sourceId || null,
               device_name: deviceName,
               deviceName,
               alert_type: broadcastType,
@@ -607,6 +655,7 @@ async function processZoneForDevice(deviceId, fleetNumber, licensePlate, lat, lo
   const nowTs = dateTime || new Date().toISOString();
   const currentZoneIds = [];
   const insideZones = [];
+  const crossedZones = [];
   const wasInside = entryMap.get(deviceId) || new Set();
   
   // Line-intersect entry detection: check if the vehicle's path (prev->current) 
@@ -633,10 +682,10 @@ async function processZoneForDevice(deviceId, fleetNumber, licensePlate, lat, lo
       currentZoneIds.push(z.id);
       insideZones.push(z);
     } else if (crossedBoundary && !wasInside.has(z.id)) {
-      // Path crossed zone boundary but current point is outside (or on edge)
-      // This indicates a crossing - treat as entry if we weren't already inside
-      currentZoneIds.push(z.id);
-      insideZones.push(z);
+      // Path crossed the boundary but the current fix is outside. Record the
+      // entry, but do NOT treat the vehicle as "inside" for stop tracking —
+      // that was creating false stop alerts for zones beside the road.
+      crossedZones.push(z);
       console.log(`[ZONE] boundary crossing detected for ${fleetNumber || deviceId} -> ${z.name} (crossed, current outside)`);
     }
   }
@@ -673,26 +722,36 @@ async function processZoneForDevice(deviceId, fleetNumber, licensePlate, lat, lo
       if (wasInside.has(z.id)) continue; // Was inside, exit handled separately
       // Approaching alerts are high-risk-only: no-go / no-stopping zones never
       // emit here (their entries + stops still alert via the entry/stop paths).
-      if (!z.is_high_risk) continue;
+      if (categoryOf(z) !== 'high_risk') continue;
 
       try {
         const intersections = turf.lineIntersect(trajectoryVector, z.polygon);
-        if (intersections.features.length > 0) {
-          // Vehicle will enter zone within lookAheadSeconds
-          const distanceToEntry = turf.distance(currentPoint, intersections.features[0], { units: 'kilometers' });
+        // A real entry crosses the boundary twice (in and out) and penetrates
+        // the polygon. A single/tangent intersection is a vehicle passing by
+        // the side — exactly the false positive this rule must not raise.
+        if (intersections.features.length >= 2) {
+          const entryPoint = intersections.features[0];
+          const exitPoint = intersections.features[1];
+          const penetrationKm = turf.distance(entryPoint, exitPoint, { units: 'kilometers' });
+          if (penetrationKm < 0.03) {
+            continue; // graze / side crossing
+          }
+          const distanceToEntry = turf.distance(currentPoint, entryPoint, { units: 'kilometers' });
           const etaSeconds = Number(speed) > 0 ? (distanceToEntry / (Number(speed) / 3600)) : Infinity;
+          if (!Number.isFinite(etaSeconds) || etaSeconds > lookAheadSeconds) continue;
           
           // Emit "Approaching Zone" alert
           await emitDeviceStatusAlert({
             deviceId, fleetNumber, licensePlate, 
             signalCode: ZONE_APPROACHING_CODE,
-            alarmText: `Approaching ${z.is_no_go ? 'No-Go' : z.is_high_risk ? 'High Risk' : 'No Stopping'} Zone: ${z.name} (ETA ~${Math.round(etaSeconds)}s)`,
+            alarmText: `Approaching High Risk Zone: ${z.name} (ETA ~${Math.round(etaSeconds)}s)`,
             lat, lon, speed, ts: nowTs,
-            extra: { 
-              zoneName: z.name, 
-              zoneType: z.is_no_go ? 'no_go' : z.is_no_stopping ? 'no_stopping' : 'high_risk',
+            extra: {
+              zoneName: z.name,
+              zoneType: 'high_risk',
               etaSeconds: Math.round(etaSeconds),
               distanceMeters: Math.round(distanceToEntry * 1000),
+              penetrationMeters: Math.round(penetrationKm * 1000),
               bearing: bearing.toFixed(1)
             },
           });
@@ -725,7 +784,7 @@ async function processZoneForDevice(deviceId, fleetNumber, licensePlate, lat, lo
   // New entries → recorded for every watched zone. An entry is only ever
   // blocked by an entry that is still open for the SAME zone, never by other
   // zones or by recent alerts.
-  for (const z of insideZones) {
+  for (const z of [...insideZones, ...crossedZones]) {
     if (wasInside.has(z.id)) continue;
     const riskLevel = z.is_no_go ? 'CRITICAL' : z.is_high_risk ? 'HIGH' : 'MEDIUM';
     const entry = await db.insertZoneEntry({
@@ -761,9 +820,9 @@ async function processZoneForDevice(deviceId, fleetNumber, licensePlate, lat, lo
   // are per zone type — high-risk/no-go zones flag at speed < 5, No-Stopping at < 10.
   // Zone category is an explicit flag (is_no_stopping), never a name match.
   for (const z of insideZones) {
-    // Zone type for stop logic: no_go and high_risk use high_risk threshold; no_stopping uses its own
-    const zoneType = z.is_no_stopping ? 'no_stopping' : 'high_risk';
-    const stopThreshold = zoneType === 'high_risk' ? STOP_SPEED : STOP_SPEED_NO_STOPPING;
+    const zoneType = categoryOf(z);
+    if (zoneType === 'normal') continue;
+    const stopThreshold = zoneType === 'no_stopping' ? STOP_SPEED_NO_STOPPING : STOP_SPEED;
     const isStopped = Number(speed) < stopThreshold;
     const stopKey = `${deviceId}:${z.id}`;
     let stop = stopMap.get(stopKey);
@@ -779,28 +838,18 @@ async function processZoneForDevice(deviceId, fleetNumber, licensePlate, lat, lo
       if (!stop) continue;
 
       // Immediate "Stopped High Risk area" on first stop poll — both zone types.
+      // Mark the flag ONLY when the emit produced a group (or the operator's
+      // cooldown deliberately diverted it). A dropped emit must retry.
       if (!stop.immediate_alert_sent) {
-        await emitDeviceStatusAlert({
+        const sent = await emitDeviceStatusAlert({
           deviceId, fleetNumber, licensePlate, signalCode: ZONE_STOP_IMMEDIATE_CODE,
-          alarmText: `Stopped ${zoneType === 'high_risk' ? 'High Risk area' : 'No Stopping zone'} in ${z.name}`,
+          alarmText: `Stopped ${zoneType === 'no_stopping' ? 'No Stopping zone' : 'High Risk area'} in ${z.name}`,
           lat, lon, speed, ts: nowTs,
           extra: { zoneName: z.name },
         });
-        await db.markZoneStopAlertSent(stop.id, 'immediate');
-      }
-
-      // >1min stop alerts.
-      if (!stop.minute_alert_sent) {
-        const elapsedMs = Date.now() - new Date(stop.stop_start).getTime();
-        if (elapsedMs >= 60000) {
-          const signalCode = zoneType === 'high_risk' ? ZONE_STOP_1MIN_HIGH_CODE : ZONE_STOP_1MIN_NO_CODE;
-          await emitDeviceStatusAlert({
-            deviceId, fleetNumber, licensePlate, signalCode,
-            alarmText: `Stopped > 1min in ${zoneType === 'high_risk' ? 'High Risk area' : 'No Stopping zone'} ${z.name}`,
-            lat, lon, speed, ts: nowTs,
-            extra: { zoneName: z.name },
-          });
-          await db.markZoneStopAlertSent(stop.id, 'minute');
+        if (sent) {
+          await db.markZoneStopAlertSent(stop.id, 'immediate');
+          stop.immediate_alert_sent = true;
         }
       }
     } else if (stop) {
@@ -890,6 +939,44 @@ function watchdogTick() {
   }
 }
 
+// Stop timers are evaluated from persisted stop events every poll, not from
+// the current fix. A vehicle that stops and goes stale still gets its >1min
+// alert. created_at is server time, immune to device clock skew.
+async function sweepStopTimers(stopMap) {
+  if (!stopMap || stopMap.size === 0) return;
+  for (const stop of stopMap.values()) {
+    if (!stop || stop.minute_alert_sent) continue;
+    const started = new Date(stop.created_at || stop.stop_start).getTime();
+    if (!Number.isFinite(started)) continue;
+    if (Date.now() - started < 60000) continue;
+    const codes = stopSignalCodes(stop.zone_type);
+    let pos = null;
+    try {
+      const r = await db.query(
+        'SELECT latitude, longitude, speed FROM vehicle_status WHERE device_id = $1 OR fleet_number = $2 LIMIT 1',
+        [stop.device_id, stop.fleet_number || stop.device_id]
+      );
+      pos = r.rows[0] || null;
+    } catch (_) { pos = null; }
+    const sent = await emitDeviceStatusAlert({
+      deviceId: stop.device_id,
+      fleetNumber: stop.fleet_number,
+      licensePlate: stop.license_plate,
+      signalCode: codes.minute,
+      alarmText: `Stopped > 1min in ${codes.isNoStopping ? 'No Stopping zone' : 'High Risk area'} ${stop.zone_name}`,
+      lat: pos?.latitude ?? null,
+      lon: pos?.longitude ?? null,
+      speed: pos?.speed ?? null,
+      ts: new Date().toISOString(),
+      extra: { zoneName: stop.zone_name },
+    });
+    if (sent) {
+      await db.markZoneStopAlertSent(stop.id, 'minute');
+      stop.minute_alert_sent = true;
+    }
+  }
+}
+
 async function pollDeviceStatus() {
   if (inFlight) return;
   inFlight = true;
@@ -944,11 +1031,73 @@ async function pollDeviceStatus() {
     const stopMap = new Map();
     for (const s of activeStops) stopMap.set(`${s.device_id}:${s.zone_id}`, s);
 
+    markStage('stop-timers');
+    await sweepStopTimers(stopMap);
+
     // Batch-load current vehicle_status for all polled devices.
     const ids = statuses.map((d) => d.device?.id).filter(Boolean);
     const existingRows = await db.query('SELECT * FROM vehicle_status WHERE device_id = ANY($1::text[])', [ids])
       .then((r) => r.rows).catch(() => []);
     const vsMap = new Map(existingRows.map((r) => [r.device_id, r]));
+    let telemetryPublished = 0;
+
+    // ── Publish every polled speed before the DB/alert loop ──
+    // The UI takes the latest sample it receives; there is no timestamp or
+    // "changed since last poll" filter here. DB persistence/alert processing
+    // still runs below, but it never delays the live card feed.
+    for (const d of statuses) {
+      const deviceId = d.device?.id;
+      if (!deviceId) continue;
+      const gDevice = gMap.get(deviceId);
+      if (!gDevice) continue;
+      const fleetNumber = gDevice.fleetNumber;
+      const licensePlate = gDevice.licensePlate;
+      let canonicalFleetNumber = fleetNumber
+        ? normalizeFleetString(fleetNumber).toUpperCase() || null
+        : null;
+      if (!canonicalFleetNumber && licensePlate) {
+        try {
+          canonicalFleetNumber = await resolveFleetNumber({
+            deviceId,
+            vehicleRegistration: licensePlate,
+          });
+          canonicalFleetNumber = canonicalFleetNumber
+            ? normalizeFleetString(canonicalFleetNumber).toUpperCase() || null
+            : null;
+        } catch { canonicalFleetNumber = null; }
+      }
+      if (!canonicalFleetNumber) continue;
+      const speed = d.speed == null || d.speed === "" ? null : Number(d.speed);
+      if (!Number.isFinite(speed)) continue;
+      const dateTime = d.dateTime || new Date().toISOString();
+      const lat = d.latitude ?? null;
+      const lon = d.longitude ?? null;
+      const currDriving = d.isDriving === true;
+      const telemetryEvent = {
+        device_id: deviceId,
+        plate: gDevice.name || null,
+        license_plate: licensePlate,
+        fleet_number: canonicalFleetNumber,
+        speed,
+        lat,
+        lon,
+        bearing: d.bearing == null || d.bearing === '' ? null : (Number.isFinite(Number(d.bearing)) ? Number(d.bearing) : null),
+        observed_at: dateTime,
+        last_log_time: dateTime,
+        current_zone: lat != null && lon != null ? findCurrentZone(zones, lat, lon) : null,
+        is_driving: currDriving,
+        // The card's Online state is based on isDriving, not on whether the
+        // device is merely communicating with Geotab.
+        is_online: currDriving,
+        sequence: ++telemetrySequence,
+        received_at: Date.now(),
+      };
+      if (lat != null && lon != null && wsBroadcast) {
+        wsBroadcast('vehicle_position', { ...telemetryEvent, latitude: lat, longitude: lon });
+      }
+      sseHub.publishTelemetry(telemetryEvent);
+      telemetryPublished++;
+    }
 
     let positionUpdated = 0;
     let drivingChanged = 0;
@@ -972,12 +1121,38 @@ async function pollDeviceStatus() {
       const dateTime = d.dateTime || new Date().toISOString();
       const fleetNumber = gDevice.fleetNumber;
       const licensePlate = gDevice.licensePlate;
+      const restDeviceId = fleetNumber || deviceId;
+
+      // Canonical fleet identity is the ONLY key the live telemetry stream may
+      // use. Geotab sometimes reports "RH33 (RAPID)" while the fleet registry
+      // says "RH33"; publishing the raw string meant the card never matched.
+      // Geotab's raw "RH33 (RAPID)" must become registry "RH33". Normalizing
+      // the reported fleet avoids a per-device DB lookup on every poll.
+      let canonicalFleetNumber = fleetNumber
+        ? normalizeFleetString(fleetNumber).toUpperCase() || null
+        : null;
+      if (!canonicalFleetNumber && licensePlate) {
+        try {
+          canonicalFleetNumber = await resolveFleetNumber({
+            deviceId,
+            vehicleRegistration: licensePlate,
+          });
+          canonicalFleetNumber = canonicalFleetNumber
+            ? normalizeFleetString(canonicalFleetNumber).toUpperCase() || null
+            : null;
+        } catch { canonicalFleetNumber = null; }
+      }
+      if (!canonicalFleetNumber && !telemetryFleetMissLogged.has(deviceId)) {
+        telemetryFleetMissLogged.add(deviceId);
+        console.warn(`[DEVSTATUS] telemetry skipped: no canonical fleet for device ${deviceId} (${fleetNumber || "no fleet"})`);
+      }
 
       // Freshness gate — dateTime is the device's own event time; isDeviceCommunicating
       // tells us it is currently talking to Geotab. Both are per-event, so no DB lookup.
       const fixAgeMs = dateTime ? Date.now() - new Date(dateTime).getTime() : Infinity;
       const communicating = d.isDeviceCommunicating === true;
       const isFresh = communicating && fixAgeMs <= DATA_FRESH_MS;
+      const currDriving = d.isDriving === true;
       if (communicating) {
         if (isFresh) freshCount++;
         else staleCount++;
@@ -992,6 +1167,7 @@ async function pollDeviceStatus() {
         speed: speed ?? null,
         latitude: lat ?? null,
         longitude: lon ?? null,
+        bearing: d.bearing == null || d.bearing === '' ? null : (Number.isFinite(Number(d.bearing)) ? Number(d.bearing) : null),
         lastLogTime: dateTime,
       });
       positionUpdated++;
@@ -1009,7 +1185,6 @@ async function pollDeviceStatus() {
       const prevRow = vsMap.get(deviceId);
       const firstSeen = !prevRow;
       const prevDriving = prevRow?.is_driving ?? null; // null initially / unknown
-      const currDriving = d.isDriving === true;
       const durMs = parseGeotabDurationMs(d.currentStateDuration);
       // Session whose break gates fatigue re-arms. Kept as a local so the tick
       // that STARTS a session uses its OWN start (prevRow still holds the old
@@ -1037,15 +1212,28 @@ async function pollDeviceStatus() {
         // speeding — nothing fires on first sighting, and the alert lands only
         // if the run survives the full sustain window from here. 90 keeps its
         // baseline silence (drop-then-recross), per "no alerts on first sight".
-        const ep85Baseline = Number.isFinite(spd0) && spd0 >= 85 ? new Date().toISOString() : null;
+        const ep85Baseline = Number.isFinite(spd0) && spd0 >= 86
+          ? (isoOf(dateTime) || new Date().toISOString())
+          : null;
         const ccId = await findVehicleCostCenterId(fleetNumber || deviceId).catch(() => null);
         if (currDriving) {
-          await db.startDrivingSession({
+          const session = await db.startDrivingSession({
             deviceId, fleetNumber, registrationNumber: licensePlate,
             costCenterId: ccId, startedAt: dateTime,
           });
+          if (isFresh) {
+            await db.endRestPeriod({
+              deviceId: restDeviceId, restEnd: dateTime, afterSessionId: session?.id || null,
+              minBreakSeconds: FATIGUE_MIN_BREAK_MS / 1000, reason: 'first_seen_resume',
+            }).catch(() => {});
+          }
           currentSessionStartIso = dateTime;
           await sessionBreakQualified(deviceId, dateTime); // prime break cache
+        } else if (isFresh) {
+          await db.startRestPeriod({
+            deviceId: restDeviceId, sourceDeviceId: deviceId, fleetNumber,
+            registrationNumber: licensePlate, restStart: dateTime,
+          }).catch(() => {});
         }
         await db.updateVehicleStatusDriving(deviceId, {
           isDriving: currDriving,
@@ -1056,12 +1244,14 @@ async function pollDeviceStatus() {
           speed90Alerted: spd0 >= 90,
           speed85EpisodeSince: ep85Baseline,
           fatigueAlertedThresholds: preAlerted,
+          fatigueAlertedSessionStart: currDriving ? dateTime : null,
         });
         vsMap.set(deviceId, {
           ...(prevRow || {}), id: deviceId, is_driving: currDriving,
           speed_85_alerted: false, speed_90_alerted: spd0 >= 90,
           speed_85_episode_since: ep85Baseline,
           fatigue_alerted_thresholds: JSON.stringify(preAlerted),
+          fatigue_alerted_session_start: currDriving ? dateTime : null,
         });
       } else {
       // Driving transition — only when a stored value FLIPS. Restart-safe:
@@ -1077,10 +1267,14 @@ async function pollDeviceStatus() {
         if (isFresh) {
           if (currDriving) {
             const ccId = await findVehicleCostCenterId(fleetNumber || deviceId).catch(() => null);
-            await db.startDrivingSession({
+            const session = await db.startDrivingSession({
               deviceId, fleetNumber, registrationNumber: licensePlate,
               costCenterId: ccId, startedAt: dateTime,
             });
+            await db.endRestPeriod({
+              deviceId: restDeviceId, restEnd: dateTime, afterSessionId: session?.id || null,
+              minBreakSeconds: FATIGUE_MIN_BREAK_MS / 1000, reason: 'driving_resumed',
+            }).catch(() => {});
             currentSessionStartIso = dateTime;
             await sessionBreakQualified(deviceId, dateTime); // prime break cache
             // Deliberately does NOT touch fatigue_alerted_thresholds or the
@@ -1096,7 +1290,12 @@ async function pollDeviceStatus() {
               maxSpeed: speed ?? 0,
             });
           } else {
-            await db.endDrivingSession(deviceId, dateTime);
+            const ended = await db.endDrivingSession(deviceId, dateTime);
+            await db.startRestPeriod({
+              deviceId: restDeviceId, sourceDeviceId: deviceId, fleetNumber,
+              registrationNumber: licensePlate, restStart: dateTime,
+              beforeSessionId: ended?.id || null,
+            }).catch(() => {});
             await db.updateVehicleStatusDriving(deviceId, {
               isDriving: false,
               drivingSince: null,
@@ -1111,6 +1310,12 @@ async function pollDeviceStatus() {
         // Stale snapshots must not roll the stored duration backwards either —
         // only a live reading advances it.
         if (isFresh) {
+          if (!currDriving) {
+            await db.startRestPeriod({
+              deviceId: restDeviceId, sourceDeviceId: deviceId, fleetNumber,
+              registrationNumber: licensePlate, restStart: dateTime,
+            }).catch(() => {});
+          }
           await db.updateVehicleStatusDriving(deviceId, {
             currentStateDurationMs: durMs,
             maxSpeed: Math.max(Number(prevRow.max_speed_this_session) || 0, Number(speed) || 0),
@@ -1119,24 +1324,13 @@ async function pollDeviceStatus() {
       }
       }
 
-      if (wsBroadcast && lat != null && lon != null) {
-        const currentZone = findCurrentZone(zones, lat, lon);
-        wsBroadcast('vehicle_position', {
-          device_id: deviceId,
-          plate: gDevice.name || null,
-          license_plate: licensePlate,
-          fleet_number: fleetNumber,
-          speed: speed ?? null,
-          latitude: lat,
-          longitude: lon,
-          last_log_time: dateTime,
-          current_zone: currentZone,
-          is_driving: currDriving,
-        });
-      }
-
       // ── Alert checks: registered vehicles only, need coords ──
-      if (firstSeen) continue; // baseline only — no alerts on first sighting
+      if (firstSeen) {
+        // First sighting still contributes the starting fix to the trail, so a
+        // later 2-minute speed window measures from the actual first sample.
+        if (lat != null && lon != null) trailRows.push([deviceId, fleetNumber || null, licensePlate || null, lat, lon, dateTime]);
+        continue; // baseline only — no alerts on first sighting
+      }
       if (!isRegisteredToken(fleetNumber, licensePlate, fleetSet)) continue;
       if (lat == null || lon == null) continue;
 
@@ -1157,15 +1351,26 @@ async function pollDeviceStatus() {
         try { return JSON.parse(prevRow.fatigue_alerted_thresholds || '[]'); } catch { return []; }
       })();
       let newFatigue = [...alertedFatigue];
+      let fatigueSessionStart = isoOf(prevRow.fatigue_alerted_session_start);
       if (isFresh) {
         const curMinutes = durMs !== null && durMs > 0 ? durMs / 60000 : null;
         const plan = planFatigueThresholds({ codes: newFatigue, curMinutes, currDriving });
         if (plan.rearm.length > 0) {
-          const breakOk = await sessionBreakQualified(deviceId, currentSessionStartIso);
-          if (!breakOk) plan.rearm = []; // short stop → keep the served batch held
+          // Re-arm is only legal in a DIFFERENT session. A Geotab clock reset
+          // inside the same session must never replay an already-served batch.
+          const sessionChanged = !!(
+            fatigueSessionStart && currentSessionStartIso && currentSessionStartIso !== fatigueSessionStart
+          );
+          const breakOk = sessionChanged && await sessionBreakQualified(deviceId, currentSessionStartIso);
+          if (!breakOk) plan.rearm = [];
         }
         for (const code of plan.rearm) {
           newFatigue = newFatigue.filter((c) => c !== code);
+        }
+        // A gap can cross several thresholds at once. Those lower thresholds are
+        // recorded as held without firing, so only the highest one alerts.
+        for (const code of plan.skip || []) {
+          if (!newFatigue.includes(code)) newFatigue.push(code);
         }
         // Km driven in the CURRENT driving session — one trail query per fire,
         // never per poll. Stored on the archive row so the alert modal can show
@@ -1181,12 +1386,14 @@ async function pollDeviceStatus() {
             lat, lon, speed, ts: dateTime,
             extra: { drivingMinutes: Math.round(curMinutes) },
             distanceKm: sessionKm,
+            durationSeconds: Math.round(curMinutes * 60),
           });
           // Record the threshold ONLY once its alert exists. A failed emit (gate,
           // missing definition, DB error) writes nothing, so it is retried on the
           // next poll instead of being silently consumed.
           if (groupRow) {
             newFatigue.push(t.signalCode);
+            fatigueSessionStart = currentSessionStartIso || isoOf(prevRow.driving_since);
           } else {
             const key = `${deviceId}:${t.signalCode}`;
             if (!fatigueDropLogged.has(key)) {
@@ -1200,15 +1407,15 @@ async function pollDeviceStatus() {
       // Speed alerts — one alert per sustained episode.
       //   90 km/h: flags on the FIRST fresh sample at/above 90 (unchanged).
       //   85 km/h: flags only after >= SPEED_85_SUSTAIN_MS (2 min) spent
-      //            continuously at/above 85 — see the episode clock below.
+      //            continuously at/above 86 (Geotab reports 85 km/h as 86).
       // Re-arm: either threshold fires again only after speed stays below it
       // for SPEED_REARM_DWELL_MS, so brief dips don't re-trigger. Only fresh
       // readings may advance the episode/re-arm state (stale dips can't).
       const spd = Number(speed);
       let s85 = !!prevRow.speed_85_alerted;
       let s90 = !!prevRow.speed_90_alerted;
-      // Current continuous >=85 run: started when the first fresh sample at/above
-      // 85 landed, cleared by the first fresh sample below 85 (strict — any dip
+      // Current continuous >=86 run: started when the first fresh sample at/above
+      // 86 landed, cleared by the first fresh sample below 86 (strict — any dip
       // restarts the 2-minute count). Stale or speedless samples never touch it.
       let ep85 = prevRow.speed_85_episode_since
         ? new Date(prevRow.speed_85_episode_since).getTime()
@@ -1226,13 +1433,14 @@ async function pollDeviceStatus() {
       let dwell90 = prevRow.speed_90_dwell_since ? new Date(prevRow.speed_90_dwell_since).getTime() : null;
 
       if (isFresh) {
-        const nowMs = Date.now();
+        const sampleMsRaw = new Date(dateTime).getTime();
+        const nowMs = Number.isFinite(sampleMsRaw) ? sampleMsRaw : Date.now();
 
-        // 85 episode clock (strict): a fresh finite sample >=85 starts/continues
-        // the run; a fresh sample <85 ends it. Non-finite (no speed) samples are
+        // 85 episode clock (strict): a fresh finite sample >=86 starts/continues
+        // the run; a fresh sample <86 ends it. Non-finite (no speed) samples are
         // unknowns — they neither advance nor reset the clock.
         if (Number.isFinite(spd)) {
-          if (spd >= 85) {
+          if (spd >= 86) {
             if (ep85 === null) ep85 = nowMs;
           } else {
             ep85 = null;
@@ -1249,7 +1457,7 @@ async function pollDeviceStatus() {
         } else {
           dwell90 = null;
         }
-        if (spd < 85) {
+        if (spd < 86) {
           if (s85) {
             if (dwell85 === null) dwell85 = nowMs;
             else if (nowMs - dwell85 >= SPEED_REARM_DWELL_MS) { s85 = false; dwell85 = null; }
@@ -1258,9 +1466,9 @@ async function pollDeviceStatus() {
           dwell85 = null;
         }
 
-        // Distance covered in the CURRENT overspeed run (haversine over the GPS
-        // trail). When the run started this very sample there is no window yet,
-        // so fall back to the previous fix — that leg is the last ~15s at speed.
+        // Distance covered in the CURRENT 85+ run (haversine over the GPS trail).
+        // When the run started this very sample there is no window yet, so fall
+        // back to the previous fix — that leg is the last ~15s at speed.
         const overspeedRunKm = async () => {
           const from =
             ep85 !== null && ep85 < nowMs
@@ -1268,7 +1476,7 @@ async function pollDeviceStatus() {
               : prevRow.last_update
                 ? new Date(prevRow.last_update).toISOString()
                 : null;
-          return distanceOverTrail(deviceId, from, dateTime, { lat, lon });
+          return distanceOverTrail(deviceId, from, dateTime, { lat, lon, t: nowMs });
         };
 
         // Only consume the threshold AFTER a successful emit (mirrors fatigue logic).
@@ -1278,8 +1486,9 @@ async function pollDeviceStatus() {
             deviceId, fleetNumber, licensePlate, signalCode: SPEED_90_CODE,
             alarmText: `Speed ${spd} km/h exceeded 90 km/h`,
             lat, lon, speed, ts: dateTime,
-            extra: { speed: spd },
-            distanceKm: await overspeedRunKm(),
+            extra: { speed: spd, speedThreshold: 90 },
+            distanceKm: 0,
+            durationSeconds: 0,
           });
           if (groupRow) {
             s90 = true;
@@ -1289,7 +1498,7 @@ async function pollDeviceStatus() {
           } else {
             logDropOnce(`speed90:${deviceId}`, `[SPEED] 90 km/h alert dropped for ${fleetNumber || deviceId} (will retry); reason logged above`);
           }
-        } else if (spd >= 85 && !s85) {
+        } else if (spd >= 86 && !s85) {
           // 2-minute gate: waiting for the run to mature is NOT a drop — the
           // threshold stays unconsumed and the emit happens on a later poll.
           if (ep85 !== null && nowMs - ep85 >= SPEED_85_SUSTAIN_MS) {
@@ -1297,8 +1506,9 @@ async function pollDeviceStatus() {
               deviceId, fleetNumber, licensePlate, signalCode: SPEED_85_CODE,
               alarmText: `Speed ${spd} km/h exceeded 85 km/h`,
               lat, lon, speed, ts: dateTime,
-              extra: { speed: spd },
+              extra: { speed: spd, speedThreshold: 86, episodeStartedAt: new Date(ep85).toISOString() },
               distanceKm: await overspeedRunKm(),
+              durationSeconds: Math.max(SPEED_85_SUSTAIN_MS / 1000, (nowMs - ep85) / 1000),
             });
             if (groupRow) {
               s85 = true;
@@ -1323,6 +1533,7 @@ async function pollDeviceStatus() {
           speed90DwellSince: dwell90 !== null ? new Date(dwell90).toISOString() : null,
           speed85EpisodeSince: ep85 !== null ? new Date(ep85).toISOString() : null,
           fatigueAlertedThresholds: newFatigue,
+          fatigueAlertedSessionStart: fatigueSessionStart,
         });
       }
 
@@ -1378,7 +1589,7 @@ async function pollDeviceStatus() {
       }
     }
 
-    console.log(`[DEVSTATUS] poll: ${statuses.length} statuses, ${positionUpdated} positions, ${drivingChanged} driving transitions | fresh ${freshCount}, stale ${staleCount}, offline ${offlineCount}`);
+    console.log(`[DEVSTATUS] poll: ${statuses.length} statuses, ${positionUpdated} positions, ${drivingChanged} driving transitions | fresh ${freshCount}, stale ${staleCount}, offline ${offlineCount} | telemetry ${telemetryPublished}`);
     lastPollError = null;
   } catch (error) {
     lastPollError = `${pollStage}: ${error.message}`;
@@ -1470,6 +1681,12 @@ async function checkCameraStatus(deviceId, fleetNumber, licensePlate, mettaxDevi
 
     console.log(`[CAMERA] ${fleetNumber} (${mettaxDeviceId}): ${status}, ${records.length} screenshots in last 10min`);
 
+    const previous = await db.query(
+      'SELECT status FROM camera_status WHERE fleet_number = $1 LIMIT 1',
+      [fleetNumber]
+    ).catch(() => ({ rows: [] }));
+    const previousStatus = previous.rows[0]?.status || null;
+
     await db.query(
       `INSERT INTO camera_status (fleet_number, reg, time_logged, status, countdown, last_screenshot, mettax_device_id)
        VALUES ($1, $2, NOW(), $3, INTERVAL '0', $4, $5)
@@ -1483,6 +1700,15 @@ async function checkCameraStatus(deviceId, fleetNumber, licensePlate, mettaxDevi
          updated_at = NOW()`,
       [fleetNumber, licensePlate || null, status, lastScreenshot, mettaxDeviceId]
     ).catch(err => console.error(`[CAMERA] status update failed for ${fleetNumber}:`, err.message));
+
+    if (fleetNumber && previousStatus !== status) {
+      sseHub.publishCamera({
+        fleet_number: fleetNumber,
+        status,
+        last_screenshot: lastScreenshot,
+        at: Date.now(),
+      });
+    }
   } catch (err) {
     console.error(`[CAMERA] check failed for ${fleetNumber}:`, err.message);
   }

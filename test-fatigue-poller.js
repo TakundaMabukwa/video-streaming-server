@@ -73,7 +73,7 @@ const DEVICE_ID = 'TESTFAT01';
 const FLEET = 'OT22';       // in fleet_vehicles, no mettax id, no cost centre
 const REG = 'LCZ729MP';
 const THREE_H = 'a43F6lFwgIUq_gkgmgSX08g';
-const FATIGUE_3H_NAME = 'Driver Fatigue - 3 hours'; // local alert_definitions name
+const FATIGUE_3H_NAME = 'Driver Fatigue 3h (Low)'; // local alert_definitions name
 
 let pass = 0;
 let fail = 0;
@@ -112,16 +112,18 @@ const heldCodes = async (row) => {
   try { return JSON.parse((r && r.fatigue_alerted_thresholds) || '[]'); } catch { return ['<unparsable>']; }
 };
 const fatigueGroups = async () =>
-  (await query('SELECT id, count, resolved FROM alert_groups WHERE device_id = $1 AND alarm_type = $2', [DEVICE_ID, FATIGUE_3H_NAME])).rows;
-const allGroups = async () => (await query('SELECT alarm_type, count FROM alert_groups WHERE device_id = $1', [DEVICE_ID])).rows;
+  (await query('SELECT id, count, resolved FROM alert_groups WHERE (device_id = $1 OR source_device_id = $1) AND alarm_type = $2', [DEVICE_ID, FATIGUE_3H_NAME])).rows;
+const allGroups = async () => (await query('SELECT alarm_type, count FROM alert_groups WHERE (device_id = $1 OR source_device_id = $1)', [DEVICE_ID])).rows;
 const sessions = async () =>
   (await query('SELECT count(*)::int n FROM driving_sessions WHERE device_id = $1', [DEVICE_ID])).rows[0].n;
+const latestRest = async () =>
+  (await query('SELECT * FROM vehicle_rest_periods WHERE device_id = $1 OR source_device_id = $1 ORDER BY id DESC LIMIT 1', [DEVICE_ID])).rows[0] || null;
 
 (async () => {
   console.log('== prep: clean test device ==');
-  await query('DELETE FROM alerts WHERE device_id = $1', [DEVICE_ID]).catch(() => {});
-  await query('DELETE FROM alert_groups WHERE device_id = $1', [DEVICE_ID]).catch(() => {});
-  await query('DELETE FROM telematics_events WHERE device_id = $1', [DEVICE_ID]).catch(() => {});
+  await query('DELETE FROM alerts WHERE (device_id = $1 OR source_device_id = $1)', [DEVICE_ID]).catch(() => {});
+  await query('DELETE FROM alert_groups WHERE (device_id = $1 OR source_device_id = $1)', [DEVICE_ID]).catch(() => {});
+  await query('DELETE FROM telematics_events WHERE (device_id = $1 OR source_device_id = $1)', [DEVICE_ID]).catch(() => {});
   await query('DELETE FROM driving_sessions WHERE device_id = $1', [DEVICE_ID]).catch(() => {});
   await query('DELETE FROM vehicle_status WHERE device_id = $1', [DEVICE_ID]).catch(() => {});
   await query(
@@ -166,13 +168,20 @@ const sessions = async () =>
   await tick('stop @ 30s', snap({ driving: false, duration: '00:00:30', speed: 0 }));
   row = await vs();
   check('trusted stop applied (is_driving false)', row.is_driving === false, row.is_driving);
+  const openRest = await latestRest();
+  check('rest period opened on stop', !!openRest && openRest.rest_end == null && openRest.device_id === FLEET, JSON.stringify(openRest));
   check('STOP did NOT re-arm fatigue memory', JSON.stringify(await heldCodes(row)) === JSON.stringify([THREE_H]), JSON.stringify(await heldCodes(row)));
   check('stop raised nothing', (await fatigueGroups()).length === 0, (await fatigueGroups()).length);
-  // Make this stop a QUALIFYING break (40 min) before the resume — the S5
+  // Make this stop a QUALIFYING break (5 min) before the resume — the S5
   // re-arm is only allowed after a real break. The refusal for a SHORT stop is
   // asserted in S10 (the prod EX65 pattern: 4-min stop re-fired the batch).
   await query(
-    "UPDATE driving_sessions SET driving_ended_at = NOW() - INTERVAL '40 minutes' WHERE device_id = $1 AND driving_ended_at IS NOT NULL",
+    "UPDATE driving_sessions SET driving_ended_at = NOW() - INTERVAL '5 minutes 1 second' WHERE device_id = $1 AND driving_ended_at IS NOT NULL",
+    [DEVICE_ID]
+  );
+  // The rest-period audit row is the authoritative break evidence.
+  await query(
+    "UPDATE vehicle_rest_periods SET rest_start = NOW() - INTERVAL '5 minutes 1 second' WHERE (device_id = $1 OR source_device_id = $1) AND rest_end IS NULL",
     [DEVICE_ID]
   );
 
@@ -182,6 +191,11 @@ const sessions = async () =>
   check('inflated resume did NOT replay the served 3h', (await fatigueGroups()).length === 0, JSON.stringify(await fatigueGroups()));
   check('memory still held through the resume', JSON.stringify(await heldCodes(row)) === JSON.stringify([THREE_H]), JSON.stringify(await heldCodes(row)));
   check('new session opened on the trusted resume', (await sessions()) === 2, await sessions());
+  const qualifiedRest = await latestRest();
+  check('5-minute rest is logged and qualified',
+    !!qualifiedRest && qualifiedRest.rest_end != null && qualifiedRest.classification === 'qualified'
+      && Number(qualifiedRest.duration_seconds) >= 300 && qualifiedRest.qualifies_for_fatigue_rearm === true,
+    JSON.stringify(qualifiedRest));
 
   console.log('== [S5] genuine clock restart: 00:05 DRIVING → batch re-arms ==');
   await tick('clock reset @ 5m', snap({ driving: true, duration: '00:05:00' }));
@@ -217,10 +231,15 @@ const sessions = async () =>
   await tick('resume @00:05 after a seconds-long stop', snap({ driving: true, duration: '00:05:00' }));
   row = await vs();
   check(
-    'short stop did NOT re-arm the held 3h (break < 30 min)',
+    'short stop did NOT re-arm the held 3h (break < 5 min)',
     JSON.stringify(await heldCodes(row)) === JSON.stringify([THREE_H]),
     JSON.stringify(await heldCodes(row))
   );
+  const shortRest = await latestRest();
+  check('short stop is logged as short',
+    !!shortRest && shortRest.rest_end != null && shortRest.classification === 'short'
+      && shortRest.qualifies_for_fatigue_rearm === false,
+    JSON.stringify(shortRest));
   check('still exactly one 3h group — no same-shift re-fire', (await fatigueGroups()).length === 1, JSON.stringify(await fatigueGroups()));
 
   console.log('');

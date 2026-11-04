@@ -1,4 +1,5 @@
 const express = require('express');
+const turf = require('@turf/turf');
 const db = require('../db');
 const { processAlertDeduction } = require('../services/driverScoringService');
 const { transformDbAlert } = require('../helpers/transform');
@@ -348,9 +349,48 @@ router.get('/zones', async (req, res) => {
 router.get('/zones-lite', async (req, res) => {
   try {
     const result = await db.query(
-      'SELECT id, name, points, is_high_risk, is_no_go, is_no_stopping FROM geotab_zones WHERE is_deleted IS NOT TRUE ORDER BY name'
+      'SELECT id, name, points, is_high_risk, is_no_go, is_no_stopping, zone_category, zone_types, comment FROM geotab_zones WHERE is_deleted IS NOT TRUE ORDER BY name'
     );
     res.json({ success: true, data: result.rows, count: result.rows.length });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// Zones that intersect a radius around a coordinate. Uses the same polygon
+// geometry as the map so large zones crossing the radius are included.
+router.get('/zones-near', async (req, res) => {
+  try {
+    const lat = Number(req.query.lat);
+    const lon = Number(req.query.lon);
+    const radiusKm = Math.min(Math.max(Number(req.query.radiusKm) || 30, 0.5), 100);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+      return res.status(400).json({ success: false, message: 'lat and lon are required' });
+    }
+    const center = turf.point([lon, lat]);
+    const circle = turf.circle(center, radiusKm, { units: 'kilometers', steps: 64 });
+    const result = await db.query(
+      'SELECT id, name, points, is_high_risk, is_no_go, is_no_stopping, zone_category, zone_types, comment FROM geotab_zones WHERE is_deleted IS NOT TRUE ORDER BY name'
+    );
+    const zones = [];
+    for (const row of result.rows) {
+      let points = row.points;
+      if (typeof points === 'string') {
+        try { points = JSON.parse(points); } catch { points = []; }
+      }
+      if (!Array.isArray(points) || points.length < 3) continue;
+      const coords = points
+        .map((p) => [Number(p.x), Number(p.y)])
+        .filter(([x, y]) => Number.isFinite(x) && Number.isFinite(y));
+      if (coords.length < 3) continue;
+      const [firstX, firstY] = coords[0];
+      const [lastX, lastY] = coords[coords.length - 1];
+      if (firstX !== lastX || firstY !== lastY) coords.push([firstX, firstY]);
+      try {
+        if (turf.booleanIntersects(turf.polygon([coords]), circle)) zones.push(row);
+      } catch { /* skip malformed polygon */ }
+    }
+    res.json({ success: true, data: zones, count: zones.length, radiusKm, center: { lat, lon } });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -383,7 +423,7 @@ function validateZonePayload(body) {
   }
 
   const type = String((body && body.type) || 'normal').toLowerCase();
-  if (!['high_risk', 'no_go', 'normal'].includes(type)) return { error: "type must be one of 'high_risk', 'no_go', 'normal'" };
+  if (!['high_risk', 'no_go', 'no_stopping', 'normal'].includes(type)) return { error: "type must be one of 'high_risk', 'no_go', 'no_stopping', 'normal'" };
 
   return {
     name,
@@ -391,6 +431,7 @@ function validateZonePayload(body) {
     comment: body.comment ? String(body.comment).trim().slice(0, 1000) : null,
     isHighRisk: type === 'high_risk',
     isNoGo: type === 'no_go',
+    zoneCategory: type,
   };
 }
 
@@ -435,6 +476,19 @@ router.delete('/zones/:id', async (req, res) => {
     if (!zone) return res.status(404).json({ success: false, message: 'zone not found' });
     await zoneCachesRefresh();
     res.json({ success: true, data: { id: zone.id, deleted: true } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ── Rest periods (isDriving=false intervals + fatigue-break classification) ──
+// GET /rest-periods/:deviceId?from=&to=&limit=
+router.get('/rest-periods/:deviceId', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const { from, to, limit } = req.query;
+    const rows = await db.listRestPeriods({ deviceId, from: from || null, to: to || null, limit });
+    res.json({ success: true, data: rows, count: rows.length });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -530,10 +584,15 @@ function stitchTrail(rows, preferDeviceId) {
 
 router.get('/route', async (req, res) => {
   try {
-    const { fleet, device_id, at, before, limit } = req.query;
+    const { fleet, device_id, at, before, from, to, limit } = req.query;
+    const hasRange = from != null && from !== '' && to != null && to !== '';
     const anchorRaw = before != null && before !== '' ? before : at;
-    if (!anchorRaw || Number.isNaN(Date.parse(String(anchorRaw)))) {
-      return res.status(400).json({ success: false, message: 'at or before (ISO datetime) query param required' });
+    if (hasRange) {
+      if (Number.isNaN(Date.parse(String(from))) || Number.isNaN(Date.parse(String(to)))) {
+        return res.status(400).json({ success: false, message: 'from and to must be ISO datetimes' });
+      }
+    } else if (!anchorRaw || Number.isNaN(Date.parse(String(anchorRaw)))) {
+      return res.status(400).json({ success: false, message: 'from/to or at/before (ISO datetime) query params required' });
     }
     let fleetKey = String(fleet || '').trim().toUpperCase() || null;
     const devId = String(device_id || '').trim();
@@ -550,9 +609,11 @@ router.get('/route', async (req, res) => {
     if (!fleetKey && !devId) {
       return res.status(400).json({ success: false, message: 'fleet or device_id query param required' });
     }
-    const atIso = new Date(String(anchorRaw)).toISOString();
-    // Trail window: polled coordinates for the 5 minutes LEADING UP TO the
-    // alert (never after — the route shows where the vehicle came from).
+    const rangeFromIso = hasRange ? new Date(String(from)).toISOString() : new Date(new Date(String(anchorRaw)).getTime() - 5 * 60 * 1000).toISOString();
+    const rangeToIso = hasRange ? new Date(String(to)).toISOString() : new Date(String(anchorRaw)).toISOString();
+    const atIso = rangeToIso;
+    // Trail window: polled coordinates in the requested range (default: the
+    // 5 minutes LEADING UP TO the alert, never after it).
     // telemetry_history is written by the 15s position poller (~20 pts), NOT
     // the sparse Geotab event stream, so the points join into the driven road.
     const where = fleetKey
@@ -565,11 +626,10 @@ router.get('/route', async (req, res) => {
       `SELECT device_id, fleet_number, registration, lat, lon, event_time
        FROM telemetry_history
        WHERE ${where}
-         AND event_time BETWEEN $2::timestamptz - INTERVAL '5 minutes'
-                            AND $2::timestamptz
+         AND event_time BETWEEN $2::timestamptz AND $3::timestamptz
        ORDER BY event_time ASC
        LIMIT ${n}`,
-      [fleetKey || devId, atIso]
+      [fleetKey || devId, rangeFromIso, rangeToIso]
     );
     const trail = stitchTrail(result.rows, devId);
     res.json({
@@ -579,7 +639,7 @@ router.get('/route', async (req, res) => {
       count: trail.points.length,
       fleet: fleetKey || null,
       at: atIso,
-      window: { from: new Date(new Date(atIso).getTime() - 5 * 60 * 1000).toISOString(), to: atIso },
+      window: { from: rangeFromIso, to: rangeToIso },
       device_id: trail.deviceId,
       devices_seen: trail.devicesSeen,
     });

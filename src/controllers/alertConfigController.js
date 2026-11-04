@@ -69,7 +69,7 @@ async function createAlertDefinition(req, res) {
       [name.trim(), category, description, signal_code.trim() || null, String(severity).toUpperCase()]
     );
     sendSuccess(res, result.rows[0], 'Alert definition created');
-    if (category === 'video') invalidateCache();
+    if (category === 'video') invalidateCache(); require('../alerts/authorization').invalidate();
   } catch (error) {
     if (error.code === '23505') return sendError(res, 'An alert definition with this signal code already exists', 409);
     sendError(res, error.message, 500);
@@ -103,7 +103,7 @@ async function updateAlertDefinition(req, res) {
     );
     if (result.rows.length === 0) return sendError(res, 'Not found', 404);
     sendSuccess(res, result.rows[0], 'Alert definition updated');
-    invalidateCache();
+    invalidateCache(); require('../alerts/authorization').invalidate();
     require('../services/alertCombos').invalidate();
   } catch (error) {
     if (error.code === '23505') return sendError(res, 'An alert definition with this signal code already exists', 409);
@@ -117,7 +117,7 @@ async function deleteAlertDefinition(req, res) {
     const purged = await purgeDefinitionAlertRows(id);
     await db.query('DELETE FROM alert_definitions WHERE id = $1', [id]);
     sendSuccess(res, { id, purged }, 'Alert definition deleted');
-    invalidateCache();
+    invalidateCache(); require('../alerts/authorization').invalidate();
     require('../services/alertCombos').invalidate();
   } catch (error) {
     sendError(res, error.message, 500);
@@ -152,7 +152,7 @@ async function upsertDefinitionOverride(req, res) {
       values
     );
     sendSuccess(res, result.rows[0], 'Override saved');
-    invalidateCache();
+    invalidateCache(); require('../alerts/authorization').invalidate();
     require('../services/alertCombos').invalidate();
   } catch (error) {
     sendError(res, error.message, 500);
@@ -189,7 +189,7 @@ async function bulkUpsertDefinitionOverrides(req, res) {
       results.push(result.rows[0]);
     }
     sendSuccess(res, results, `${results.length} override(s) saved`);
-    invalidateCache();
+    invalidateCache(); require('../alerts/authorization').invalidate();
     require('../services/alertCombos').invalidate();
   } catch (error) {
     sendError(res, error.message, 500);
@@ -206,7 +206,7 @@ async function deleteDefinitionOverride(req, res) {
       [Number(definition_id), Number(cc_id)]
     );
     sendSuccess(res, { definition_id: Number(definition_id), cost_center_id: Number(cc_id) }, 'Override deleted');
-    invalidateCache();
+    invalidateCache(); require('../alerts/authorization').invalidate();
     require('../services/alertCombos').invalidate();
   } catch (error) {
     sendError(res, error.message, 500);
@@ -292,7 +292,7 @@ async function deleteAllDefinitionOverrides(req, res) {
       { definition_id: Number(definition_id), removed: result.rowCount, purged },
       `Removed from ${result.rowCount} cost center set(s), purged ${purged.alerts} alert(s) / ${purged.groups} group(s)`
     );
-    invalidateCache();
+    invalidateCache(); require('../alerts/authorization').invalidate();
     require('../services/alertCombos').invalidate();
   } catch (error) {
     sendError(res, error.message, 500);
@@ -606,7 +606,7 @@ async function upsertGroupConfigOverride(req, res) {
       values
     );
     sendSuccess(res, result.rows[0], 'Override saved');
-    invalidateCache();
+    invalidateCache(); require('../alerts/authorization').invalidate();
     require('../services/alertCombos').invalidate();
   } catch (error) {
     sendError(res, error.message, 500);
@@ -641,7 +641,7 @@ async function bulkUpsertGroupConfigOverrides(req, res) {
       results.push(result.rows[0]);
     }
     sendSuccess(res, results, `${results.length} override(s) saved`);
-    invalidateCache();
+    invalidateCache(); require('../alerts/authorization').invalidate();
     require('../services/alertCombos').invalidate();
   } catch (error) {
     sendError(res, error.message, 500);
@@ -686,7 +686,7 @@ async function deleteGroupConfigOverride(req, res) {
       [Number(group_id), Number(cc_id)]
     );
     sendSuccess(res, { group_config_id: Number(group_id), cost_center_id: Number(cc_id) }, 'Override deleted');
-    invalidateCache();
+    invalidateCache(); require('../alerts/authorization').invalidate();
     require('../services/alertCombos').invalidate();
   } catch (error) {
     sendError(res, error.message, 500);

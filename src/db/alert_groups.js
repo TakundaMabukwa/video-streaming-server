@@ -1,4 +1,4 @@
-const { query } = require('./pool');
+const { query, getClient } = require('./pool');
 const { isRegisteredVehicle } = require('../services/fleetRegistryGuard');
 
 // Log an override drop once per (alert, vehicle) so a chatty camera cannot flood
@@ -41,6 +41,11 @@ async function stampMember(groupRow, a) {
       fleetNumber: a.fleetExact || null,
       sourceType: a.sourceType || 'video',
       groupId: groupRow.id,
+      sourceDeviceId: a.sourceDeviceId || null,
+      geotabDeviceId: a.geotabDeviceId || null,
+      mettaxDeviceId: a.mettaxDeviceId || null,
+      distanceKm: a.distanceKm ?? null,
+      durationSeconds: a.durationSeconds ?? null,
     });
   } catch (err) {
     console.error('[GROUPS] member stamp failed:', err.message);
@@ -48,13 +53,45 @@ async function stampMember(groupRow, a) {
   return groupRow;
 }
 
-async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, alertId, alarmTs, lat, lon, speed, sourceType = 'video', severity, fleetNumber, registration }) {
-  // Backstop: a vehicle configured to skip this alert must never get a
-  // group, whichever detection path tried to create one.
+async function upsertAlertGroup({
+  deviceId, deviceName, alarmType, alarmText, alertId, alarmTs, lat, lon, speed,
+  sourceType = 'video', severity, fleetNumber, registration, sourceDeviceId,
+  geotabDeviceId, mettaxDeviceId, distanceKm, durationSeconds,
+}) {
+  const identityMod = require('../vehicles/identity');
+  let identity = null;
+  try {
+    identity = await identityMod.resolveVehicle({
+      deviceId, fleetNumber, deviceName, registration, mettaxDeviceId,
+    });
+  } catch (err) {
+    console.error('[GROUPS] identity resolve failed:', err.message);
+  }
+
+  const sourceId = sourceDeviceId || (deviceId == null ? null : String(deviceId));
+  const canonicalId = identity?.fleetNumber || (fleetNumber ? String(fleetNumber).trim() : String(deviceId || ''));
+  const ccId = identity?.costCenterId == null ? null : identity.costCenterId;
+  const geoId = geotabDeviceId || identity?.geotabDeviceId || null;
+  const mettaxId = mettaxDeviceId || identity?.mettaxDeviceId || null;
+
+  // Model A: the cost-centre alert set is the allowlist. This is the final
+  // backstop so no source can create an alert outside the vehicle's set.
+  try {
+    const { canRaiseAlert } = require('../alerts/authorization');
+    const allowed = await canRaiseAlert({ costCenterId: ccId, name: alarmType });
+    if (!allowed) {
+      logDropOnce(`authz:${alarmType}:${canonicalId}`, `[GROUPS] suppressed "${alarmType}" for ${canonicalId}: not in cost-centre alert set`);
+      return null;
+    }
+  } catch (err) {
+    console.error('[GROUPS] authorization check failed:', err.message);
+  }
+
+  // Backstop: a vehicle configured to skip this alert must never get a group.
   try {
     const { isSuppressedSync } = require('../services/vehicleAlertOverrides');
     if (isSuppressedSync({
-      fleetNumber: fleetNumber || null,
+      fleetNumber: identity?.fleetNumber || fleetNumber || null,
       registration: registration || null,
       alertName: alarmType,
     })) {
@@ -63,32 +100,34 @@ async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, al
   } catch (_) { /* never block detection on the override check */ }
 
   // Only vehicles in fleet_vehicles may raise alerts.
-  if (!(await isRegisteredVehicle({ deviceId, deviceName }))) return null;
+  if (!(await isRegisteredVehicle({ deviceId: canonicalId || deviceId, deviceName }))) return null;
 
-  const baseKey = `${deviceId}:${alarmType}`.toLowerCase();
-
-  // Authoritative fleet (exact registries only) — stored on every write so
-  // reads join on a column, never on parsed names. deviceName is passed too:
-  // camera device ids are not resolvable on their own, but the detection name
-  // carries the vehicle ("FM10 - LDG067MP"), and without the fleet the group
-  // would resolve no cost centre and show under every cost centre selection.
   const { resolveFleetExact } = require('../services/costCenterLookup');
-  let fleetExact = null;
-  try {
-    fleetExact = await resolveFleetExact({ deviceId, fleetNumber: null, deviceName }) || null;
-  } catch (_) { fleetExact = null; }
+  let fleetExact = identity?.fleetNumber || null;
+  if (!fleetExact) {
+    try {
+      fleetExact = await resolveFleetExact({ deviceId: canonicalId || deviceId, fleetNumber: null, deviceName }) || null;
+    } catch (_) { fleetExact = null; }
+  }
 
-  // Reuse the current LIVE group for this device+type (open AND genuine):
-  // bump the counter and refresh the timestamp so the group keeps showing
-  // recent time. A resolved or false-alerted row is dead — the event below
-  // starts a fresh group instead of resurrecting it.
+  const canonical = canonicalId || deviceId;
+  const baseKey = `${canonical}:${alarmType}`.toLowerCase();
+  const ctx = {
+    alertId, deviceId: canonical, deviceName, alarmType, alarmText, alarmTs,
+    lat, lon, speed, severity, fleetExact, sourceType,
+    sourceDeviceId: sourceId, geotabDeviceId: geoId, mettaxDeviceId: mettaxId,
+    distanceKm: distanceKm ?? null,
+    durationSeconds: durationSeconds ?? null,
+  };
+
+  // Reuse the current LIVE group for this device+type (open AND genuine).
   const active = await query(
     `SELECT group_key FROM alert_groups
      WHERE device_id = $1 AND alarm_type = $2 AND source_type = $3
        AND resolved = FALSE AND false_alert = FALSE
      ORDER BY last_alert_ts DESC NULLS LAST
      LIMIT 1`,
-    [deviceId, alarmType, sourceType]
+    [canonical, alarmType, sourceType]
   );
 
   if (active.rows.length > 0) {
@@ -101,50 +140,47 @@ async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, al
          device_name = COALESCE(NULLIF($3, ''), alert_groups.device_name),
          lat = COALESCE($4, alert_groups.lat),
          lon = COALESCE($5, alert_groups.lon),
-         speed = CASE
-                   WHEN $6::float8 IS NULL THEN alert_groups.speed
-                   WHEN alert_groups.speed IS NULL THEN $6::float8
-                   ELSE GREATEST(alert_groups.speed, $6::float8)
-                 END,
+         speed = COALESCE($6::float8, alert_groups.speed),
+         distance_km = COALESCE($11::float8, alert_groups.distance_km),
+         duration_seconds = COALESCE($15::float8, alert_groups.duration_seconds),
          alarm_text = COALESCE(NULLIF(alert_groups.alarm_text, ''), NULLIF($7, '')),
          severity = COALESCE(NULLIF($8, ''), alert_groups.severity),
          fleet_number = COALESCE(NULLIF($9, ''), alert_groups.fleet_number),
+         source_device_id = COALESCE(NULLIF($12, ''), alert_groups.source_device_id),
+         geotab_device_id = COALESCE(NULLIF($13, ''), alert_groups.geotab_device_id),
+         mettax_device_id = COALESCE(NULLIF($14, ''), alert_groups.mettax_device_id),
          updated_at = NOW()
        WHERE group_key = $10
        RETURNING id, group_key, count, alarm_type`,
-      [alertId, alarmTs, deviceName, lat, lon, speed ?? null, alarmText, severity, fleetExact || null, groupKey]
+      [alertId, alarmTs, deviceName, lat, lon, speed ?? null, alarmText, severity,
+       fleetExact || null, groupKey, distanceKm ?? null, sourceId, geoId, mettaxId, durationSeconds ?? null]
     );
-    return stampMember(result.rows[0], { alertId, deviceId, deviceName, alarmType, alarmText, alarmTs, lat, lon, speed, severity, fleetExact, sourceType });
+    return stampMember(result.rows[0], ctx);
   }
 
   // Operator cooldown: while a timer runs for this (vehicle, alert type), a
   // NEW group is stored in the backup mirrors and nothing reaches the board.
-  // Only reached when no open group exists — an active group above keeps
-  // bumping exactly as always. Lookup failure falls through (never drops
-  // today's alert creation behaviour).
   try {
     const { getActiveCooldown, recordSuppressed } = require('../services/alertCooldowns');
-    const cooldown = await getActiveCooldown(deviceId, alarmType);
+    let cooldown = await getActiveCooldown(canonical, alarmType);
+    if (!cooldown && sourceId && sourceId !== canonical) {
+      cooldown = await getActiveCooldown(sourceId, alarmType);
+    }
     if (cooldown) {
       const stored = await recordSuppressed(cooldown, {
-        deviceId, deviceName, alarmType, alarmText, alertId, alarmTs,
+        deviceId: canonical, deviceName, alarmType, alarmText, alertId, alarmTs,
         lat, lon, speed, severity, fleetNumber: fleetExact || null, sourceType,
       }, {
-        id: alertId, deviceId, deviceName, alarmType, alarmText, alarmTs,
+        id: alertId, deviceId: canonical, deviceName, alarmType, alarmText, alarmTs,
         lat, lon, speed, severity, fleetNumber: fleetExact || null, sourceType,
       });
-      console.log(`[COOLDOWN] ${fleetExact || deviceId}: "${alarmType}" stored in backup (count ${stored ? stored.count : '?'}) — no board alert`);
+      console.log(`[COOLDOWN] ${fleetExact || canonical}: "${alarmType}" stored in backup (count ${stored ? stored.count : '?'}) — no board alert`);
       return null;
     }
   } catch (err) {
     console.error('[COOLDOWN] gate failed:', err.message);
   }
 
-  // No active group. (No resolve cooldown — a new event after a manual
-  // resolve always starts a fresh active group immediately.)
-  // If the base key is still taken by a resolved (closed) group, the code
-  // below picks a fresh unique key so this alert surfaces in its own group
-  // instead of merging into the resolved one.
   let groupKey = baseKey;
   const taken = await query('SELECT 1 FROM alert_groups WHERE group_key = $1', [groupKey]);
   if (taken.rows.length > 0) {
@@ -152,34 +188,42 @@ async function upsertAlertGroup({ deviceId, deviceName, alarmType, alarmText, al
   }
 
   const result = await query(
-    `INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon, speed, source_type, severity, fleet_number)
-     VALUES ($1, $2, $3, $4, $5, 1, $6, $7, $8, $9, $10, $11, $12, $13)
+    `INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon, speed, source_type, severity, fleet_number, source_device_id, geotab_device_id, mettax_device_id, distance_km, duration_seconds)
+     VALUES ($1, $2, $3, $4, $5, 1, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
      ON CONFLICT (group_key) DO NOTHING
      RETURNING id, group_key, count, alarm_type`,
-    [groupKey, deviceId, deviceName, alarmType, alarmText, alertId, alarmTs || null, lat, lon, speed ?? null, sourceType, severity,
-     fleetExact || null]
+    [groupKey, canonical, deviceName, alarmType, alarmText, alertId, alarmTs || null, lat, lon, speed ?? null,
+     sourceType, severity, fleetExact || null, sourceId, geoId, mettaxId, distanceKm ?? null, durationSeconds ?? null]
   );
   if (result.rows.length > 0) {
-    const row = await stampMember(result.rows[0], { alertId, deviceId, deviceName, alarmType, alarmText, alarmTs, lat, lon, speed, severity, fleetExact, sourceType });
-    await requestIncidentFootage(row, { alertId, deviceId, alarmType, alarmTs, fleetExact, deviceName, sourceType });
+    const row = await stampMember(result.rows[0], ctx);
+    await requestIncidentFootage(row, {
+      alertId, deviceId: sourceId || canonical, alarmType, alarmTs, fleetExact, deviceName, sourceType,
+    });
     return row;
   }
-  // Base key lost a race (or is squatted by a dead row): bump-or-insert via
-  // the live-row arbiter instead of throwing. Never throws, never twins.
+
+  // Base key lost a race (or is squatted by a dead row): bump-or-insert.
   const raced = await query(
-    `INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon, speed, source_type, severity, fleet_number)
-     VALUES ($1, $2, $3, $4, $5, 1, $6, $7, $8, $9, $10, $11, $12, $13)
+    `INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon, speed, source_type, severity, fleet_number, source_device_id, geotab_device_id, mettax_device_id, distance_km, duration_seconds)
+     VALUES ($1, $2, $3, $4, $5, 1, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
      ON CONFLICT (device_id, alarm_type, source_type) WHERE (resolved = FALSE AND false_alert = FALSE)
      DO UPDATE SET count = alert_groups.count + 1, last_alert_id = EXCLUDED.last_alert_id,
        last_alert_ts = EXCLUDED.last_alert_ts,
+       speed = COALESCE(EXCLUDED.speed, alert_groups.speed),
+       distance_km = COALESCE(EXCLUDED.distance_km, alert_groups.distance_km),
+       duration_seconds = COALESCE(EXCLUDED.duration_seconds, alert_groups.duration_seconds),
        fleet_number = COALESCE(NULLIF(EXCLUDED.fleet_number, ''), alert_groups.fleet_number),
+       source_device_id = COALESCE(EXCLUDED.source_device_id, alert_groups.source_device_id),
+       geotab_device_id = COALESCE(EXCLUDED.geotab_device_id, alert_groups.geotab_device_id),
+       mettax_device_id = COALESCE(EXCLUDED.mettax_device_id, alert_groups.mettax_device_id),
        updated_at = NOW()
      RETURNING id, group_key, count, alarm_type`,
     [`${baseKey}:${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
-     deviceId, deviceName, alarmType, alarmText, alertId, alarmTs || null, lat, lon, speed ?? null, sourceType, severity,
-     fleetExact || null]
+     canonical, deviceName, alarmType, alarmText, alertId, alarmTs || null, lat, lon, speed ?? null,
+     sourceType, severity, fleetExact || null, sourceId, geoId, mettaxId, distanceKm ?? null, durationSeconds ?? null]
   );
-  return stampMember(raced.rows[0] || null, { alertId, deviceId, deviceName, alarmType, alarmText, alarmTs, lat, lon, speed, severity, fleetExact, sourceType });
+  return stampMember(raced.rows[0] || null, ctx);
 }
 
 // Collision alerts must have their footage captured. The request is queued
@@ -269,6 +313,43 @@ async function batchUpsertAlertGroups(groups) {
   }
   if (notSuppressed.length === 0) return [];
   groups = notSuppressed;
+
+  // Canonical identity + Model A authorization for the batch path too. This is
+  // what makes camera/video alerts land under the same fleet id as telematics.
+  const identityMod = require('../vehicles/identity');
+  const { canRaiseAlert } = require('../alerts/authorization');
+  const resolved = [];
+  for (const g of groups) {
+    const sourceId = g.sourceDeviceId || g.deviceId;
+    let identity = null;
+    try {
+      identity = await identityMod.resolveVehicle({
+        deviceId: g.deviceId, fleetNumber: g.fleetNumber, deviceName: g.deviceName, registration: g.registration,
+      });
+    } catch (_) { identity = null; }
+    const canonicalId = identity?.fleetNumber || g.fleetNumber || g.deviceId;
+    const ccId = identity?.costCenterId == null ? (g.costCenterId ?? null) : identity.costCenterId;
+    let allowedBySet = true;
+    try {
+      allowedBySet = await canRaiseAlert({ costCenterId: ccId, name: g.alarmType });
+    } catch (_) { allowedBySet = true; }
+    if (!allowedBySet) {
+      logDropOnce(`authz:${g.alarmType}:${canonicalId}`, `[GROUPS] suppressed "${g.alarmType}" for ${canonicalId}: not in cost-centre alert set`);
+      continue;
+    }
+    resolved.push({
+      ...g,
+      deviceId: canonicalId,
+      sourceDeviceId: sourceId,
+      geotabDeviceId: g.geotabDeviceId || identity?.geotabDeviceId || null,
+      mettaxDeviceId: g.mettaxDeviceId || identity?.mettaxDeviceId || null,
+      fleetNumber: identity?.fleetNumber || g.fleetNumber || null,
+      costCenterId: ccId,
+    });
+  }
+  groups = resolved;
+  if (groups.length === 0) return [];
+
   // Only vehicles in fleet_vehicles may raise alerts.
   const allowed = [];
   for (const g of groups) {
@@ -330,7 +411,10 @@ async function batchUpsertAlertGroups(groups) {
     const { getActiveCooldown, recordSuppressed } = require('../services/alertCooldowns');
     for (let i = pending.length - 1; i >= 0; i--) {
       const g = pending[i];
-      const cd = await getActiveCooldown(g.deviceId, g.alarmType);
+      let cd = await getActiveCooldown(g.deviceId, g.alarmType);
+      if (!cd && g.sourceDeviceId && g.sourceDeviceId !== g.deviceId) {
+        cd = await getActiveCooldown(g.sourceDeviceId, g.alarmType);
+      }
       if (!cd) continue;
       try {
         await recordSuppressed(cd, {
@@ -499,6 +583,62 @@ async function getActiveAlertGroups({ limit = 2000 } = {}) {
      ORDER BY g.last_alert_ts DESC NULLS LAST
      LIMIT $1`,
     [limit]
+  );
+  return result.rows;
+}
+
+async function getOpenAlertGroupsByFleet(fleetNumber) {
+  const fleet = String(fleetNumber || '').trim();
+  if (!fleet) return [];
+  const result = await query(
+    `SELECT * FROM alert_groups g
+      WHERE UPPER(TRIM(g.fleet_number)) = UPPER(TRIM($1))
+        AND g.resolved = FALSE AND g.false_alert = FALSE
+        AND LOWER(COALESCE(g.status, '')) NOT IN ('resolved', 'closed')
+      ORDER BY g.last_alert_ts DESC NULLS LAST, g.id DESC`,
+    [fleet]
+  );
+  return result.rows;
+}
+
+async function getClosedAlertGroupCountSinceMidnight(fleetNumber) {
+  const fleet = String(fleetNumber || '').trim();
+  if (!fleet) return 0;
+  const result = await query(
+    `SELECT COUNT(*)::int AS n
+       FROM alert_groups
+      WHERE UPPER(TRIM(fleet_number)) = UPPER(TRIM($1))
+        AND resolved = TRUE
+        AND false_alert = FALSE
+        AND COALESCE(resolved_at, updated_at) >= (
+          date_trunc('day', NOW() AT TIME ZONE 'Africa/Johannesburg')
+          AT TIME ZONE 'Africa/Johannesburg'
+        )`,
+    [fleet]
+  );
+  return Number(result.rows[0]?.n || 0);
+}
+
+async function resolveAlertGroupsWithNotes({ items, actor, now = new Date().toISOString() }) {
+  const clean = (items || [])
+    .map((item) => ({ id: Number(item?.id), notes: String(item?.notes || '').trim() }))
+    .filter((item) => Number.isInteger(item.id) && item.id >= 1 && item.notes);
+  if (clean.length === 0) return [];
+  const ids = clean.map((item) => item.id);
+  const notes = clean.map((item) => item.notes);
+  const result = await query(
+    `UPDATE alert_groups ag
+        SET resolved = TRUE,
+            false_alert = FALSE,
+            resolved_by = $3,
+            resolved_at = $4::timestamptz,
+            notes = v.notes,
+            updated_at = NOW()
+       FROM unnest($1::int[], $2::text[]) AS v(id, notes)
+      WHERE ag.id = v.id
+        AND ag.resolved = FALSE AND ag.false_alert = FALSE
+      RETURNING ag.id, ag.group_key, ag.device_id, ag.alarm_type, ag.fleet_number, ag.notes`,
+    [ids, notes, actor || null, now]
   );
   return result.rows;
 }
@@ -1060,6 +1200,9 @@ module.exports = {
   getActiveAlertChanges,
   getResolvedSince,
   packAlerts,
+  getOpenAlertGroupsByFleet,
+  getClosedAlertGroupCountSinceMidnight,
+  resolveAlertGroupsWithNotes,
   getAlertGroupById,
   getAlertGroupByKey,
   getAlertGroupByAlertId,

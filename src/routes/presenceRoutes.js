@@ -1,11 +1,15 @@
 const express = require('express');
 const { getViewers, getViewersExcept } = require('../services/presence');
+const { presenceHeartbeat, getPresenceSnapshot } = require('../controllers/liveController');
 
 const router = express.Router();
 
 // GET /api/presence/alerts/:alertId
 // Returns list of users currently viewing the given alert.
 // Excludes the requesting user via ?exclude=userEmail when provided.
+router.get('/snapshot', getPresenceSnapshot);
+router.post('/heartbeat', presenceHeartbeat);
+
 router.get('/alerts/:alertId', (req, res) => {
   const alertId = String(req.params.alertId || '').trim();
   if (!alertId) {

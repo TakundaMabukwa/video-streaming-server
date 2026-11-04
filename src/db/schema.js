@@ -19,8 +19,43 @@ CREATE TABLE IF NOT EXISTS alerts (
     false_alert BOOLEAN DEFAULT FALSE,
     notes TEXT,
     documents JSONB DEFAULT '[]'::jsonb,
+    source_type TEXT DEFAULT 'video',
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Referenced by the one-time backfill below; full table definitions follow
+-- later in this migration. IF NOT EXISTS keeps the later CREATE harmless.
+CREATE TABLE IF NOT EXISTS cost_centers (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    code TEXT DEFAULT '',
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS alert_definitions (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    category TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    signal_code TEXT DEFAULT '',
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS alert_definition_overrides (
+    id SERIAL PRIMARY KEY,
+    alert_definition_id INTEGER NOT NULL REFERENCES alert_definitions(id) ON DELETE CASCADE,
+    cost_center_id INTEGER NOT NULL,
+    severity TEXT,
+    description TEXT,
+    is_active BOOLEAN,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(alert_definition_id, cost_center_id)
 );
 
 CREATE TABLE IF NOT EXISTS alert_media (
@@ -39,8 +74,11 @@ CREATE INDEX IF NOT EXISTS idx_alerts_alarm_type ON alerts(alarm_type);
 CREATE INDEX IF NOT EXISTS idx_alerts_alarm_ts ON alerts(alarm_ts DESC);
 CREATE INDEX IF NOT EXISTS idx_alert_media_alert_id ON alert_media(alert_id);
 
+CREATE SEQUENCE IF NOT EXISTS alert_groups_revision_seq;
+
 CREATE TABLE IF NOT EXISTS alert_groups (
     id SERIAL PRIMARY KEY,
+    revision BIGINT NOT NULL DEFAULT nextval('alert_groups_revision_seq'),
     group_key TEXT NOT NULL UNIQUE,
     device_id TEXT NOT NULL,
     device_name TEXT,
@@ -59,6 +97,7 @@ CREATE TABLE IF NOT EXISTS alert_groups (
     resolved_by TEXT,
     notes TEXT,
     documents JSONB DEFAULT '[]'::jsonb,
+    source_type TEXT DEFAULT 'video',
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
   );
@@ -71,6 +110,15 @@ CREATE INDEX IF NOT EXISTS idx_alert_groups_device_open ON alert_groups(device_i
 `;
 
 const MIGRATIONS_SQL = `
+  -- Alert-group revision: total order for SSE snapshot/delta consistency.
+  CREATE SEQUENCE IF NOT EXISTS alert_groups_revision_seq;
+  ALTER TABLE alert_groups ADD COLUMN IF NOT EXISTS revision BIGINT;
+  UPDATE alert_groups SET revision = nextval('alert_groups_revision_seq')
+   WHERE revision IS NULL OR revision = 0;
+  ALTER TABLE alert_groups ALTER COLUMN revision SET DEFAULT nextval('alert_groups_revision_seq');
+  ALTER TABLE alert_groups ALTER COLUMN revision SET NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_alert_groups_revision ON alert_groups(revision);
+
   CREATE INDEX IF NOT EXISTS idx_alert_groups_device_open ON alert_groups(device_id, resolved, false_alert, last_alert_ts DESC);
 
   ALTER TABLE alerts ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'new';
@@ -558,6 +606,27 @@ const MIGRATIONS_SQL = `
   CREATE INDEX IF NOT EXISTS idx_telematics_events_time ON telematics_events(event_time DESC);
   CREATE INDEX IF NOT EXISTS idx_telematics_events_plate ON telematics_events(plate);
 
+  -- ON CONFLICT (device_id, event_code, event_time) in both Geotab ingest and
+  -- the device-status poller requires this exact unique index. Without it
+  -- every telematics insert throws, aborts the feed cycle and no new
+  -- telematics alert groups are created.
+  DO $$
+  BEGIN
+    IF to_regclass('public.idx_telematics_events_dedup') IS NULL THEN
+      DELETE FROM telematics_events t
+      USING (
+        SELECT id, row_number() OVER (
+          PARTITION BY device_id, event_code, event_time
+          ORDER BY id
+        ) AS rn
+        FROM telematics_events
+      ) keep
+      WHERE t.id = keep.id AND keep.rn > 1;
+    END IF;
+  END $$;
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_telematics_events_dedup
+    ON telematics_events (device_id, event_code, event_time);
+
   -- Add missing columns to telematics_events
   ALTER TABLE telematics_events ADD COLUMN IF NOT EXISTS license_plate TEXT;
   ALTER TABLE telematics_events ADD COLUMN IF NOT EXISTS fleet_number TEXT;
@@ -576,6 +645,34 @@ const MIGRATIONS_SQL = `
   ALTER TABLE alert_groups ADD COLUMN IF NOT EXISTS source_type TEXT DEFAULT 'video';
   CREATE INDEX IF NOT EXISTS idx_alerts_source_type ON alerts(source_type);
   CREATE INDEX IF NOT EXISTS idx_alert_groups_source_type ON alert_groups(source_type);
+
+  -- Canonical vehicle identity: device_id is the frontend fleet_number.
+  -- The original provider ids are preserved for traceability and media.
+  ALTER TABLE alerts ADD COLUMN IF NOT EXISTS source_device_id TEXT;
+  ALTER TABLE alerts ADD COLUMN IF NOT EXISTS geotab_device_id TEXT;
+  ALTER TABLE alerts ADD COLUMN IF NOT EXISTS mettax_device_id TEXT;
+  ALTER TABLE alerts ADD COLUMN IF NOT EXISTS legacy_device_id TEXT;
+  ALTER TABLE alert_groups ADD COLUMN IF NOT EXISTS source_device_id TEXT;
+  ALTER TABLE alert_groups ADD COLUMN IF NOT EXISTS geotab_device_id TEXT;
+  ALTER TABLE alert_groups ADD COLUMN IF NOT EXISTS mettax_device_id TEXT;
+  ALTER TABLE alert_groups ADD COLUMN IF NOT EXISTS legacy_device_id TEXT;
+  ALTER TABLE telematics_events ADD COLUMN IF NOT EXISTS source_device_id TEXT;
+  ALTER TABLE telematics_events ADD COLUMN IF NOT EXISTS geotab_device_id TEXT;
+  ALTER TABLE telematics_events ADD COLUMN IF NOT EXISTS mettax_device_id TEXT;
+  ALTER TABLE telematics_events ADD COLUMN IF NOT EXISTS legacy_device_id TEXT;
+  CREATE INDEX IF NOT EXISTS idx_alerts_source_device ON alerts(source_device_id);
+  CREATE INDEX IF NOT EXISTS idx_alert_groups_source_device ON alert_groups(source_device_id);
+  CREATE INDEX IF NOT EXISTS idx_telematics_events_source_device ON telematics_events(source_device_id);
+
+  -- Distance is a first-class alert field (km): poller trail distance or the
+  -- Geotab ExceptionEvent.distance value.
+  ALTER TABLE alerts ADD COLUMN IF NOT EXISTS distance_km DOUBLE PRECISION;
+  ALTER TABLE alerts ADD COLUMN IF NOT EXISTS duration_seconds DOUBLE PRECISION;
+  ALTER TABLE alert_groups ADD COLUMN IF NOT EXISTS distance_km DOUBLE PRECISION;
+  ALTER TABLE alert_groups ADD COLUMN IF NOT EXISTS duration_seconds DOUBLE PRECISION;
+
+  -- Model A: CC-less vehicles use only explicitly global definitions.
+  ALTER TABLE alert_definitions ADD COLUMN IF NOT EXISTS is_global BOOLEAN DEFAULT TRUE;
 
   -- Follow-up: temporarily lower severity for 15 minutes
   ALTER TABLE alert_groups ADD COLUMN IF NOT EXISTS follow_up BOOLEAN DEFAULT FALSE;
@@ -623,6 +720,127 @@ const MIGRATIONS_SQL = `
   FOR EACH ROW WHEN (NEW.resolved OR NEW.false_alert)
   EXECUTE FUNCTION propagate_group_resolution();
 
+  -- Revision + SSE change feed. Rows are never deleted by the resolve flow;
+  -- a close is an UPDATE (resolved/false_alert) and emits ALERT_CLOSED.
+  CREATE OR REPLACE FUNCTION set_alert_group_revision() RETURNS trigger AS $$
+  BEGIN
+    IF TG_OP = 'UPDATE' THEN
+      NEW.revision := nextval('alert_groups_revision_seq');
+    END IF;
+    RETURN NEW;
+  END;
+  $$ LANGUAGE plpgsql;
+
+  DROP TRIGGER IF EXISTS trg_alert_group_revision ON alert_groups;
+  CREATE TRIGGER trg_alert_group_revision
+  BEFORE UPDATE ON alert_groups
+  FOR EACH ROW EXECUTE FUNCTION set_alert_group_revision();
+
+  CREATE OR REPLACE FUNCTION notify_alert_group_change() RETURNS trigger AS $$
+  DECLARE
+    payload JSONB;
+  BEGIN
+    IF TG_OP = 'DELETE' THEN
+      payload := jsonb_build_object(
+        'type', 'ALERT_CLOSED',
+        'action', 'PURGED',
+        'id', OLD.id,
+        'fleet_number', OLD.fleet_number,
+        'revision', COALESCE(OLD.revision, 0),
+        'resolved', TRUE,
+        'false_alert', COALESCE(OLD.false_alert, FALSE),
+        'status', OLD.status,
+        'resolved_at', OLD.resolved_at,
+        'resolved_by', OLD.resolved_by,
+        'purged', TRUE
+      );
+    ELSIF NEW.resolved = TRUE OR NEW.false_alert = TRUE THEN
+      payload := jsonb_build_object(
+        'type', 'ALERT_CLOSED',
+        'id', NEW.id,
+        'fleet_number', NEW.fleet_number,
+        'revision', NEW.revision,
+        'resolved', NEW.resolved,
+        'false_alert', NEW.false_alert,
+        'status', NEW.status,
+        'resolved_at', NEW.resolved_at,
+        'resolved_by', NEW.resolved_by
+      );
+    ELSE
+      payload := jsonb_build_object(
+        'type', 'ALERT_DELTA',
+        'action', 'UPSERT',
+        'id', NEW.id,
+        'fleet_number', NEW.fleet_number,
+        'revision', NEW.revision,
+        'row', jsonb_build_object(
+          'id', NEW.id,
+          'fleet_number', NEW.fleet_number,
+          'device_id', NEW.device_id,
+          'device_name', NEW.device_name,
+          'alert_type', NEW.alarm_type,
+          'alarm_type', NEW.alarm_type,
+          'alarm_text', NEW.alarm_text,
+          'severity', CASE
+            WHEN NEW.follow_up = TRUE
+             AND NEW.follow_up_at > NOW() - INTERVAL '15 minutes'
+            THEN 'low'
+            ELSE LOWER(COALESCE(NEW.severity, 'low'))
+          END,
+          'follow_up', COALESCE(NEW.follow_up, FALSE),
+          'follow_up_at', NEW.follow_up_at,
+          'original_severity', NEW.original_severity,
+          'repeated_count', COALESCE(NEW.count, 1),
+          'count', COALESCE(NEW.count, 1),
+          'source_type', NEW.source_type,
+          'last_alert_id', NEW.last_alert_id,
+          'last_occurrence', ROUND(EXTRACT(EPOCH FROM NEW.last_alert_ts) * 1000),
+          'last_alert_ts', NEW.last_alert_ts,
+          'lat', NEW.lat,
+          'lon', NEW.lon,
+          'speed', NEW.speed,
+          'status', NEW.status,
+          'resolved', NEW.resolved,
+          'false_alert', NEW.false_alert,
+          'revision', NEW.revision
+        )
+      );
+    END IF;
+
+    PERFORM pg_notify('video_alert_broadcast_channel', payload::text);
+    RETURN NULL;
+  END;
+  $$ LANGUAGE plpgsql;
+
+  DROP TRIGGER IF EXISTS trg_alert_group_notify ON alert_groups;
+  CREATE TRIGGER trg_alert_group_notify
+  AFTER INSERT OR UPDATE OR DELETE ON alert_groups
+  FOR EACH ROW EXECUTE FUNCTION notify_alert_group_change();
+
+  -- Persistent polling cursors (Geotab feed version, high-water marks).
+  -- getSyncState/setSyncState treat this as best-effort, but without the table
+  -- every restart re-drains the feed from the beginning — and the poller logs
+  -- "relation sync_state does not exist" on every persist attempt.
+  CREATE TABLE IF NOT EXISTS sync_state (
+    key TEXT PRIMARY KEY,
+    value JSONB NOT NULL DEFAULT '{}'::jsonb,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+
+  -- Diagnostic buffer for unknown Soltrack registrations.
+  CREATE TABLE IF NOT EXISTS soltrack_unknown (
+    id BIGSERIAL PRIMARY KEY,
+    reg TEXT NOT NULL,
+    frame JSONB,
+    reason TEXT,
+    first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    seen_count INTEGER NOT NULL DEFAULT 1
+  );
+  CREATE INDEX IF NOT EXISTS idx_soltrack_unknown_reg ON soltrack_unknown (UPPER(TRIM(reg)));
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_soltrack_unknown_reg_unique
+    ON soltrack_unknown (UPPER(REPLACE(TRIM(reg), ' ', '')));
+
   -- Add missing columns to vehicle_status
   CREATE TABLE IF NOT EXISTS vehicle_status (
     device_id TEXT PRIMARY KEY,
@@ -640,6 +858,7 @@ const MIGRATIONS_SQL = `
   ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS speed DOUBLE PRECISION;
   ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION;
   ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION;
+  ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS bearing DOUBLE PRECISION;
   ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS last_log_time TIMESTAMPTZ;
   -- Real Geotab device state (syncDeviceStatus + syncIgnitionStatus):
   -- is_device_communicating / online-since come from DeviceStatusInfo;
@@ -651,6 +870,10 @@ const MIGRATIONS_SQL = `
   ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS is_driving BOOLEAN;
   ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS driving_since TIMESTAMPTZ;
   ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS current_state_duration INTERVAL;
+  ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS source_device_id TEXT;
+  ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS geotab_device_id TEXT;
+  ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS mettax_device_id TEXT;
+  ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS fatigue_alerted_session_start TIMESTAMPTZ;
   ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS max_speed_this_session DOUBLE PRECISION DEFAULT 0;
   ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS speed_85_alerted BOOLEAN DEFAULT FALSE;
   ALTER TABLE vehicle_status ADD COLUMN IF NOT EXISTS speed_90_alerted BOOLEAN DEFAULT FALSE;
@@ -686,6 +909,7 @@ const MIGRATIONS_SQL = `
   ALTER TABLE geotab_zones ADD COLUMN IF NOT EXISTS locally_modified TIMESTAMPTZ;
   ALTER TABLE geotab_zones ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN DEFAULT FALSE;
   ALTER TABLE geotab_zones ADD COLUMN IF NOT EXISTS is_no_stopping BOOLEAN DEFAULT FALSE;
+  ALTER TABLE geotab_zones ADD COLUMN IF NOT EXISTS zone_category TEXT;
   CREATE INDEX IF NOT EXISTS idx_geotab_zones_deleted ON geotab_zones(is_deleted) WHERE is_deleted = TRUE;
 
   -- High risk zone entries
@@ -749,6 +973,30 @@ const MIGRATIONS_SQL = `
   CREATE INDEX IF NOT EXISTS idx_driving_sessions_active ON driving_sessions(driving_ended_at) WHERE driving_ended_at IS NULL;
   CREATE INDEX IF NOT EXISTS idx_driving_sessions_cc ON driving_sessions(cost_center_id);
 
+  -- Rest periods: every observed isDriving=false interval, with the duration
+  -- and whether it qualified as a fatigue re-arm break (>= 5 minutes).
+  CREATE TABLE IF NOT EXISTS vehicle_rest_periods (
+    id SERIAL PRIMARY KEY,
+    device_id TEXT NOT NULL,
+    source_device_id TEXT,
+    fleet_number TEXT,
+    registration_number TEXT,
+    rest_start TIMESTAMPTZ NOT NULL,
+    last_seen_at TIMESTAMPTZ,
+    rest_end TIMESTAMPTZ,
+    duration_seconds INTEGER,
+    classification TEXT,
+    qualifies_for_fatigue_rearm BOOLEAN,
+    before_session_id INTEGER,
+    after_session_id INTEGER,
+    reason TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  );
+  CREATE INDEX IF NOT EXISTS idx_rest_periods_device_time ON vehicle_rest_periods(device_id, rest_start DESC);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_rest_periods_open
+    ON vehicle_rest_periods(device_id) WHERE rest_end IS NULL;
+
   -- Vehicle log records (GPS positions)
   CREATE TABLE IF NOT EXISTS vehicle_log_records (
     id SERIAL PRIMARY KEY,
@@ -783,6 +1031,15 @@ const MIGRATIONS_SQL = `
   CREATE INDEX IF NOT EXISTS idx_telemetry_history_fleet_time ON telemetry_history(fleet_number, event_time);
   CREATE INDEX IF NOT EXISTS idx_telemetry_history_event_time ON telemetry_history(event_time);
   CREATE INDEX IF NOT EXISTS idx_telemetry_history_device_time ON telemetry_history(device_id, event_time);
+
+  -- Cross-device user map preferences (Supabase user id).
+  CREATE TABLE IF NOT EXISTS user_map_preferences (
+    user_id TEXT PRIMARY KEY,
+    zone_radius_km DOUBLE PRECISION NOT NULL DEFAULT 30,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+
+  ALTER TABLE user_map_preferences ALTER COLUMN zone_radius_km SET DEFAULT 30;
 
   -- NCR escalation email outbox: the dashboard enqueues finished emails and
   -- returns instantly; the sweeper delivers in the background with retry, so

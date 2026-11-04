@@ -4,10 +4,16 @@ const { getAlertTypes, getAlarmPage, getAlertFeed, getAlarmFilesById, getAlarmFi
 const { getActiveAlerts, getActiveAlertsAll, getActivePerVehicleAlerts, getActiveAlertCounts, getClosedSummaryByCC, getResolvedAlerts, getResolvedAlertCount, getClosedAlertsCountQuery, getAlertById, getAlertScreenshots, getAlertMedia, getAlertMembers, acknowledgeAlert, resolveAlert, escalateAlert, markFalseAlert, uploadDocumentToAlert, followUpAlert, clearFollowUp, getAlertHistory, listAlerts, watchAlert, unwatchAlert, getAlertWatchers, getAllWatchers, getActiveCooldowns } = require('../controllers/dbAlertController');
 const db = require('../db');
 const apiClient = require('../helpers/apiClient');
+const { getAlertSnapshot, streamAlerts } = require('../controllers/liveController');
+const { getAlertGroupDetail, getOpenAlertsByFleet, getAlertGroupMembers, getAlertOccurrenceDetail, resolveAlerts } = require('../controllers/alertCenterController');
 
 const router = express.Router();
 
 const { resolveAlertsBulk } = require('../controllers/dbAlertController');
+
+// Live board pipeline
+router.get('/snapshot', getAlertSnapshot);
+router.get('/stream', streamAlerts);
 
 router.get('/types', getAlertTypes);
 router.post('/page', getAlarmPage);
@@ -15,6 +21,11 @@ router.get('/feed', getAlertFeed);
 router.get('/files/:alarmId', getAlarmFilesById);
 router.post('/files/page', getAlarmFilesByPage);
 router.get('/devices', getDevices);
+
+router.get('/groups/:id', getAlertGroupDetail);
+router.get('/open', getOpenAlertsByFleet);
+router.get('/groups/:id/members', getAlertGroupMembers);
+router.get('/occurrences/:id', getAlertOccurrenceDetail);
 
 router.get('/active', getActiveAlerts);
 router.get('/active-per-vehicle', getActivePerVehicleAlerts);
@@ -42,6 +53,7 @@ const bulkCloseLimiter = rateLimit({
   message: { success: false, message: 'Too many bulk-close requests, please try again later.' },
 });
 router.post('/bulk-close', bulkCloseLimiter, resolveAlertsBulk);
+router.post('/resolve', bulkCloseLimiter, resolveAlerts);
 router.get('/:id/screenshots', getAlertScreenshots);
 router.get('/:id/media', getAlertMedia);
 router.get('/:id/members', getAlertMembers);

@@ -17,7 +17,7 @@ const REG = 'LDG368MP';
 const DEVICE_NAME = `${FLEET} - ${REG}`;
 const COOLED_TYPE = 'Cellphone Use';
 const SPEED90_CODE = 'aLv1Bv53LBkClq5rSQ5QPkQ';
-const SPEED90_TYPE = 'Speeding 90km/h'; // local alert_definitions name
+const SPEED90_TYPE = 'Heavy Duty Max Speeding 90KM/H'; // local alert_definitions name
 
 let pass = 0;
 let fail = 0;
@@ -26,15 +26,15 @@ function check(label, cond, detail) {
   else { fail += 1; console.log(`  FAIL  ${label}${detail === undefined ? '' : ` → ${detail}`}`); }
 }
 const groupCount = async (alarmType) => {
-  const r = await query('SELECT count(*)::int n FROM alert_groups WHERE device_id = $1 AND alarm_type = $2', [DEVICE_ID, alarmType]);
+  const r = await query('SELECT count(*)::int n FROM alert_groups WHERE (device_id = $1 OR source_device_id = $1) AND alarm_type = $2', [DEVICE_ID, alarmType]);
   return r.rows[0].n;
 };
 const backupGroup = async (alarmType) => {
-  const r = await query('SELECT id, count FROM alert_cooldown_groups WHERE device_id = $1 AND alarm_type = $2', [DEVICE_ID, alarmType]);
+  const r = await query('SELECT id, count FROM alert_cooldown_groups WHERE device_id = $1 AND alarm_type = $2', [FLEET, alarmType]);
   return r.rows[0] || null;
 };
 const backupMemberCount = async () =>
-  (await query('SELECT count(*)::int n FROM alert_cooldown_members WHERE device_id = $1', [DEVICE_ID])).rows[0].n;
+  (await query('SELECT count(*)::int n FROM alert_cooldown_members WHERE device_id = $1', [FLEET])).rows[0].n;
 
 async function upsert(alarmType, alertId) {
   return db.upsertAlertGroup({
@@ -55,15 +55,15 @@ async function upsert(alarmType, alertId) {
 (async () => {
   console.log('== prep: clean test device ==');
   for (const sql of [
-    'DELETE FROM alert_cooldown_members WHERE device_id = $1',
-    'DELETE FROM alert_cooldown_groups WHERE device_id = $1',
-    'DELETE FROM alert_cooldowns WHERE device_id = $1',
-    'DELETE FROM alerts WHERE device_id = $1',
-    'DELETE FROM alert_groups WHERE device_id = $1',
-    'DELETE FROM telematics_events WHERE device_id = $1',
-    'DELETE FROM driving_sessions WHERE device_id = $1',
-    'DELETE FROM vehicle_status WHERE device_id = $1',
-  ]) await query(sql, [DEVICE_ID]).catch(() => {});
+    'DELETE FROM alert_cooldown_members WHERE device_id = $1 OR device_id = $2',
+    'DELETE FROM alert_cooldown_groups WHERE device_id = $1 OR device_id = $2',
+    'DELETE FROM alert_cooldowns WHERE device_id = $1 OR device_id = $2',
+    'DELETE FROM alerts WHERE device_id = $1 OR source_device_id = $1 OR device_id = $2',
+    'DELETE FROM alert_groups WHERE device_id = $1 OR source_device_id = $1 OR device_id = $2',
+    'DELETE FROM telematics_events WHERE device_id = $1 OR source_device_id = $1 OR device_id = $2',
+    'DELETE FROM driving_sessions WHERE device_id = $1 OR device_id = $2',
+    'DELETE FROM vehicle_status WHERE device_id = $1 OR device_id = $2',
+  ]) await query(sql, [DEVICE_ID, FLEET]).catch(() => {});
   await query(
     `INSERT INTO geotab_devices (id, name, fleet_number, license_plate)
      VALUES ($1, $2, $3, $4)

@@ -48,6 +48,18 @@ function parseWindowMs(value) {
   return Number.isFinite(ms) ? ms : null;
 }
 
+// Skycamx alarm timestamps have no timezone suffix but are UTC. Date.parse
+// would treat them as local time (SAST +02:00), shifting every record two
+// hours backwards and making it look older than the HWM.
+function parseApiTimestamp(value) {
+  if (!value) return null;
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value;
+  const s = String(value).trim();
+  if (!s) return null;
+  const ms = Date.parse(/[zZ]$|[+-]\d{2}:?\d{2}$/.test(s) ? s : `${s.replace(' ', 'T')}Z`);
+  return Number.isFinite(ms) ? new Date(ms) : null;
+}
+
 /**
  * Pure freshness partition: keep records inside [startMs, now - maxAgeMs].
  * Records without a usable alarmTs are KEPT (can't judge — never silently
@@ -59,7 +71,7 @@ function partitionFreshRecords(records, { startMs = null, maxAgeMs = null, nowMs
   let tooOld = 0;
   for (const r of records || []) {
     const ts = r?.alarmTs || r?.alarm_ts || null;
-    const t = ts ? Date.parse(ts) : NaN;
+    const t = parseApiTimestamp(ts)?.getTime() ?? NaN;
     if (!Number.isFinite(t)) { kept.push(r); continue; }
     if (startMs != null && t < startMs) { stale++; continue; }
     if (maxAgeMs != null && nowMs - t > maxAgeMs) { tooOld++; continue; }
@@ -77,30 +89,39 @@ function partitionFreshRecords(records, { startMs = null, maxAgeMs = null, nowMs
 async function partitionCooledRecords(records) {
   if (!records || records.length === 0) return records;
   const { getActiveCooldown, recordSuppressed } = require('./alertCooldowns');
+  const identityMod = require('../vehicles/identity');
   const fresh = [];
-  const cdCache = new Map(); // `${deviceId}:${alarmType}` -> cooldown | null | false(lookup done, none)
+  const cdCache = new Map(); // `${canonicalId}:${alarmType}` -> cooldown | null | false
   for (const r of records) {
-    const deviceId = String(r.deviceId || r.device_id || '');
+    const sourceId = String(r.deviceId || r.device_id || '');
     const alarmType = String(r.alarmType || r.alarm_type || '');
-    if (!deviceId || !alarmType) { fresh.push(r); continue; }
+    if (!sourceId || !alarmType) { fresh.push(r); continue; }
+    let identity = null;
+    try {
+      identity = await identityMod.resolveVehicle({ deviceId: sourceId, deviceName: r.deviceName });
+    } catch (_) { identity = null; }
+    const deviceId = identity?.fleetNumber || sourceId;
+    const fleetNumber = identity?.fleetNumber || null;
     const key = `${deviceId}:${alarmType}`.toLowerCase();
     let cd = cdCache.get(key);
     if (cd === undefined) {
-      cd = await getActiveCooldown(deviceId, alarmType) || false;
+      cd = await getActiveCooldown(deviceId, alarmType)
+        || (sourceId !== deviceId ? await getActiveCooldown(sourceId, alarmType) : null)
+        || false;
       cdCache.set(key, cd);
     }
     if (!cd) { fresh.push(r); continue; }
     try {
       await recordSuppressed(cd, {
         deviceId, deviceName: r.deviceName || null, alarmType, alarmText: r.alarmText || null,
-        alertId: r.id, alarmTs: r.alarmTs ? new Date(r.alarmTs) : null,
+        alertId: r.id, alarmTs: parseApiTimestamp(r.alarmTs),
         lat: r.lat ?? null, lon: r.lon ?? null, speed: r.speed ?? null,
-        severity: r.severity || null, fleetNumber: null, sourceType: 'video',
+        severity: r.severity || null, fleetNumber, sourceType: 'video',
       }, {
         id: String(r.id), deviceId, deviceName: r.deviceName || null, alarmType,
-        alarmText: r.alarmText || null, alarmTs: r.alarmTs ? new Date(r.alarmTs) : null,
+        alarmText: r.alarmText || null, alarmTs: parseApiTimestamp(r.alarmTs),
         lat: r.lat ?? null, lon: r.lon ?? null, speed: r.speed ?? null,
-        severity: r.severity || null, fleetNumber: null, sourceType: 'video',
+        severity: r.severity || null, fleetNumber, sourceType: 'video',
       });
       console.log(`[COOLDOWN] ${deviceId}: "${alarmType}" stored in backup only (cooldown until ${cd.cooldown_until}) — no alerts/alert_groups row`);
     } catch (err) {
@@ -134,7 +155,14 @@ function filterMediaToWindow(files, startMs, endMs, toleranceMs = 5 * 60 * 1000)
   return kept;
 }
 
+let deviceIdsCache = null;
+let deviceIdsCacheTime = 0;
+const DEVICE_IDS_TTL_MS = 10 * 60 * 1000;
+
 async function getAllDeviceIds() {
+  if (deviceIdsCache && Date.now() - deviceIdsCacheTime < DEVICE_IDS_TTL_MS) {
+    return deviceIdsCache;
+  }
   const allDevices = [];
   let pageIndex = 1;
   let hasMore = true;
@@ -167,6 +195,10 @@ async function getAllDeviceIds() {
       hasMore = false;
     }
     if (hasMore) await sleep(200);
+  }
+  if (allDevices.length > 0) {
+    deviceIdsCache = allDevices;
+    deviceIdsCacheTime = Date.now();
   }
   return allDevices;
 }
@@ -446,21 +478,37 @@ async function normalizeVideoAlarmTypes(records) {
 }
 
 async function syncAlerts(deviceIds, startTime, endTime) {
-  let pageIndex = 1;
-  let hasMore = true;
+  // Skycamx rejects alarmPage requests for more than 100 devices in one call
+  // ("The number of devices queried at once cannot exceed 100"). Chunking is
+  // what keeps the 178-device fleet pollable; without it the whole sync
+  // silently returned 0 and the HWM never advanced.
+  const idList = String(deviceIds || '')
+    .split(',')
+    .map((id) => id.trim())
+    .filter(Boolean);
   const allNewRecords = [];
-  let emptyPageCount = 0;
 
-  while (hasMore) {
-    const response = await fetchAlarmsPageWithRetry({
-      deviceIds,
+  for (let offset = 0; offset < idList.length; offset += 100) {
+    const chunk = idList.slice(offset, offset + 100).join(',');
+    let pageIndex = 1;
+    let hasMore = true;
+    let emptyPageCount = 0;
+
+    while (hasMore) {
+      const response = await fetchAlarmsPageWithRetry({
+        deviceIds: chunk,
       startTime,
       endTime,
       pageIndex,
       pageSize: 100,
     });
 
-    if (response.code !== 0 || !response.data?.records?.length) {
+    if (response.code !== 0) {
+      console.error(`[SYNC] alarmPage failed: code=${response.code} msg=${response.msg || 'unknown'} (devices ${offset + 1}-${Math.min(offset + 100, idList.length)})`);
+      hasMore = false;
+      break;
+    }
+    if (!response.data?.records?.length) {
       hasMore = false;
       break;
     }
@@ -519,8 +567,8 @@ async function syncAlerts(deviceIds, startTime, endTime) {
         deviceId: r.deviceId,
         deviceName: r.deviceName,
         alarmType: r.alarmType,
-        alarmTs: r.alarmTs ? new Date(r.alarmTs) : null,
-        alarmTsEnd: r.alarmTsEnd ? new Date(r.alarmTsEnd) : null,
+        alarmTs: parseApiTimestamp(r.alarmTs),
+        alarmTsEnd: parseApiTimestamp(r.alarmTsEnd),
         lat: r.lat,
         lon: r.lon,
         alarmText: r.alarmText,
@@ -560,7 +608,7 @@ async function syncAlerts(deviceIds, startTime, endTime) {
                 deviceName: r.deviceName,
                 alarmType: r.alarmType,
                 alarmText: r.alarmText,
-                alarmTs: r.alarmTs ? new Date(r.alarmTs) : null,
+                alarmTs: parseApiTimestamp(r.alarmTs),
                 lat: r.lat,
                 lon: r.lon,
                 speed: r.speed ?? null,
@@ -587,7 +635,7 @@ async function syncAlerts(deviceIds, startTime, endTime) {
       const groupMap = {};
       for (const r of newRecords) {
         const key = `${r.deviceId}:${r.alarmType}`.toLowerCase();
-        if (!groupMap[key] || new Date(r.alarmTs || 0) > new Date(groupMap[key].alarmTs || 0)) {
+        if (!groupMap[key] || (parseApiTimestamp(r.alarmTs)?.getTime() || 0) > (parseApiTimestamp(groupMap[key].alarmTs)?.getTime() || 0)) {
           groupMap[key] = r;
         }
       }
@@ -598,28 +646,49 @@ async function syncAlerts(deviceIds, startTime, endTime) {
       // The vehicle identifiers travel with the entry so the batch upsert can
       // (a) honour a vehicle alert override and (b) store a fleet number for
       // cost-centre attribution. cameraName already carries both ("FM10 - LDG067MP").
-      const groupEntries = await Promise.all(Object.values(groupMap).map(async (r) => {
+      const identityMod = require('../vehicles/identity');
+      const { canRaiseAlert } = require('../alerts/authorization');
+      const builtGroups = await Promise.all(Object.values(groupMap).map(async (r) => {
         let fleetNumber = null;
         let registration = null;
+        let identity = null;
         try {
-          fleetNumber = await resolveFleetNumber({ deviceId: r.deviceId, vehicleRegistration: r.deviceName }).catch(() => null);
+          identity = await identityMod.resolveVehicle({
+            deviceId: r.deviceId, deviceName: r.deviceName,
+          });
+          fleetNumber = identity?.fleetNumber || await resolveFleetNumber({ deviceId: r.deviceId, vehicleRegistration: r.deviceName }).catch(() => null);
         } catch (_) { fleetNumber = null; }
-        const nameParts = String(r.deviceName || '').split(/\s*-\s*/).map((p) => p.trim()).filter(Boolean);
+        const nameParts = String(r.deviceName || '').split(/s*-s*/).map((p) => p.trim()).filter(Boolean);
         registration = nameParts.length > 1 ? nameParts[nameParts.length - 1] : (nameParts[0] || null);
         return {
-          deviceId: r.deviceId,
+          deviceId: identity?.fleetNumber || fleetNumber || r.deviceId,
+          sourceDeviceId: r.deviceId,
+          geotabDeviceId: identity?.geotabDeviceId || null,
+          mettaxDeviceId: identity?.mettaxDeviceId || r.deviceId,
           deviceName: r.deviceName,
           alarmType: r.alarmType,
           alarmText: r.alarmText,
           alertId: r.id,
-          alarmTs: r.alarmTs ? new Date(r.alarmTs) : null,
+          alarmTs: parseApiTimestamp(r.alarmTs),
           lat: r.lat,
           lon: r.lon,
           severity: resolveBaseSeverity(r.alarmType, severityMap),
           fleetNumber,
           registration,
+          costCenterId: identity?.costCenterId == null ? null : identity.costCenterId,
         };
       }));
+      const groupEntries = [];
+      for (const g of builtGroups) {
+        try {
+          const allowed = await canRaiseAlert({ costCenterId: g.costCenterId, name: g.alarmType });
+          if (allowed) groupEntries.push(g);
+          else console.log(`[SYNC] suppressed "${g.alarmType}" for ${g.fleetNumber || g.deviceId}: not in cost-centre alert set`);
+        } catch (err) {
+          console.error('[SYNC] authorization check failed:', err.message);
+          groupEntries.push(g);
+        }
+      }
       const groupSeverityByKey = {};
       if (groupEntries.length > 0) {
         try {
@@ -643,7 +712,7 @@ async function syncAlerts(deviceIds, startTime, endTime) {
       if (wsBroadcast) {
         for (const r of newRecords) {
           try {
-            const alarmTsIso = r.alarmTs ? new Date(r.alarmTs).toISOString() : new Date().toISOString();
+            const alarmTsIso = parseApiTimestamp(r.alarmTs)?.toISOString() || new Date().toISOString();
             const gkey = `${r.deviceId}:${r.alarmType}`.toLowerCase();
             const gsev = groupSeverityByKey[gkey];
             const base = gsev?.base || resolveBaseSeverity(r.alarmType, severityMap);
@@ -749,6 +818,8 @@ async function syncAlerts(deviceIds, startTime, endTime) {
     }
   }
 
+  }
+
   // Media fetching disabled during auto-sync — frontend no longer uses pre-fetched media.
   // On-demand media fetch is still available via fetchMediaOnDemand().
   let mediaCount = 0;
@@ -787,16 +858,20 @@ async function runSync() {
     // sliding wall-clock window that can miss alerts entirely.
     let defaultStart;
     try {
-      const hwmResult = await db.query(`SELECT MAX(alarm_ts) AS latest FROM alerts`);
+      const hwmResult = await db.query(`SELECT MAX(alarm_ts) AS latest FROM alerts WHERE source_type = 'video'`);
       const latestTs = hwmResult.rows[0]?.latest;
-      defaultStart = latestTs
-        ? new Date(new Date(latestTs).getTime() - 10 * 60 * 1000).toISOString().replace('T', ' ').slice(0, 19)
-        : new Date(now.getTime() - 10 * 60 * 1000).toISOString().replace('T', ' ').slice(0, 19);
-      console.log(`[SYNC] High-water mark: latest alarm_ts=${latestTs}, start=${defaultStart}`);
+      const overlapMs = 10 * 60 * 1000;
+      // Never query older than the freshness cap: those records are dropped
+      // after the API call anyway. An ancient HWM made the request span more
+      // than 10 days, which the provider rejects (>100 devices / long range).
+      const ageFloorMs = now.getTime() - MAX_ALERT_AGE_MINUTES * 60 * 1000;
+      const hwmMs = latestTs ? new Date(latestTs).getTime() - overlapMs : ageFloorMs;
+      const startMs = Math.max(Number.isFinite(hwmMs) ? hwmMs : ageFloorMs, ageFloorMs);
+      defaultStart = new Date(startMs).toISOString().replace('T', ' ').slice(0, 19);
+      console.log(`[SYNC] High-water mark: latest alarm_ts=${latestTs}, start=${defaultStart} (${MAX_ALERT_AGE_MINUTES}m floor)`);
     } catch (hwmErr) {
-      defaultStart = new Date(now.getTime() - 10 * 60 * 1000).toISOString().replace('T', ' ').slice(0, 19);
+      defaultStart = new Date(now.getTime() - MAX_ALERT_AGE_MINUTES * 60 * 1000).toISOString().replace('T', ' ').slice(0, 19);
     }
-
     syncState.lastSyncStart = defaultStart;
     const result = await syncAlerts(idsStr, defaultStart, defaultEnd);
 
@@ -854,7 +929,7 @@ function getStatus() {
   return { ...rest };
 }
 
-const MIN_SYNC_TICK_MS = 5000;
+const MIN_SYNC_TICK_MS = 15000;
 const DEFAULT_SYNC_TICK_MS = 15000;
 
 let autoSyncEnabled = false;

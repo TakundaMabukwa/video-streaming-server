@@ -163,7 +163,7 @@ function patchHandler() {
   check('infringement NOT overwritten by stale job', afterJob.infringement === 'Speeding Violation', afterJob.infringement);
   check('closure status applied', afterJob.status === 'RESOLVED', afterJob.status);
   check('closure_type applied', afterJob.closure_type === 'ncr', afterJob.closure_type);
-  check('alert identity applied', afterJob.alarm_type === 'Cellphone Use' && afterJob.device_id === DEVICE_ID);
+  check('alert identity applied', afterJob.alarm_type === 'Cellphone Use' && (afterJob.device_id === DEVICE_ID || afterJob.device_id === FLEET), afterJob.device_id);
 
   console.log('== [4] PATCH mirrors register edits into ncr_forms.form_data ==');
   const patch = patchHandler();

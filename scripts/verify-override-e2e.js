@@ -34,7 +34,7 @@ async function countRows(fleet) {
   // 2) Override: the OVR vehicle must not raise speeding 85.
   await db.query(
     `INSERT INTO vehicle_alert_overrides (fleet_number, alert_types, signal_codes, created_by, notes)
-     VALUES ($1, ARRAY['Speeding 85km/h'], ARRAY[$2], 'qa', 'e2e')
+     VALUES ($1, ARRAY['Heavy Duty Max Speeding 85km/h'], ARRAY[$2], 'qa', 'e2e')
      ON CONFLICT (COALESCE(fleet_number,''), COALESCE(registration,''))
      DO UPDATE SET alert_types = EXCLUDED.alert_types, signal_codes = EXCLUDED.signal_codes`,
     [OVR_FLEET, SPEED_85]
@@ -73,7 +73,7 @@ async function countRows(fleet) {
   // 5) The control vehicle now has an override -> its NEXT detection is blocked.
   await db.query(
     `INSERT INTO vehicle_alert_overrides (fleet_number, alert_types, signal_codes, created_by)
-     VALUES ($1, ARRAY['Speeding 85km/h'], ARRAY[$2], 'qa')
+     VALUES ($1, ARRAY['Heavy Duty Max Speeding 85km/h'], ARRAY[$2], 'qa')
      ON CONFLICT (COALESCE(fleet_number,''), COALESCE(registration,''))
      DO UPDATE SET alert_types = EXCLUDED.alert_types`,
     [PLAIN_FLEET, SPEED_85]

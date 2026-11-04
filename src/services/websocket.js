@@ -58,6 +58,9 @@ function startWebSocket(port = 3004) {
       wss.emit('connection', ws, req);
     });
   });
+  httpServer.on('error', (err) => {
+    console.error('[WS] server error:', err.message);
+  });
   httpServer.listen(port);
 
   wss.on('connection', (ws) => {
