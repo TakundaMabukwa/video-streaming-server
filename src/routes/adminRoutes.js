@@ -26,19 +26,12 @@ router.post('/clear-alerts', async (req, res) => {
          (SELECT COUNT(*) FROM telematics_events) AS events`
     );
     const counts = before.rows[0] || {};
-    await db.query('BEGIN');
-    try {
-      // alert_media cascades from alerts, but clear it explicitly so the
-      // order never depends on FK timing.
-      await db.query('DELETE FROM alert_media');
-      await db.query('DELETE FROM alerts');
-      await db.query('DELETE FROM alert_groups');
-      await db.query('DELETE FROM telematics_events');
-      await db.query('COMMIT');
-    } catch (err) {
-      await db.query('ROLLBACK').catch(() => {});
-      throw err;
-    }
+    // TRUNCATE is O(1) regardless of row count — DELETE hits the 45s
+    // statement_timeout on the 3M+ telematics_events table. Transactional
+    // in PostgreSQL so ROLLBACK still works.
+    await db.query(
+      'TRUNCATE alert_media, alerts, alert_groups, telematics_events'
+    );
     console.log(
       `[ADMIN] alerts cleared by ${req.user?.email || 'unknown'}: ` +
       `${counts.groups} groups, ${counts.alerts} alerts, ${counts.events} events`
