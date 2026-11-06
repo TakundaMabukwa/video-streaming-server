@@ -111,7 +111,23 @@ function buildCharts(stats) {
     ncrs: s.ncrs,
   }));
 
-  return { pie, bar };
+  // NCR charts: every cost centre with at least one NCR. No top-N cap.
+  const ncrSorted = [...stats].filter((s) => s.ncrs > 0).sort((a, b) => b.ncrs - a.ncrs);
+  const ncrPie = ncrSorted.map((s) => ({
+    cc_id: s.cc_id,
+    name: s.cc_name,
+    value: s.ncrs,
+    events: s.alert_events,
+  }));
+  const ncrBar = ncrSorted.map((s) => ({
+    cc_id: s.cc_id,
+    name: s.cc_name,
+    alerts: s.ncrs,
+    events: s.alert_events,
+    ncrs: s.ncrs,
+  }));
+
+  return { pie, bar, ncrPie, ncrBar };
 }
 
 async function buildDataset({ from, to }) {
