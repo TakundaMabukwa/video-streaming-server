@@ -1139,8 +1139,18 @@ async function resolveAlertGroup(groupKey, updates) {
   return result.rows[0] || null;
 }
 
-async function getResolvedAlertGroupCount() {
-  const result = await query('SELECT COUNT(*) FROM alert_groups WHERE resolved = TRUE');
+async function getResolvedAlertGroupCount({ from = null, to = null } = {}) {
+  const conditions = ['g.resolved = TRUE'];
+  const params = [];
+  if (from) {
+    params.push(from);
+    conditions.push(`COALESCE(g.resolved_at, g.updated_at, g.last_alert_ts) >= $${params.length}::timestamptz`);
+  }
+  if (to) {
+    params.push(to);
+    conditions.push(`COALESCE(g.resolved_at, g.updated_at, g.last_alert_ts) <= $${params.length}::timestamptz`);
+  }
+  const result = await query(`SELECT COUNT(*) FROM alert_groups g WHERE ${conditions.join(' AND ')}`, params);
   return parseInt(result.rows[0].count);
 }
 

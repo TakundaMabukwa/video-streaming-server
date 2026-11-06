@@ -1741,8 +1741,10 @@ async function getActiveCooldowns(req, res) {
 
 async function getResolvedAlertCount(req, res) {
   try {
-    const count = await db.getResolvedAlertGroupCount();
-    res.json({ success: true, count });
+    const from = req.query.from ? String(req.query.from) : null;
+    const to = req.query.to ? String(req.query.to) : null;
+    const count = await db.getResolvedAlertGroupCount({ from, to });
+    res.json({ success: true, count, from, to });
   } catch (error) {
     res.status(500).json({ success: false, count: 0, message: error.message });
   }
