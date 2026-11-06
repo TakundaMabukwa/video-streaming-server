@@ -5,6 +5,7 @@
 // of rows. It never ships the full range to the browser.
 const reportStats = require('../db/reportStats');
 const linkage = require('./reportLinkage');
+const { query } = require('../db/pool');
 
 const SNAPSHOT_TTL_MS = 20 * 1000;
 const snapshotCache = new Map();
@@ -84,7 +85,41 @@ function buildCostCentreStats(rows, costCenters) {
   );
 }
 
-function buildCharts(stats) {
+// NCR counts per cost centre — queried directly from ncr_forms JOIN incidents.
+// Independent of alert_groups so deleted/cleared alerts don't hide NCRs.
+async function getNcrCountsByCostCentre({ from, to, costCenterIds } = {}) {
+  const params = [];
+  const conditions = [];
+  if (from && to) {
+    params.push(from, to);
+    conditions.push(`nf.created_at >= $${params.length - 1}::date AND nf.created_at < ($${params.length}::date + INTERVAL '1 day')`);
+  } else if (from) {
+    params.push(from);
+    conditions.push(`nf.created_at >= $${params.length}::date`);
+  } else if (to) {
+    params.push(to);
+    conditions.push(`nf.created_at < ($${params.length}::date + INTERVAL '1 day')`);
+  }
+  const ccList = String(costCenterIds || '').split(',').map(s => s.trim()).filter(Boolean).map(Number).filter(n => Number.isFinite(n) && n > 0);
+  if (ccList.length > 0) {
+    params.push(ccList);
+    conditions.push(`i.cost_center_id = ANY($${params.length}::int[])`);
+  }
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const result = await query(
+    `SELECT i.cost_center_id, COALESCE(cc.name, 'Unknown') AS name, COUNT(nf.id)::int AS ncrs
+       FROM ncr_forms nf
+       JOIN incidents i ON i.id = nf.incident_id
+       LEFT JOIN cost_centers cc ON cc.id = i.cost_center_id
+       ${where}
+      GROUP BY i.cost_center_id, cc.name
+      ORDER BY ncrs DESC`,
+    params
+  );
+  return result.rows;
+}
+
+function buildCharts(stats, ncrCounts = []) {
   const sorted = [...stats].sort((a, b) => b.closed_alerts - a.closed_alerts);
   const topPie = sorted.slice(0, 8);
   const rest = sorted.slice(8);
@@ -111,20 +146,19 @@ function buildCharts(stats) {
     ncrs: s.ncrs,
   }));
 
-  // NCR charts: every cost centre with at least one NCR. No top-N cap.
-  const ncrSorted = [...stats].filter((s) => s.ncrs > 0).sort((a, b) => b.ncrs - a.ncrs);
-  const ncrPie = ncrSorted.map((s) => ({
-    cc_id: s.cc_id,
-    name: s.cc_name,
-    value: s.ncrs,
-    events: s.alert_events,
+  // NCR charts: direct query from ncr_forms JOIN incidents. All CCs, no cap.
+  const ncrPie = ncrCounts.map((s) => ({
+    cc_id: s.cost_center_id,
+    name: s.name,
+    value: Number(s.ncrs || 0),
+    events: 0,
   }));
-  const ncrBar = ncrSorted.map((s) => ({
-    cc_id: s.cc_id,
-    name: s.cc_name,
-    alerts: s.ncrs,
-    events: s.alert_events,
-    ncrs: s.ncrs,
+  const ncrBar = ncrCounts.map((s) => ({
+    cc_id: s.cost_center_id,
+    name: s.name,
+    alerts: Number(s.ncrs || 0),
+    events: 0,
+    ncrs: Number(s.ncrs || 0),
   }));
 
   return { pie, bar, ncrPie, ncrBar };
@@ -262,6 +296,11 @@ function summarize(rows) {
 async function getSnapshot(params = {}) {
   const { range, rows, costCenters, alertTypes } = await getReportData(params);
   const stats = buildCostCentreStats(rows, costCenters);
+  const ncrCounts = await getNcrCountsByCostCentre({
+    from: range.from,
+    to: range.to,
+    costCenterIds: params.costCenterIds,
+  });
   const pageSize = Math.min(200, Math.max(1, Number(params.pageSize) || 50));
   const page = Math.max(1, Number(params.page) || 1);
   const total = rows.length;
@@ -282,7 +321,7 @@ async function getSnapshot(params = {}) {
     range,
     summary: summarize(rows),
     cost_centre_stats: stats,
-    charts: buildCharts(stats),
+    charts: buildCharts(stats, ncrCounts),
     alert_types: alertTypes,
     cost_centers: costCenters,
     closed_alerts: rows.slice(start, start + pageSize),
