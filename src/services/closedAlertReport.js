@@ -104,18 +104,21 @@ async function getNcrCountsByCostCentre({ from, to, costCenterIds } = {}) {
   const ccList = String(costCenterIds || '').split(',').map(s => s.trim()).filter(Boolean).map(Number).filter(n => Number.isFinite(n) && n > 0);
   if (ccList.length > 0) {
     params.push(ccList);
-    conditions.push(`i.cost_center_id = ANY($${params.length}::int[])`);
+    conditions.push(`COALESCE(i.cost_center_id, fv.cost_center_id) = ANY($${params.length}::int[])`);
   }
   const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
   const result = await query(
-    `SELECT i.cost_center_id, COALESCE(cc.name, 'Unknown') AS name,
+    `SELECT COALESCE(i.cost_center_id, fv.cost_center_id) AS cost_center_id,
+            COALESCE(cc.name, fv_cc.name, 'Unknown') AS name,
             COUNT(nf.id)::int AS ncrs,
             COUNT(DISTINCT NULLIF(TRIM(i.fleet_number), ''))::int AS vehicles
        FROM ncr_forms nf
        JOIN incidents i ON i.id = nf.incident_id
        LEFT JOIN cost_centers cc ON cc.id = i.cost_center_id
+       LEFT JOIN fleet_vehicles fv ON fv.fleet_number = i.fleet_number
+       LEFT JOIN cost_centers fv_cc ON fv_cc.id = fv.cost_center_id
        ${where}
-      GROUP BY i.cost_center_id, cc.name
+      GROUP BY COALESCE(i.cost_center_id, fv.cost_center_id), COALESCE(cc.name, fv_cc.name, 'Unknown')
       ORDER BY ncrs DESC`,
     params
   );

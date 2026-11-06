@@ -251,12 +251,15 @@ async function getNcrRegister({ status, from, to, costCenterIds, q, pageSize = 5
             i.alert_id, i.alarm_type, i.source_type,
             i.fleet_number, i.driver_name, i.contact_number,
             i.infringement, i.infringement_detail, i.action_taken, i.outcome, i.notes,
-            i.cost_center_id, i.closure_type, i.resolved_by,
+            COALESCE(i.cost_center_id, fv.cost_center_id) AS cost_center_id,
+            i.closure_type, i.resolved_by,
             i.resolved_at, i.created_at AS incident_created_at,
-            cc.name AS cost_center_name
+            COALESCE(cc.name, fv_cc.name) AS cost_center_name
        FROM ncr_forms nf
        JOIN incidents i ON i.id = nf.incident_id
        LEFT JOIN cost_centers cc ON cc.id = i.cost_center_id
+       LEFT JOIN fleet_vehicles fv ON fv.fleet_number = i.fleet_number
+       LEFT JOIN cost_centers fv_cc ON fv_cc.id = fv.cost_center_id
        ${where}
       ORDER BY nf.created_at DESC
       LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
