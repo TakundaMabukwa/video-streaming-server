@@ -27,10 +27,10 @@ router.post('/clear-alerts', async (req, res) => {
     );
     const counts = before.rows[0] || {};
     // TRUNCATE is O(1) regardless of row count — DELETE hits the 45s
-    // statement_timeout on the 3M+ telematics_events table. Transactional
-    // in PostgreSQL so ROLLBACK still works.
+    // statement_timeout on the 3M+ telematics_events table. CASCADE handles
+    // the FK chain: alert_media→alerts→alert_groups, alert_combo_events→alerts.
     await db.query(
-      'TRUNCATE alert_media, alerts, alert_groups, telematics_events'
+      'TRUNCATE alert_media, alert_combo_events, alerts, alert_groups, telematics_events CASCADE'
     );
     console.log(
       `[ADMIN] alerts cleared by ${req.user?.email || 'unknown'}: ` +
