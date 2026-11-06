@@ -107,9 +107,10 @@ async function getNcrCountsByCostCentre({ from, to, costCenterIds } = {}) {
     conditions.push(`i.cost_center_id = ANY($${params.length}::int[])`);
   }
   const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
-  console.log('[NCR-COUNTS] from=%s to=%s cc=%j params=%j where=%s', from, to, costCenterIds, params, where);
   const result = await query(
-    `SELECT i.cost_center_id, COALESCE(cc.name, 'Unknown') AS name, COUNT(nf.id)::int AS ncrs
+    `SELECT i.cost_center_id, COALESCE(cc.name, 'Unknown') AS name,
+            COUNT(nf.id)::int AS ncrs,
+            COUNT(DISTINCT NULLIF(TRIM(i.fleet_number), ''))::int AS vehicles
        FROM ncr_forms nf
        JOIN incidents i ON i.id = nf.incident_id
        LEFT JOIN cost_centers cc ON cc.id = i.cost_center_id
@@ -306,21 +307,26 @@ async function getSnapshot(params = {}) {
 
   // Merge direct NCR counts into cost_centre_stats so cards and charts agree.
   // The old stats[].ncrs came from closed-alert groups (broken by deletions).
-  const ncrMap = new Map(ncrCounts.map((r) => [Number(r.cost_center_id), Number(r.ncrs || 0)]));
+  const ncrMap = new Map(ncrCounts.map((r) => [Number(r.cost_center_id), r]));
   for (const bucket of stats) {
-    bucket.ncrs = ncrMap.get(bucket.cc_id) ?? 0;
+    const ncrRow = ncrMap.get(bucket.cc_id);
+    bucket.ncrs = ncrRow ? Number(ncrRow.ncrs || 0) : 0;
+    // Vehicle count: max of alert-derived and NCR-derived (a vehicle may
+    // appear in either source depending on whether its alert was cleared).
+    const ncrVehicles = ncrRow ? Number(ncrRow.vehicles || 0) : 0;
+    bucket.vehicles = Math.max(bucket.vehicles, ncrVehicles);
     ncrMap.delete(bucket.cc_id);
   }
-  // Add CCs that have NCRs but no closed alerts (e.g. "Unknown" with 34).
-  for (const [ccId, count] of ncrMap) {
+  // Add CCs that have NCRs but no closed alerts (e.g. RAPID, YOTG).
+  for (const [ccId, ncrRow] of ncrMap) {
     const cc = (costCenters || []).find((c) => Number(c.id) === ccId);
     stats.push({
       cc_id: ccId,
-      cc_name: cc?.name || `CC ${ccId}`,
+      cc_name: cc?.name || ncrRow.name || `CC ${ccId}`,
       closed_alerts: 0,
       alert_events: 0,
-      ncrs: count,
-      vehicles: 0,
+      ncrs: Number(ncrRow.ncrs || 0),
+      vehicles: Number(ncrRow.vehicles || 0),
     });
   }
   stats.sort((a, b) => (b.ncrs - a.ncrs) || (b.closed_alerts - a.closed_alerts));
