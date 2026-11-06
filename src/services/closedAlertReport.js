@@ -86,19 +86,20 @@ function buildCostCentreStats(rows, costCenters) {
 }
 
 // NCR counts per cost centre — queried directly from ncr_forms JOIN incidents.
-// Independent of alert_groups so deleted/cleared alerts don't hide NCRs.
+// Uses incident_date (not nf.created_at) so it matches the alert date range
+// and the drill-down. Independent of alert_groups so cleared alerts don't hide NCRs.
 async function getNcrCountsByCostCentre({ from, to, costCenterIds } = {}) {
   const params = [];
   const conditions = [];
   if (from && to) {
     params.push(from, to);
-    conditions.push(`nf.created_at >= $${params.length - 1}::date AND nf.created_at < ($${params.length}::date + INTERVAL '1 day')`);
+    conditions.push(`i.incident_date >= $${params.length - 1}::date AND i.incident_date <= $${params.length}::date`);
   } else if (from) {
     params.push(from);
-    conditions.push(`nf.created_at >= $${params.length}::date`);
+    conditions.push(`i.incident_date >= $${params.length}::date`);
   } else if (to) {
     params.push(to);
-    conditions.push(`nf.created_at < ($${params.length}::date + INTERVAL '1 day')`);
+    conditions.push(`i.incident_date <= $${params.length}::date`);
   }
   const ccList = String(costCenterIds || '').split(',').map(s => s.trim()).filter(Boolean).map(Number).filter(n => Number.isFinite(n) && n > 0);
   if (ccList.length > 0) {
@@ -106,6 +107,7 @@ async function getNcrCountsByCostCentre({ from, to, costCenterIds } = {}) {
     conditions.push(`i.cost_center_id = ANY($${params.length}::int[])`);
   }
   const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  console.log('[NCR-COUNTS] from=%s to=%s cc=%j params=%j where=%s', from, to, costCenterIds, params, where);
   const result = await query(
     `SELECT i.cost_center_id, COALESCE(cc.name, 'Unknown') AS name, COUNT(nf.id)::int AS ncrs
        FROM ncr_forms nf
