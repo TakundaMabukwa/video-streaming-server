@@ -7,6 +7,7 @@ const { isRegisteredVehicle } = require('./fleetRegistryGuard');
 const { escalateSeverity } = require('../helpers/transform');
 const { categoryOf, entryLabel, riskLevel, stopSignalCodes } = require('../alerts/zoneCategory');
 const sseHub = require('../live/sseHub');
+const zoneNotifications = require('./zoneNotifications');
 const {
   FATIGUE_3H_CODE,
   FATIGUE_6H_CODE,
@@ -20,6 +21,8 @@ const {
   NOGO_ENTRY_CODE,
   NO_STOP_ENTRY_CODE,
   ZONE_APPROACHING_CODE,
+  SIGNAL_LOSS_ENTRY_CODE,
+  isSelfMonitoringZoneAlert,
   ZONE_STOP_IMMEDIATE_CODE,
   ZONE_STOP_1MIN_HIGH_CODE,
   ZONE_STOP_1MIN_NO_CODE,
@@ -466,6 +469,53 @@ async function emitDeviceStatusAlert({ deviceId, fleetNumber, licensePlate, sign
     const alertId = `dst-${canonicalId}-${signalCode}-${Date.now()}`;
     const alarmTs = ts || new Date().toISOString();
 
+    if (isSelfMonitoringZoneAlert({ signalCode, alarmType: def.name })) {
+      const kind = signalCode === ZONE_APPROACHING_CODE
+        ? 'approaching'
+        : signalCode === SIGNAL_LOSS_ENTRY_CODE
+          ? 'signal_loss'
+          : 'entering';
+      const zoneId = extra.zoneId ?? extra.zone_id ?? null;
+      const zoneName = extra.zoneName ?? extra.zone_name ?? null;
+      if (kind === 'entering' && zoneId) {
+        zoneNotifications.removeApproach(canonicalId, zoneId);
+      }
+      zoneNotifications.upsert({
+        fleet_number: canonicalId,
+        device_id: sourceId,
+        plate: licensePlate || null,
+        cost_center_id: ccId,
+        kind,
+        alert_type: def.name,
+        zone_id: zoneId,
+        zone_name: zoneName,
+        severity: String(def.severity || 'MEDIUM').toLowerCase(),
+        eta_seconds: extra.etaSeconds ?? null,
+        distance_meters: extra.distanceMeters ?? null,
+        lat: lat ?? null,
+        lon: lon ?? null,
+        speed: speed ?? null,
+      });
+      await db.query(
+        `INSERT INTO telematics_events (device_id, vehicle_id, license_plate, fleet_number, plate,
+          event_type, event_code, severity, latitude, longitude, speed, description, zone_name, raw_data, event_time, distance, duration_seconds,
+          source_device_id, geotab_device_id, mettax_device_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
+        [
+          canonicalId, canonicalId, licensePlate || null, fleetNumber || canonicalId, licensePlate || null,
+          def.name, signalCode, String(def.severity || 'MEDIUM').toUpperCase(),
+          lat ?? null, lon ?? null, speed ?? null,
+          alarmText || def.name, zoneName,
+          JSON.stringify({ signalCode, source: 'deviceStatus', notificationOnly: true, ...extra }),
+          alarmTs,
+          Number.isFinite(distanceKm) && distanceKm >= 0 ? distanceKm : null,
+          Number.isFinite(durationSeconds) && durationSeconds >= 0 ? Math.round(durationSeconds) : null,
+          sourceId || null, identity?.geotabDeviceId || sourceId || null, identity?.mettaxDeviceId || null,
+        ]
+      ).catch(() => {});
+      return { notification_only: true, alarmType: def.name };
+    }
+
     // Operator cooldown: while a timer runs for this vehicle + alert type the
     // occurrence goes to the backup mirrors and NOTHING reaches the board.
     // Returns a truthy object so fatigue/speed consume their memory exactly
@@ -747,6 +797,7 @@ async function processZoneForDevice(deviceId, fleetNumber, licensePlate, lat, lo
             alarmText: `Approaching High Risk Zone: ${z.name} (ETA ~${Math.round(etaSeconds)}s)`,
             lat, lon, speed, ts: nowTs,
             extra: {
+              zoneId: z.id,
               zoneName: z.name,
               zoneType: 'high_risk',
               etaSeconds: Math.round(etaSeconds),
@@ -775,6 +826,7 @@ async function processZoneForDevice(deviceId, fleetNumber, licensePlate, lat, lo
          WHERE device_id = $1 AND zone_id = $3 AND is_active = TRUE`,
         [deviceId, nowTs, zoneId]
       );
+      zoneNotifications.removeEntry(fleetNumber || deviceId, zoneId);
       wasInside.delete(zoneId);
     } catch (err) {
       console.error(`[ZONE] exit close failed device=${deviceId} zone=${zoneId}: ${err.message}`);
@@ -811,7 +863,7 @@ async function processZoneForDevice(deviceId, fleetNumber, licensePlate, lat, lo
         deviceId, fleetNumber, licensePlate, signalCode: zoneConfig.code,
         alarmText: `Entering ${zoneConfig.text} in zone ${z.name}`,
         lat, lon, speed, ts: nowTs,
-        extra: { zoneName: z.name, zoneType },
+        extra: { zoneId: z.id, zoneName: z.name, zoneType },
       });
     }
   }

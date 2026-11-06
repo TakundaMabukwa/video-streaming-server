@@ -1,39 +1,118 @@
 // Reports linkage resolver.
 //
-// One place decides which cost centre a row belongs to and which driver it
-// belongs to. Every /eps/reports/* endpoint uses it, so the register, the
-// cost-centre cards and the driver rows can never disagree.
+// Supabase is the source of truth:
+//   vehiclesc      -> vehicle identity + cost centre
+//   cost_centers   -> cost centre names/codes
+//   drivers        -> driver identity + cost centre
 //
-// Vehicle cost centre (first hit wins):
-//   1. the cost centre stored on the incident row (written when the NCR was
-//      saved)
-//   2. fleet_vehicles by fleet number
-//   3. fleet_vehicles by REGISTRATION — the fleet number in the alert name
-//      is often a Geotab label ("LSA11") while the registry calls the same
-//      truck "LSA/CB26", so the plate is the reliable join key
-//   4. driver_scoring by fleet number (a fleet registered for a cost centre)
-//   5. the driver's own cost centre (Supabase drivers)
-//   6. nothing → Unassigned (VISIBLE, never dropped)
-//
-// Driver identity (first hit wins):
-//   1. id_number → Supabase drivers.id_or_passport_number (exact)
-//   2. driver name → Supabase drivers first/surname
-//   3. fleet number → driver_scoring (local mirror with driver + cost centre)
-//   4. the raw name on the row
+// Vehicle matching is fleet-code first ("B29 - KXH548MP" -> "B29"), then all
+// known vehicle aliases (registration, vehicle number, call number, old/temp
+// numbers, asset number) before falling back to a stored incident cost centre.
 const { query } = require('../db/pool');
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-// ── Small registries (loaded once per request, cached briefly) ─────────────
-const REGISTRY_TTL_MS = 60 * 1000;
+const REGISTRY_TTL_MS = 10 * 60 * 1000;
 let registryCache = null;
 let registryCachedAt = 0;
+let registryInFlight = null;
 
-async function loadRegistry() {
-  const now = Date.now();
-  if (registryCache && now - registryCachedAt < REGISTRY_TTL_MS) return registryCache;
+const DRIVERS_TTL_MS = 5 * 60 * 1000;
+let driversCache = null;
+let driversCachedAt = 0;
 
+function normKey(value) {
+  return String(value || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+
+function normName(value) {
+  return String(value || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function normText(value) {
+  return String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+function fleetCode(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const beforeDash = raw.split(/\s*[-\u2013\u2014]\s*/)[0] || raw;
+  return normKey(beforeDash);
+}
+
+function nameTokens(...values) {
+  const out = [];
+  const seen = new Set();
+  for (const value of values) {
+    const raw = String(value || '').trim();
+    if (!raw) continue;
+    const parts = raw.split(/[^A-Za-z0-9]+/);
+    for (const part of parts) {
+      if (!part || part.length < 2) continue;
+      for (const variant of [part, part.replace(/RAPID/i, ''), part.replace(/REMCO/i, '')]) {
+        const key = normKey(variant);
+        if (!key || key.length < 2 || seen.has(key)) continue;
+        seen.add(key);
+        out.push(key);
+      }
+    }
+  }
+  return out;
+}
+
+function deviceCandidates(row) {
+  const out = [];
+  const seen = new Set();
+  const push = (value) => {
+    const key = normKey(value);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    out.push(key);
+  };
+
+  push(row.fleet_number);
+  push(fleetCode(row.fleet_number));
+  push(fleetCode(row.device_name));
+  push(row.device_id);
+
+  const device = String(row.device_name || '').trim();
+  if (device) {
+    const parts = device.split(/\s*[-\u2013\u2014]\s*/);
+    push(parts[0]);
+    push(parts[parts.length - 1]);
+    for (const token of nameTokens(device)) push(token);
+  }
+  for (const token of nameTokens(row.fleet_number)) push(token);
+  return out;
+}
+
+async function supabaseGet(path) {
+  if (!SUPABASE_URL || !SUPABASE_KEY) return null;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  try {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+      headers: {
+        apikey: SUPABASE_KEY,
+        Authorization: `Bearer ${SUPABASE_KEY}`,
+      },
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      console.error(`[ReportLinkage] Supabase ${path} failed: ${res.status}`);
+      return null;
+    }
+    return await res.json();
+  } catch (err) {
+    console.error(`[ReportLinkage] Supabase ${path} failed:`, err.message);
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function loadFallbackRegistry() {
   const [fvRes, dsRes] = await Promise.all([
     query(
       `SELECT fleet_number, registration_number, cost_center_id
@@ -47,175 +126,206 @@ async function loadRegistry() {
     ).catch(() => ({ rows: [] })),
   ]);
 
-  const byFleet = new Map();
-  const byRegistration = new Map();
+  const byAlias = new Map();
   for (const row of fvRes.rows || []) {
-    const fk = normKey(row.fleet_number);
-    const rk = normKey(row.registration_number);
     const entry = {
+      id: null,
       fleet: row.fleet_number || null,
       registration: row.registration_number || null,
       ccId: row.cost_center_id == null ? null : Number(row.cost_center_id),
+      ccText: null,
+      driverId: null,
     };
-    if (fk && !byFleet.has(fk)) byFleet.set(fk, entry);
-    if (rk && !byRegistration.has(rk)) byRegistration.set(rk, entry);
+    for (const value of [row.fleet_number, row.registration_number]) {
+      const key = normKey(value);
+      if (key && !byAlias.has(key)) byAlias.set(key, entry);
+    }
   }
 
   const scoringByFleet = new Map();
   for (const row of dsRes.rows || []) {
-    const fk = normKey(row.fleet_number);
-    if (!fk) continue;
-    const entry = {
+    const key = normKey(row.fleet_number);
+    if (!key) continue;
+    scoringByFleet.set(key, {
       fleet: row.fleet_number || null,
-      driver: row.driver || null,
-      ccId: row.cost_center_id == null ? null : Number(row.cost_center_id),
       registration: row.registration_number || null,
-    };
-    if (!scoringByFleet.has(fk)) scoringByFleet.set(fk, entry);
+      ccId: row.cost_center_id == null ? null : Number(row.cost_center_id),
+      driver: row.driver || null,
+    });
   }
 
-  registryCache = { byFleet, byRegistration, scoringByFleet };
-  registryCachedAt = now;
-  return registryCache;
+  return { byAlias, scoringByFleet, costCenters: [], vehicleCountByCc: new Map() };
 }
 
-// ── Supabase drivers (5-min cache — never fetched per row) ─────────────────
-const DRIVERS_TTL_MS = 5 * 60 * 1000;
-let driversCache = null;
-let driversCachedAt = 0;
+async function loadRegistry() {
+  const now = Date.now();
+  if (registryCache && now - registryCachedAt < REGISTRY_TTL_MS) return registryCache;
+  if (registryInFlight) return registryInFlight;
 
-function normKey(value) {
-  return String(value || '').trim().toUpperCase().replace(/\s+/g, '');
-}
+  registryInFlight = (async () => {
+    const vehicleSelect = [
+      'id',
+      'fleet_number',
+      'registration_number',
+      'vehicle_number',
+      'vehicle_call_number',
+      'register_number',
+      'old_number',
+      'temp_number',
+      'licence_number',
+      'asset_number',
+      'cost_center_id',
+      'cost_center',
+      'cost_centres',
+      'driver_id',
+    ].join(',');
 
-function normName(value) {
-  return String(value || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+    const [vehicles, costCenters] = await Promise.all([
+      supabaseGet(`vehiclesc?select=${vehicleSelect}&limit=10000`),
+      supabaseGet('cost_centers?select=id,name,code,is_active&limit=500'),
+    ]);
+
+    if (!Array.isArray(vehicles) || vehicles.length === 0) {
+      const fallback = await loadFallbackRegistry();
+      registryCache = fallback;
+      registryCachedAt = Date.now();
+      return fallback;
+    }
+
+    const ccRows = Array.isArray(costCenters) ? costCenters : [];
+    const ccById = new Map();
+    const ccByText = new Map();
+    for (const cc of ccRows) {
+      const id = Number(cc.id);
+      if (!Number.isFinite(id)) continue;
+      ccById.set(id, cc);
+      for (const value of [cc.name, cc.code]) {
+        const key = normText(value);
+        if (key && !ccByText.has(key)) ccByText.set(key, id);
+      }
+    }
+
+    const byAlias = new Map();
+    const vehicleCountByCc = new Map();
+    const ordered = [...vehicles].sort((a, b) => {
+      const aHas = a.cost_center_id == null ? 1 : 0;
+      const bHas = b.cost_center_id == null ? 1 : 0;
+      return aHas - bHas || Number(a.id || 0) - Number(b.id || 0);
+    });
+
+    for (const row of ordered) {
+      const ccId = row.cost_center_id == null ? null : Number(row.cost_center_id);
+      const ccText = row.cost_center || row.cost_centres || null;
+      const entry = {
+        id: row.id == null ? null : String(row.id),
+        fleet: row.fleet_number || null,
+        registration: row.registration_number || null,
+        ccId: Number.isFinite(ccId) ? ccId : null,
+        ccText,
+        driverId: row.driver_id == null ? null : String(row.driver_id),
+      };
+      if (entry.ccId != null) {
+        vehicleCountByCc.set(entry.ccId, (vehicleCountByCc.get(entry.ccId) || 0) + 1);
+      }
+      const aliases = [
+        row.fleet_number,
+        fleetCode(row.fleet_number),
+        row.registration_number,
+        row.vehicle_number,
+        row.vehicle_call_number,
+        row.register_number,
+        row.old_number,
+        row.temp_number,
+        row.licence_number,
+        row.asset_number,
+      ];
+      for (const value of aliases) {
+        const key = normKey(value);
+        if (key && !byAlias.has(key)) byAlias.set(key, entry);
+      }
+    }
+
+    registryCache = {
+      byAlias,
+      scoringByFleet: new Map(),
+      costCenters: ccRows,
+      ccById,
+      ccByText,
+      vehicleCountByCc,
+    };
+    registryCachedAt = Date.now();
+    return registryCache;
+  })();
+
+  try {
+    return await registryInFlight;
+  } finally {
+    registryInFlight = null;
+  }
 }
 
 async function loadSupabaseDrivers() {
   const now = Date.now();
   if (driversCache && now - driversCachedAt < DRIVERS_TTL_MS) return driversCache;
 
-  const empty = { byIdNumber: new Map(), byName: new Map(), byFleet: new Map(), list: [] };
+  const empty = { byIdNumber: new Map(), byName: new Map(), byFleet: new Map(), byId: new Map(), list: [] };
   if (!SUPABASE_URL || !SUPABASE_KEY) return empty;
 
-  try {
-    const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/drivers?select=id,first_name,surname,fleet_number,cost_center_id,id_or_passport_number`,
-      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
-    );
-    if (!res.ok) return empty;
-    const rows = await res.json();
-    if (!Array.isArray(rows)) return empty;
+  const rows = await supabaseGet(
+    'drivers?select=id,first_name,surname,fleet_number,cost_center_id,id_or_passport_number&limit=10000'
+  );
+  if (!Array.isArray(rows)) return empty;
 
-    const byIdNumber = new Map();
-    const byName = new Map();
-    const byFleet = new Map();
-    const list = [];
-    for (const row of rows) {
-      const driver = {
-        id: row.id == null ? null : String(row.id),
-        firstName: row.first_name || null,
-        surname: row.surname || null,
-        fleetNumber: row.fleet_number || null,
-        ccId: row.cost_center_id == null ? null : Number(row.cost_center_id),
-        idNumber: row.id_or_passport_number || null,
-      };
-      list.push(driver);
-      const idn = normKey(driver.idNumber);
-      if (idn && !byIdNumber.has(idn)) byIdNumber.set(idn, driver);
-      const full = normName(`${driver.firstName || ''} ${driver.surname || ''}`);
-      if (full && !byName.has(full)) byName.set(full, driver);
-      const first = normName(driver.firstName);
-      if (first && !byName.has(first)) byName.set(first, driver);
-      const fk = normKey(driver.fleetNumber);
-      if (fk && !byFleet.has(fk)) byFleet.set(fk, driver);
-    }
-
-    driversCache = { byIdNumber, byName, byFleet, list };
-    driversCachedAt = now;
-    return driversCache;
-  } catch (err) {
-    console.error('[ReportLinkage] Supabase drivers fetch failed:', err.message);
-    return empty;
+  const byIdNumber = new Map();
+  const byName = new Map();
+  const byFleet = new Map();
+  const byId = new Map();
+  const list = [];
+  for (const row of rows) {
+    const driver = {
+      id: row.id == null ? null : String(row.id),
+      firstName: row.first_name || null,
+      surname: row.surname || null,
+      fleetNumber: row.fleet_number || null,
+      ccId: row.cost_center_id == null ? null : Number(row.cost_center_id),
+      idNumber: row.id_or_passport_number || null,
+    };
+    list.push(driver);
+    if (driver.id) byId.set(driver.id, driver);
+    const idn = normKey(driver.idNumber);
+    if (idn && !byIdNumber.has(idn)) byIdNumber.set(idn, driver);
+    const full = normName(`${driver.firstName || ''} ${driver.surname || ''}`);
+    if (full && !byName.has(full)) byName.set(full, driver);
+    const first = normName(driver.firstName);
+    if (first && !byName.has(first)) byName.set(first, driver);
+    const fk = normKey(driver.fleetNumber);
+    if (fk && !byFleet.has(fk)) byFleet.set(fk, driver);
   }
+
+  driversCache = { byIdNumber, byName, byFleet, byId, list };
+  driversCachedAt = Date.now();
+  return driversCache;
 }
 
-// ── Name tokens: every chunk of the device name, suffix-stripped ─────────
-// "LSA11 - KXH512MP" → ["LSA11", "KXH512MP"]
-// "RH39 (RAPID) - JFP870FS" → ["RH39", "JFP870FS"] (RAPID/REMCO stripped
-// so the Geotab label still matches the registry fleet number)
-function nameTokens(...values) {
-  const out = [];
-  const seen = new Set();
-  for (const value of values) {
-    const raw = String(value || '').trim();
-    if (!raw) continue;
-    for (const part of raw.split(/[^A-Za-z0-9]+/)) {
-      if (!part || part.length < 4) continue;
-      const variants = new Set([part, part.replace(/RAPID/i, ''), part.replace(/REMCO/i, '')]);
-      for (const variant of variants) {
-        const token = variant.trim();
-        if (!token || token.length < 4) continue;
-        const key = token.toUpperCase();
-        if (seen.has(key)) continue;
-        seen.add(key);
-        out.push(token);
-      }
-    }
-  }
-  return out;
-}
-
-/**
- * Resolve one row (incident or closed alert group) to its vehicle cost
- * centre, driver identity and driver cost centre.
- *
- * @param {object} row  { incident_id?, alert_id?, alert_group_key?, device_id?,
- *                        device_name?, fleet_number?, driver_name?, id_number?,
- *                        cost_center_id? }
- */
-async function resolveRow(row, ctx) {
+function resolveRow(row, ctx) {
   const registry = ctx.registry;
   const drivers = ctx.drivers;
+  const candidates = deviceCandidates(row);
 
-  const storedFleet = normKey(row.fleet_number);
-  const tokens = nameTokens(row.device_name, row.fleet_number, row.device_id);
-
-  // 1) vehicle via REGISTRATION (the plate) — the physical truth. The fleet
-  //    label in an alert name is often a Geotab label ("LSA11") while the
-  //    registry calls the same truck "LSA/CB26", so the plate is the only
-  //    reliable join key. It also outranks a fleet label that points at a
-  //    DIFFERENT truck (stale driver_scoring rows).
   let vehicle = null;
-  for (const token of tokens) {
-    const hit = registry.byRegistration.get(normKey(token));
+  for (const key of candidates) {
+    const hit = registry.byAlias.get(key);
     if (hit) { vehicle = hit; break; }
   }
 
-  // 2) vehicle via fleet number
-  if (!vehicle && storedFleet) {
-    vehicle = registry.byFleet.get(storedFleet) || null;
-  }
-
-  // 3) vehicle via fleet label variants (RH39 (RAPID) → RH39)
+  let scoring = null;
   if (!vehicle) {
-    for (const token of tokens) {
-      const hit = registry.byFleet.get(normKey(token));
-      if (hit) { vehicle = hit; break; }
-    }
-  }
-
-  // 4) scoring mirror by fleet (a fleet registered for a cost centre)
-  let scoring = storedFleet ? registry.scoringByFleet.get(storedFleet) || null : null;
-  if (!scoring) {
-    for (const token of tokens) {
-      const hit = registry.scoringByFleet.get(normKey(token));
+    for (const key of candidates) {
+      const hit = registry.scoringByFleet.get(key);
       if (hit) { scoring = hit; break; }
     }
   }
 
-  // ── driver identity ───────────────────────────────────────────────────
   let driver = null;
   let driverSource = null;
   const idNumber = normKey(row.id_number);
@@ -223,12 +333,25 @@ async function resolveRow(row, ctx) {
     driver = drivers.byIdNumber.get(idNumber);
     driverSource = 'id_number';
   }
+  if (!driver && vehicle && vehicle.driverId && drivers.byId.has(vehicle.driverId)) {
+    driver = drivers.byId.get(vehicle.driverId);
+    driverSource = 'vehicle';
+  }
   if (!driver) {
     const rawName = String(row.driver_name || '').trim();
     const nameKey = normName(rawName);
     if (nameKey && drivers.byName.has(nameKey)) {
       driver = drivers.byName.get(nameKey);
       driverSource = 'name';
+    }
+  }
+  if (!driver) {
+    for (const key of candidates) {
+      if (drivers.byFleet.has(key)) {
+        driver = drivers.byFleet.get(key);
+        driverSource = 'fleet';
+        break;
+      }
     }
   }
   if (!driver && scoring && scoring.driver) {
@@ -247,20 +370,27 @@ async function resolveRow(row, ctx) {
     ? [driver.firstName, driver.surname].filter(Boolean).join(' ').trim() || null
     : (scoring && scoring.driver) || (row.driver_name ? String(row.driver_name).trim() : null) || null;
 
-  // ── cost centres ─────────────────────────────────────────────────────
   const storedCc = row.cost_center_id == null ? null : Number(row.cost_center_id);
-  const vehicleCc = vehicle && vehicle.ccId != null ? vehicle.ccId : null;
+  let vehicleCc = vehicle && vehicle.ccId != null ? vehicle.ccId : null;
+
+  if (vehicleCc == null && vehicle) {
+    for (const value of [vehicle.ccText, vehicle.fleet]) {
+      const key = normText(value);
+      const fromText = key ? registry.ccByText?.get(key) : null;
+      if (fromText != null) { vehicleCc = fromText; break; }
+    }
+  }
+
   const scoringCc = scoring && scoring.ccId != null ? scoring.ccId : null;
   const driverCc = driver && driver.ccId != null ? driver.ccId : null;
 
-  let ccId = storedCc;
-  let ccSource = ccId != null ? 'incident' : null;
-  if (ccId == null && vehicleCc != null) { ccId = vehicleCc; ccSource = 'vehicle'; }
+  let ccId = vehicleCc;
+  let ccSource = ccId != null ? 'vehicle' : null;
   if (ccId == null && scoringCc != null) { ccId = scoringCc; ccSource = 'fleet_scoring'; }
   if (ccId == null && driverCc != null) { ccId = driverCc; ccSource = 'driver'; }
+  if (ccId == null && storedCc != null) { ccId = storedCc; ccSource = 'incident'; }
 
-  // The vehicle's cost centre is reported separately so the frontend can
-  // match on EITHER the vehicle's or the driver's cost centre.
+  const cc = ccId == null ? null : registry.ccById?.get(ccId) || null;
   const vehicleCcFinal = vehicleCc != null ? vehicleCc : (ccSource === 'vehicle' ? ccId : null);
   const driverCcFinal = driverCc != null ? driverCc : (ccSource === 'driver' ? ccId : null);
 
@@ -268,6 +398,7 @@ async function resolveRow(row, ctx) {
     vehicle_cc_id: vehicleCcFinal,
     driver_cc_id: driverCcFinal,
     cc_id: ccId,
+    cc_name: cc?.name || (ccId == null ? null : `CC ${ccId}`),
     cc_source: ccSource,
     vehicle_fleet: vehicle ? vehicle.fleet : (scoring ? scoring.fleet : row.fleet_number || null),
     vehicle_registration: vehicle ? vehicle.registration : (scoring ? scoring.registration : null),
@@ -275,6 +406,7 @@ async function resolveRow(row, ctx) {
     driver_name: driverName,
     driver_source: driverSource,
     driver_fleet: driver && driver.fleetNumber ? driver.fleetNumber : null,
+    mapping_error: ccId == null ? 'no_cost_centre' : null,
   };
 }
 
@@ -285,11 +417,7 @@ async function createContext() {
 
 async function resolveRows(rows) {
   const ctx = await createContext();
-  const out = [];
-  for (const row of rows || []) {
-    out.push(await resolveRow(row, ctx));
-  }
-  return out;
+  return (rows || []).map((row) => resolveRow(row, ctx));
 }
 
 function invalidateCaches() {
@@ -306,6 +434,7 @@ module.exports = {
   loadRegistry,
   loadSupabaseDrivers,
   nameTokens,
+  fleetCode,
   normKey,
   normName,
   invalidateCaches,

@@ -16,6 +16,7 @@ const ZONE_APPROACHING_CODE = 'zone-approaching';
 const ZONE_STOP_IMMEDIATE_CODE = 'aKW3NJEDtS0OpMwwVlTHWJQ';
 const ZONE_STOP_1MIN_HIGH_CODE = 'aCOAc4GcoSkKgsIS9Qnb7mA';
 const ZONE_STOP_1MIN_NO_CODE = 'aUg2ERYlb3UChMJWTat0fKw';
+const SIGNAL_LOSS_ENTRY_CODE = 'aahnxDzyHj0qJPRlzy63Q2w';
 
 // Geotab definitions that must never create a board alert. Their events may
 // still be archived only when listed in GEOTAB_ARCHIVE_ONLY_SPEEDING_CODES.
@@ -58,6 +59,7 @@ const POLLER_OWNED_SIGNAL_CODES = new Set([
   ZONE_STOP_IMMEDIATE_CODE,
   ZONE_STOP_1MIN_HIGH_CODE,
   ZONE_STOP_1MIN_NO_CODE,
+  SIGNAL_LOSS_ENTRY_CODE,
 ].map((c) => c.toLowerCase()));
 
 // Geotab feeding these two codes is archived for comparison, never grouped.
@@ -92,6 +94,29 @@ function isPollerOwnedAlert(def) {
   if (POLLER_OWNED_ALARM_NAMES.has(String(def.name || '').trim().toLowerCase())) return true;
   if (POLLER_OWNED_SIGNAL_CODES.has(String(def.signalCode || def.signal_code || '').trim().toLowerCase())) return true;
   return false;
+}
+
+const SELF_MONITORING_ZONE_NAMES = new Set([
+  'approaching zone',
+  'entering high risk area',
+  'entering no-go zone',
+  'no-go zone entry',
+  'entering no stopping zone',
+  'entering signal loss area',
+]);
+
+const SELF_MONITORING_ZONE_CODES = new Set([
+  ZONE_APPROACHING_CODE,
+  ZONE_ENTRY_CODE,
+  NOGO_ENTRY_CODE,
+  NO_STOP_ENTRY_CODE,
+  SIGNAL_LOSS_ENTRY_CODE,
+].map((code) => String(code).toLowerCase()));
+
+function isSelfMonitoringZoneAlert(input = {}) {
+  const signalCode = String(input.signalCode || input.signal_code || input || '').trim().toLowerCase();
+  const alarmType = String(input.alarmType || input.alarm_type || input.name || '').trim().toLowerCase();
+  return SELF_MONITORING_ZONE_CODES.has(signalCode) || SELF_MONITORING_ZONE_NAMES.has(alarmType);
 }
 
 function isGeotabSpeedingDefinition(def) {
@@ -133,6 +158,7 @@ module.exports = {
   ZONE_STOP_IMMEDIATE_CODE,
   ZONE_STOP_1MIN_HIGH_CODE,
   ZONE_STOP_1MIN_NO_CODE,
+  SIGNAL_LOSS_ENTRY_CODE,
   POLLER_OWNED_ALARM_NAMES,
   POLLER_OWNED_SIGNAL_CODES,
   GEOTAB_ARCHIVE_ONLY_SPEEDING_CODES,
@@ -141,6 +167,9 @@ module.exports = {
   POLLER_SPEEDING_CODES,
   FATIGUE_THRESHOLDS,
   isPollerOwnedAlert,
+  isSelfMonitoringZoneAlert,
+  SELF_MONITORING_ZONE_NAMES,
+  SELF_MONITORING_ZONE_CODES,
   isGeotabSpeedingDefinition,
   geotabSpeedingPolicy,
   isPollerSpeedingCode,

@@ -65,6 +65,67 @@ async function getAllClosedGroups() {
   return result.rows;
 }
 
+// Closed alert groups for a SAST calendar range. One query returns the
+// report rows plus linked NCR/cost-centre metadata; no per-row subqueries.
+async function getClosedGroupsInRange({ from, to } = {}) {
+  const fromDate = String(from || '').slice(0, 10);
+  const toDate = String(to || '').slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(fromDate) || !/^\d{4}-\d{2}-\d{2}$/.test(toDate)) {
+    return [];
+  }
+  const result = await query(
+    `WITH closed AS (
+       SELECT g.id, g.group_key, g.device_id, g.device_name, g.alarm_type,
+              g.severity, g.count, g.source_type, g.last_alert_ts,
+              g.fleet_number, g.resolved_at, g.updated_at,
+              to_char(COALESCE(g.resolved_at, g.updated_at, g.last_alert_ts)
+                      AT TIME ZONE 'Africa/Johannesburg', 'YYYY-MM-DD"T"HH24:MI:SS') AS closed_sast,
+              to_char(COALESCE(g.resolved_at, g.updated_at, g.last_alert_ts)
+                      AT TIME ZONE 'Africa/Johannesburg', 'YYYY-MM-DD') AS closed_date
+         FROM alert_groups g
+        WHERE g.resolved = TRUE
+          AND g.false_alert = FALSE
+          AND COALESCE(g.resolved_at, g.updated_at, g.last_alert_ts) >= $1::date
+          AND COALESCE(g.resolved_at, g.updated_at, g.last_alert_ts) < ($2::date + INTERVAL '1 day')
+     ),
+     alert_counts AS (
+       SELECT alert_group_id, COUNT(*)::int AS member_count
+         FROM alerts
+        WHERE alert_group_id IN (SELECT id FROM closed)
+        GROUP BY alert_group_id
+     ),
+     incident_meta AS (
+       SELECT i.alert_group_key, MAX(i.cost_center_id) AS incident_cc_id
+         FROM incidents i
+        WHERE i.alert_group_key IN (SELECT group_key FROM closed)
+        GROUP BY i.alert_group_key
+     ),
+     ncr_meta AS (
+       SELECT i.alert_group_key,
+              COUNT(nf.id)::int AS ncr_count,
+              string_agg(nf.ncr_no, ', ' ORDER BY nf.created_at DESC) AS ncr_nos,
+              (array_agg(i.id::text ORDER BY nf.created_at DESC))[1] AS ncr_incident_id
+         FROM incidents i
+         JOIN ncr_forms nf ON nf.incident_id = i.id
+        WHERE i.alert_group_key IN (SELECT group_key FROM closed)
+        GROUP BY i.alert_group_key
+     )
+     SELECT c.*,
+            im.incident_cc_id,
+            GREATEST(c.count, COALESCE(ac.member_count, 0))::int AS occurrence_count,
+            COALESCE(nm.ncr_count, 0)::int AS ncr_count,
+            nm.ncr_nos,
+            nm.ncr_incident_id
+       FROM closed c
+       LEFT JOIN alert_counts ac ON ac.alert_group_id = c.id
+       LEFT JOIN incident_meta im ON im.alert_group_key = c.group_key
+       LEFT JOIN ncr_meta nm ON nm.alert_group_key = c.group_key
+      ORDER BY COALESCE(c.resolved_at, c.updated_at, c.last_alert_ts) DESC, c.id DESC`,
+    [fromDate, toDate]
+  );
+  return result.rows;
+}
+
 // Every stored NCR document (for the document lists + driver drill-down).
 async function getAllNcrForms() {
   const result = await query(
@@ -133,6 +194,7 @@ async function deleteIncidentDocument(id) {
 module.exports = {
   getAllIncidents,
   getAllClosedGroups,
+  getClosedGroupsInRange,
   getAllNcrForms,
   getCostCenters,
   getIncidentDocuments,

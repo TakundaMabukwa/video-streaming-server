@@ -13,6 +13,8 @@ const express = require('express');
 const db = require('../db');
 const reportStats = require('../db/reportStats');
 const linkage = require('../services/reportLinkage');
+const closedAlertReport = require('../services/closedAlertReport');
+const reportFormService = require('../services/reportFormService');
 const storage = require('../helpers/storage');
 
 const router = express.Router();
@@ -54,6 +56,124 @@ function asInt(value) {
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
 }
+
+// ── GET /eps/reports/closed-alerts/snapshot ─────────────────────────────
+// Closed-alerts-only report. Scoped by SAST calendar dates, summarized on the
+// server and returned as aggregates + one page.
+function reportParams(req) {
+  const costCenterIds = req.query.costCentreIds ?? req.query.costCenterIds;
+  return {
+    from: req.query.from,
+    to: req.query.to,
+    page: req.query.page,
+    pageSize: req.query.pageSize,
+    q: req.query.q,
+    alertType: req.query.alertType,
+    severity: req.query.severity,
+    onlyWithNcr: req.query.onlyWithNcr,
+    costCenterIds: costCenterIds == null
+      ? null
+      : String(costCenterIds).split(',').map((v) => Number(v.trim())).filter((v) => Number.isFinite(v) && v > 0),
+  };
+}
+
+function scopeReportCostCenters(req, requested) {
+  const allowed = Array.isArray(req.userCostCenterIds)
+    ? req.userCostCenterIds.map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0)
+    : [];
+  const isAdmin = String(req.userRole || '').toLowerCase() === 'admin';
+  if (allowed.length === 0) return isAdmin ? requested : [];
+  if (requested == null) return allowed;
+  const allowedSet = new Set(allowed);
+  return requested.filter((id) => allowedSet.has(id));
+}
+
+function scopedReportParams(req) {
+  const params = reportParams(req);
+  params.costCenterIds = scopeReportCostCenters(req, params.costCenterIds);
+  return params;
+}
+
+router.get('/closed-alerts/snapshot', async (req, res) => {
+  try {
+    res.json(await closedAlertReport.getSnapshot(scopedReportParams(req)));
+  } catch (err) {
+    console.error('[Reports] closed-alert snapshot error:', err.message);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── GET /eps/reports/closed-alerts/export ────────────────────────────────
+// Every filtered row for the selected range, used by the Excel exporter.
+router.get('/closed-alerts/export', async (req, res) => {
+  try {
+    const { range, rows } = await closedAlertReport.getExportRows(scopedReportParams(req));
+    res.json({
+      success: true,
+      generated_at: new Date().toISOString(),
+      range,
+      total: rows.length,
+      rows,
+    });
+  } catch (err) {
+    console.error('[Reports] closed-alert export error:', err.message);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── POST /eps/reports/forms ──────────────────────────────────────────────
+// Store the exact submitted form snapshot. No PDF, no lookups, no recalc.
+router.post('/forms', async (req, res) => {
+  try {
+    const saved = await reportFormService.saveReportForm(req.body || {}, req.user || null);
+    res.json({ success: true, ...saved });
+  } catch (err) {
+    console.error('[Reports] save form error:', err.message);
+    res.status(err.status || 500).json({ success: false, message: err.message });
+  }
+});
+
+// ── GET /eps/reports/forms ───────────────────────────────────────────────
+router.get('/forms', async (req, res) => {
+  try {
+    const requested = req.query.costCentreIds ?? req.query.costCenterIds;
+    const costCenterIds = scopeReportCostCenters(
+      req,
+      requested == null
+        ? null
+        : String(requested).split(',').map((v) => Number(v.trim())).filter((v) => Number.isFinite(v) && v > 0)
+    );
+    const rows = await reportFormService.listReportForms({
+      from: req.query.from,
+      to: req.query.to,
+      costCenterIds,
+      driverId: req.query.driverId,
+      reportType: req.query.reportType,
+      q: req.query.q,
+      limit: req.query.limit,
+    });
+    res.json({ success: true, count: rows.length, forms: rows });
+  } catch (err) {
+    console.error('[Reports] list forms error:', err.message);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── GET /eps/reports/forms/:id ───────────────────────────────────────────
+router.get('/forms/:id', async (req, res) => {
+  try {
+    const form = await reportFormService.getReportForm(String(req.params.id || '').trim());
+    if (!form) return res.status(404).json({ success: false, message: 'Report form not found' });
+    const allowed = scopeReportCostCenters(req, null);
+    if (Array.isArray(allowed) && form.cost_center_id != null && !allowed.includes(Number(form.cost_center_id))) {
+      return res.status(403).json({ success: false, message: 'Report form is outside your cost centres' });
+    }
+    res.json({ success: true, form });
+  } catch (err) {
+    console.error('[Reports] get form error:', err.message);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
 
 // ── GET /eps/reports/incidents ───────────────────────────────────────────
 // EVERY incident, resolved for vehicle + driver cost centre. The frontend
@@ -697,6 +817,7 @@ router.post('/incidents/:id/close', async (req, res) => {
       }
     }
 
+    closedAlertReport.invalidate();
     res.json({ success: true, incident, alert_group_resolved: alertGroupResolved });
   } catch (err) {
     console.error('[Reports] incident close error:', err.message);
@@ -744,6 +865,7 @@ router.patch('/incidents/:id', async (req, res) => {
       ).catch((err) => console.error('[Reports] NCR form mirror failed:', err.message));
     }
 
+    closedAlertReport.invalidate();
     res.json({ success: true, incident });
   } catch (err) {
     console.error('[Reports] incident update error:', err.message);

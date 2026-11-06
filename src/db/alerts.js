@@ -1,5 +1,11 @@
 const { query } = require('./pool');
 
+function dbTime(value) {
+  if (!value) return null;
+  const d = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
+
 async function upsertAlert(alert) {
   const { id, deviceId, deviceName, alarmType, alarmTs, alarmTsEnd, lat, lon, alarmText, serialNo, fenceId, alarmExtension, sourceType = 'video', speed, severity, fleetNumber, distanceKm, durationSeconds } = alert;
   const result = await query(
@@ -24,7 +30,7 @@ async function upsertAlert(alert) {
        duration_seconds = COALESCE(EXCLUDED.duration_seconds, alerts.duration_seconds),
        updated_at = NOW()
      RETURNING id`,
-    [id, deviceId, deviceName, alarmType, alarmTs || null, alarmTsEnd || null, lat || null, lon || null, alarmText || null, serialNo || null, fenceId || null, alarmExtension || null, sourceType, speed ?? null, severity || null, fleetNumber || null, distanceKm ?? null, durationSeconds ?? null]
+    [id, deviceId, deviceName, alarmType, dbTime(alarmTs), dbTime(alarmTsEnd), lat || null, lon || null, alarmText || null, serialNo || null, fenceId || null, alarmExtension || null, sourceType, speed ?? null, severity || null, fleetNumber || null, distanceKm ?? null, durationSeconds ?? null]
   );
   return result.rows[0];
 }
@@ -32,17 +38,18 @@ async function upsertAlert(alert) {
 async function batchUpsertAlerts(alerts) {
   if (alerts.length === 0) return;
   const values = alerts.map((_, i) =>
-    `(${i * 17 + 1}, ${i * 17 + 2}, ${i * 17 + 3}, ${i * 17 + 4}, ${i * 17 + 5}, ${i * 17 + 6}, ${i * 17 + 7}, ${i * 17 + 8}, ${i * 17 + 9}, ${i * 17 + 10}, ${i * 17 + 11}, ${i * 17 + 12}, ${i * 17 + 13}, ${i * 17 + 14}, ${i * 17 + 15}, ${i * 17 + 16}, ${i * 17 + 17})`
+    `($${i * 17 + 1}, $${i * 17 + 2}, $${i * 17 + 3}, $${i * 17 + 4}, $${i * 17 + 5}, $${i * 17 + 6}, $${i * 17 + 7}, $${i * 17 + 8}, $${i * 17 + 9}, $${i * 17 + 10}, $${i * 17 + 11}, $${i * 17 + 12}, $${i * 17 + 13}, $${i * 17 + 14}, $${i * 17 + 15}, $${i * 17 + 16}, $${i * 17 + 17})`
   ).join(',');
   const params = alerts.flatMap(a => [
     a.id, a.deviceId, a.deviceName || null, a.alarmType,
-    a.alarmTs || null, a.alarmTsEnd || null,
+    dbTime(a.alarmTs), dbTime(a.alarmTsEnd),
     a.lat || null, a.lon || null,
     a.alarmText || null, a.serialNo || null,
     a.fenceId || null, a.alarmExtension || null,
     a.speed ?? null, a.severity || null, a.fleetNumber || null,
     a.distanceKm ?? null, a.durationSeconds ?? null,
   ]);
+  try {
   await query(
     `INSERT INTO alerts (id, device_id, device_name, alarm_type, alarm_ts, alarm_ts_end, lat, lon, alarm_text, serial_no, fence_id, alarm_extension, speed, severity, fleet_number, distance_km, duration_seconds)
      VALUES ${values}
@@ -65,6 +72,10 @@ async function batchUpsertAlerts(alerts) {
        updated_at = NOW()`,
     params
   );
+  } catch (err) {
+    console.error('[ALERTS] batch upsert failed:', err.message);
+    throw err;
+  }
 }
 
 // Member linkage choke point: every detection (video sync, Geotab feed,

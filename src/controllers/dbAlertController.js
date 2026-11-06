@@ -1296,9 +1296,9 @@ async function resolveAlert(req, res) {
       // device_id / alarm_type. Blank stays blank. The deduction lookup may
       // still use the group's fleet, but that is never stored over form data.
       const fleetNumber = String(incidentData.fleet_number || incidentData.fleetNumber || '').trim();
-      const costCenterId = fleetNumber
-        ? await findVehicleCostCenterId(fleetNumber).catch(() => null)
-        : null;
+      const submittedCc = incidentData.cost_center_id ?? incidentData.costCenterId;
+      const numericCc = submittedCc == null ? null : Number(submittedCc);
+      const costCenterId = Number.isFinite(numericCc) && numericCc > 0 ? numericCc : null;
 
       incident = await db.upsertIncidentFromAlert({
         alertId: group.last_alert_id || String(groupId),
@@ -1638,7 +1638,7 @@ async function resolveAlertsBulk(req, res) {
            updated_at = NOW()
        WHERE resolved = FALSE AND id IN (${pIds})
        RETURNING id, group_key, count, device_id, alarm_type`,
-      [...uniqueIds, isFalse, userId || null, now, notes || null]
+      [...uniqueIds, isFalse, actor, now, notes || null]
     );
 
     if (notesById && typeof notesById === 'object') {

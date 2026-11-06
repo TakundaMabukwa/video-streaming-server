@@ -10,6 +10,7 @@ const config = require('../config/config');
 const { eventFromRow } = require('./alertEvents');
 const { canSeeFleet } = require('./visibility');
 const livePresence = require('./presence');
+const zoneNotifications = require('../services/zoneNotifications');
 const { resolveFleetNumber, normalizeFleetString } = require('../services/costCenterLookup');
 
 const CHANNEL = 'video_alert_broadcast_channel';
@@ -225,6 +226,15 @@ async function sendPresenceSnapshot(client) {
   write(client, { type: 'PRESENCE_SNAPSHOT', fleets, alerts });
 }
 
+async function sendZoneNotificationSnapshot(client) {
+  const rows = zoneNotifications.snapshot();
+  const notifications = [];
+  for (const row of rows) {
+    if (await visible(client.ccIds, row.fleet_number)) notifications.push(row);
+  }
+  write(client, { type: 'ZONE_NOTIFICATION_SNAPSHOT', notifications, at: Date.now() });
+}
+
 async function addClient({ res, identity, ccIds, sinceRevision }) {
   const client = {
     res,
@@ -274,6 +284,7 @@ async function addClient({ res, identity, ccIds, sinceRevision }) {
   await sendTelemetrySnapshot(client);
   await sendCameraSnapshot(client);
   await sendPresenceSnapshot(client);
+  await sendZoneNotificationSnapshot(client);
 
   client.replaying = false;
   const buffered = client.buffer;
@@ -404,6 +415,8 @@ async function startListener() {
 function start() {
   if (heartbeatTimer || telemetryTimer || presenceTimer) return;
   stopping = false;
+  zoneNotifications.setBroadcast(broadcast);
+  zoneNotifications.start();
   startListener().catch(() => {});
   heartbeatTimer = setInterval(() => {
     for (const client of Array.from(clients)) {
@@ -424,6 +437,7 @@ function start() {
 
 async function stop() {
   stopping = true;
+  zoneNotifications.stop();
   clearTimeout(reconnectTimer);
   reconnectTimer = null;
   if (heartbeatTimer) clearInterval(heartbeatTimer);

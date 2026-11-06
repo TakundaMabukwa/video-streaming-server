@@ -22,6 +22,7 @@ function reset() {
 // Pure tests first.
 run('test/policy.test.js');
 run('test-fatigue-plan.js');
+run('test/zone-notifications.test.js');
 
 // Integration tests each start from a clean, seeded schema.
 reset();

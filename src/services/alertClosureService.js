@@ -2,7 +2,6 @@
 // the background job runner, so a queued NCR closure behaves exactly like a
 // manual one. The logic was moved verbatim out of dbAlertController.resolveAlert.
 const db = require('../db');
-const { findVehicleCostCenterId } = require('./costCenterLookup');
 const { applyNcrDeduction } = require('./driverScoringService');
 
 let wsBroadcast = null;
@@ -105,9 +104,9 @@ async function closeAlertGroup(opts = {}) {
     // alarm_type. Blank stays blank; the deduction lookup below may still use
     // the group's fleet, but that is never STORED over what was entered.
     const fleetNumber = String(incidentData.fleet_number || incidentData.fleetNumber || '').trim();
-    const costCenterId = fleetNumber
-      ? await findVehicleCostCenterId(fleetNumber).catch(() => null)
-      : null;
+    const submittedCc = incidentData.cost_center_id ?? incidentData.costCenterId;
+    const numericCc = submittedCc == null ? null : Number(submittedCc);
+    const costCenterId = Number.isFinite(numericCc) && numericCc > 0 ? numericCc : null;
 
     if (incidentId) {
       // The NCR flow created the register row up-front (fast save) with the

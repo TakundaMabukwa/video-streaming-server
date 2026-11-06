@@ -3,7 +3,8 @@ const https = require('https');
 const { fetchVehiclesFromSupabase } = require('../helpers/supabaseClient');
 const { getTelematicsNameMap } = require('../db/alert_definitions');
 const { matchAlertDefinition } = require('../helpers/alertMatching');
-const { isPollerOwnedAlert, SPEED_85_CODE, SPEED_90_CODE, geotabSpeedingPolicy } = require('../helpers/pollerOwnedAlerts');
+const { isPollerOwnedAlert, isSelfMonitoringZoneAlert, SPEED_85_CODE, SPEED_90_CODE, geotabSpeedingPolicy } = require('../helpers/pollerOwnedAlerts');
+const zoneNotifications = require('./zoneNotifications');
 const overrides = require('./vehicleAlertOverrides');
 const { processAlertDeduction } = require('./driverScoringService');
 const { escalateSeverity } = require('../helpers/transform');
@@ -969,6 +970,29 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
       // DeviceStatusInfo poller owns speeding. Other poller-owned types are
       // archived only as well.
       if (archiveOnlySpeeding) continue;
+
+      if (isSelfMonitoringZoneAlert({ signalCode: matchedDef.signalCode || eventCode, alarmType: matchedDef.name })) {
+        const isSignalLoss = /signal loss/i.test(String(matchedDef.name || eventName || ''));
+        if (!isSignalLoss && zoneNameFromEvent) {
+          zoneNotifications.removeApproach(identity?.fleetNumber || fleetNumber || canonicalId, zoneNameFromEvent);
+        }
+        zoneNotifications.upsert({
+          fleet_number: identity?.fleetNumber || fleetNumber || canonicalId,
+          device_id: canonicalId,
+          plate: licensePlate || null,
+          cost_center_id: eventCC || null,
+          kind: isSignalLoss ? 'signal_loss' : 'entering',
+          alert_type: matchedDef.name,
+          zone_id: zoneNameFromEvent || null,
+          zone_name: zoneNameFromEvent || null,
+          severity: String(matchedDef.severity || 'MEDIUM').toLowerCase(),
+          lat: evtLat ?? null,
+          lon: evtLon ?? null,
+          speed: evtSpeed ?? null,
+        });
+        continue;
+      }
+
       if (isPollerOwnedAlert(matchedDef)) {
         continue;
       }
@@ -1370,6 +1394,23 @@ async function createZoneEntryAlert({ deviceId, fleetNumber, licensePlate, lat, 
     const matchedDef = (nameMap.nameMap || {})[defName.toLowerCase()];
     if (!matchedDef) return null; // not in this device's CC set — would be filtered from display anyway
 
+    zoneNotifications.removeApproach(fleetNumber || deviceId, zone.id);
+    zoneNotifications.upsert({
+      fleet_number: fleetNumber || deviceId,
+      device_id: deviceId,
+      plate: licensePlate || null,
+      cost_center_id: eventCC,
+      kind: 'entering',
+      alert_type: matchedDef.name,
+      zone_id: zone.id,
+      zone_name: zone.name,
+      severity: String(matchedDef.severity || 'MEDIUM').toLowerCase(),
+      lat: lat ?? null,
+      lon: lon ?? null,
+      speed: speed ?? null,
+    });
+    return { notification_only: true };
+
     const alertId = `zone-${deviceId}-${zone.id}-${Date.now()}`;
     const deviceName = fleetNumber ? `${fleetNumber}${licensePlate ? ' - ' + licensePlate : ''}` : deviceId;
     const alarmText = `${defName} in zone ${zone.name}`;
@@ -1636,6 +1677,7 @@ async function checkZoneBreaches(deviceId, lat, lon, speed, fleetNumber, license
             [existing.id]
           );
         }
+        zoneNotifications.removeEntry(fleetNumber || deviceId, zone.id);
       }
     }
   } catch (error) {

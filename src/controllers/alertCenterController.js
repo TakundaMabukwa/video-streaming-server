@@ -26,7 +26,14 @@ async function getAlertGroupDetail(req, res) {
     if (!id) return res.status(400).json({ success: false, message: 'Numeric alert group id required' });
     const row = await db.getAlertGroupById(id);
     if (!row) return res.status(404).json({ success: false, message: `Alert group ${id} not found` });
-    return res.json({ success: true, alert: groupAlert(row), source: 'eps-db' });
+    const latestAlert = row.last_alert_id ? await db.getAlertOccurrence(row.last_alert_id) : null;
+    const alert = groupAlert({
+      ...row,
+      source_device_id: row.source_device_id || latestAlert?.source_device_id || latestAlert?.device_id || null,
+      geotab_device_id: row.geotab_device_id || latestAlert?.geotab_device_id || null,
+      mettax_device_id: row.mettax_device_id || latestAlert?.mettax_device_id || null,
+    });
+    return res.json({ success: true, alert, source: 'eps-db' });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
@@ -36,11 +43,20 @@ async function getOpenAlertsByFleet(req, res) {
   try {
     const fleet = String(req.query?.fleet_number || req.query?.fleet || '').trim();
     if (!fleet) return res.status(400).json({ success: false, message: 'fleet_number is required' });
-    const [rows, closedSinceMidnight] = await Promise.all([
+    const [rows, closedSinceMidnight, closedByType] = await Promise.all([
       db.getOpenAlertGroupsByFleet(fleet),
       db.getClosedAlertGroupCountSinceMidnight(fleet),
+      db.getClosedAlertGroupCountsByTypeSinceMidnight(fleet),
     ]);
-    const alerts = rows.map(groupAlert);
+    const alerts = rows.map((row) => ({
+      ...groupAlert({
+        ...row,
+        source_device_id: row.source_device_id || row.latest_source_device_id || row.latest_alert_device_id || null,
+        geotab_device_id: row.geotab_device_id || row.latest_geotab_device_id || null,
+        mettax_device_id: row.mettax_device_id || row.latest_mettax_device_id || null,
+      }),
+      closed_today: closedByType.get(String(row.alarm_type || '').trim().toLowerCase()) || 0,
+    }));
     return res.json({
       success: true,
       fleet_number: fleet.toUpperCase(),

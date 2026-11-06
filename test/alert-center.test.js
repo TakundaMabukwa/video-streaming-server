@@ -63,6 +63,16 @@ function call(handler, req) {
   );
   const secondId = Number(second.rows[0].id);
 
+  console.log('[batch alert timestamps]');
+  await db.batchUpsertAlerts([{
+    id: 'batch-ts-test', deviceId: 'EX55', deviceName: 'EX55 - LDR065MP', alarmType: 'Overtime Driving',
+    alarmTs: new Date('2026-11-04T19:17:25Z'), alarmTsEnd: new Date('2026-11-04T19:17:31Z'),
+    lat: -26.1, lon: 28.1, speed: 10, severity: 'low', fleetNumber: 'EX55',
+  }]);
+  const batchRow = (await db.query("SELECT alarm_ts, alarm_ts_end FROM alerts WHERE id='batch-ts-test'")).rows[0];
+  check('batch alarm_ts stored as timestamp', !!batchRow && new Date(batchRow.alarm_ts).toISOString() === '2026-11-04T19:17:25.000Z', JSON.stringify(batchRow));
+  check('batch alarm_ts_end stored as timestamp', !!batchRow && new Date(batchRow.alarm_ts_end).toISOString() === '2026-11-04T19:17:31.000Z', JSON.stringify(batchRow));
+
   console.log('[group detail]');
   const detail = await call(controller.getAlertGroupDetail, { params: { id: String(groupId) } });
   check('detail 200', detail.status === 200, detail);
@@ -128,6 +138,8 @@ function call(handler, req) {
   const after = await call(controller.getOpenAlertsByFleet, { query: { fleet_number: 'EX55' } });
   check('closed groups disappear from fleet open', after.body?.count === 0, after.body?.count);
   check('closed-since-midnight count returned', after.body?.closed_since_midnight === 2, after.body?.closed_since_midnight);
+  const byType = await db.getClosedAlertGroupCountsByTypeSinceMidnight('EX55');
+  check('per-type closed counts separate types', Number(byType.get('approaching zone') || 0) === 1 && Number(byType.get('driver fatigue 3h') || 0) === 1, JSON.stringify([...byType.entries()]));
 
   console.log(`alert-center: ${pass} passed, ${fail} failed`);
   await db.closePool();

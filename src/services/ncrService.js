@@ -2,7 +2,6 @@
 // jobs that finish the process (resolve + email). The save is deliberately
 // FAST — the user must never wait for a PDF, an email or a group closure.
 const db = require('../db');
-const { findVehicleCostCenterId } = require('./costCenterLookup');
 
 const ALERT_FORM_KEYS = [
   'ncrNo', 'driverId', 'driverName', 'secondDriverId', 'secondDriverName', 'contactNumber', 'idNumber', 'idDocumentType',
@@ -59,28 +58,25 @@ async function createNcrFromAlert(opts = {}) {
   const group = await db.getAlertGroupById(groupId);
   if (!group) return { ok: false, error: `Alert group ${groupId} not found` };
 
-  // Keep only the known document keys — the payload may carry extra context.
-  // Form values are stored VERBATIM: no fallback to group.fleet_number,
-  // group.device_id or group.alarm_type. What the operator saw and typed is
-  // what gets stored; a blank field stays blank.
-  const formData = {};
-  for (const key of ALERT_FORM_KEYS) {
-    if (form[key] !== undefined) formData[key] = form[key];
-  }
-  formData.savedAt = new Date().toISOString();
-  formData.alertType = formData.alertType || group.alarm_type || null;
-  formData.createdByEmail = actorEmail;
-  formData.createdById = actorId;
+  // Store the submitted form exactly. No whitelist, fallback, recalculation or
+  // metadata is injected into form_data. Metadata lives in its own column.
+  const formData = form && typeof form === 'object' && !Array.isArray(form)
+    ? JSON.parse(JSON.stringify(form))
+    : {};
 
   const fleetNumber = String(formData.vehicleFleetNumber || formData.fleetNumber || '').trim();
-  const costCenterId = await findVehicleCostCenterId(fleetNumber).catch(() => null);
-  // Always keep the vehicle's cost centre on the stored document too, not only
-  // on the incident row. When the id resolves, the authoritative name wins.
-  formData.costCenterId = costCenterId == null ? null : costCenterId;
-  if (costCenterId != null) {
-    const resolvedCostCenterName = await findCostCenterName(costCenterId).catch(() => null);
-    if (resolvedCostCenterName) formData.costCenterName = resolvedCostCenterName;
-  }
+  const submittedCostCenter = Number(formData.costCenterId);
+  const costCenterId = Number.isFinite(submittedCostCenter) && submittedCostCenter > 0 ? submittedCostCenter : null;
+  const metadata = {
+    savedAt: new Date().toISOString(),
+    alertType: group.alarm_type || null,
+    alertGroupId: groupId,
+    alertGroupKey: group.group_key || null,
+    alertId: group.last_alert_id || null,
+    createdByEmail: actorEmail,
+    createdById: actorId,
+    submittedCostCenterId: costCenterId,
+  };
 
   const now = new Date().toISOString();
   const incident = await db.upsertIncidentFromAlert({
@@ -113,11 +109,12 @@ async function createNcrFromAlert(opts = {}) {
   // of failing on the unique index.
   const inserted = await db.query(
     `INSERT INTO ncr_forms
-       (incident_id, ncr_no, alert_id, alert_group_id, alert_group_key, form_data, status,
+       (incident_id, ncr_no, alert_id, alert_group_id, alert_group_key, form_data, metadata, status,
         created_by, created_by_id, created_by_email)
-     VALUES ($1, $2, $3, $4, $5, $6::jsonb, 'SAVED', $7, $8, $9)
+     VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, 'SAVED', $8, $9, $10)
      ON CONFLICT (incident_id) DO UPDATE
        SET form_data = EXCLUDED.form_data,
+           metadata = EXCLUDED.metadata,
            ncr_no = COALESCE(EXCLUDED.ncr_no, ncr_forms.ncr_no),
            alert_id = EXCLUDED.alert_id,
            alert_group_id = EXCLUDED.alert_group_id,
@@ -135,6 +132,7 @@ async function createNcrFromAlert(opts = {}) {
       groupId,
       group.group_key || null,
       JSON.stringify(formData),
+      JSON.stringify(metadata),
       actorEmail,
       actorId,
       actorEmail,
@@ -241,6 +239,7 @@ async function getNcrForm(formId) {
     alert_id: form.alert_id,
     alert_group_id: form.alert_group_id,
     form_data: form.form_data || {},
+    metadata: form.metadata || {},
     document_path: form.document_path,
     document_status: form.document_status,
     status: form.status,

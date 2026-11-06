@@ -128,6 +128,13 @@ async function start() {
       console.error(`[LIVE] SSE hub failed to start: ${err.message}`);
     }
 
+    // Warm the reports registry in the background so the first report load
+    // does not pay the Supabase vehicles/cost-centres/drivers round-trips.
+    try {
+      const reportLinkage = require('./services/reportLinkage');
+      void Promise.all([reportLinkage.loadRegistry(), reportLinkage.loadSupabaseDrivers()]).catch(() => {});
+    } catch {}
+
     // Initialize driver scoring from vehiclesc + drivers
     try {
       const { initializeDriverScoring, startMidnightCron } = require('./services/driverScoringService');

@@ -591,7 +591,13 @@ async function getOpenAlertGroupsByFleet(fleetNumber) {
   const fleet = String(fleetNumber || '').trim();
   if (!fleet) return [];
   const result = await query(
-    `SELECT * FROM alert_groups g
+    `SELECT g.*,
+            a.device_id AS latest_alert_device_id,
+            a.source_device_id AS latest_source_device_id,
+            a.geotab_device_id AS latest_geotab_device_id,
+            a.mettax_device_id AS latest_mettax_device_id
+       FROM alert_groups g
+       LEFT JOIN alerts a ON a.id = g.last_alert_id
       WHERE UPPER(TRIM(g.fleet_number)) = UPPER(TRIM($1))
         AND g.resolved = FALSE AND g.false_alert = FALSE
         AND LOWER(COALESCE(g.status, '')) NOT IN ('resolved', 'closed')
@@ -617,6 +623,25 @@ async function getClosedAlertGroupCountSinceMidnight(fleetNumber) {
     [fleet]
   );
   return Number(result.rows[0]?.n || 0);
+}
+
+async function getClosedAlertGroupCountsByTypeSinceMidnight(fleetNumber) {
+  const fleet = String(fleetNumber || '').trim();
+  if (!fleet) return new Map();
+  const result = await query(
+    `SELECT lower(alarm_type) AS alarm_type, COUNT(*)::int AS n
+       FROM alert_groups
+      WHERE UPPER(TRIM(fleet_number)) = UPPER(TRIM($1))
+        AND resolved = TRUE
+        AND false_alert = FALSE
+        AND COALESCE(resolved_at, updated_at) >= (
+          date_trunc('day', NOW() AT TIME ZONE 'Africa/Johannesburg')
+          AT TIME ZONE 'Africa/Johannesburg'
+        )
+      GROUP BY lower(alarm_type)`,
+    [fleet]
+  );
+  return new Map(result.rows.map((row) => [String(row.alarm_type || '').trim().toLowerCase(), Number(row.n) || 0]));
 }
 
 async function resolveAlertGroupsWithNotes({ items, actor, now = new Date().toISOString() }) {
@@ -1202,6 +1227,7 @@ module.exports = {
   packAlerts,
   getOpenAlertGroupsByFleet,
   getClosedAlertGroupCountSinceMidnight,
+  getClosedAlertGroupCountsByTypeSinceMidnight,
   resolveAlertGroupsWithNotes,
   getAlertGroupById,
   getAlertGroupByKey,

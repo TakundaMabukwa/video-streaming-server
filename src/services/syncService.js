@@ -434,6 +434,7 @@ async function gateVideoRecordsByCostCenter(records) {
   const ccVideoMaps = {};
   const kept = [];
   let gatedOut = 0;
+  const gatedNames = new Map();
 
   await Promise.all([...byDevice.entries()].map(async ([did, recs]) => {
     let allowed = globalVideoMap;
@@ -447,12 +448,16 @@ async function gateVideoRecordsByCostCenter(records) {
     } catch { /* fall back to global map */ }
     for (const r of recs) {
       if (allowed[String(r.alarmType || '').toLowerCase()]) kept.push(r);
-      else gatedOut++;
+      else {
+        gatedOut++;
+        const name = String(r.alarmType || '(blank)');
+        gatedNames.set(name, (gatedNames.get(name) || 0) + 1);
+      }
     }
   }));
 
   if (gatedOut > 0) {
-    console.log(`[SYNC] Gated out ${gatedOut} video alert(s) not in device cost-center set`);
+    console.log(`[SYNC] Gated out ${gatedOut} video alert(s) not in device cost-center set: ${[...gatedNames.entries()].map(([name, n]) => `${name} x${n}`).join(', ')}`);
   }
   return kept;
 }
@@ -884,7 +889,7 @@ async function runSync() {
     console.log(`[SYNC] Done: ${result.newCount} new alerts, ${result.mediaCount} media files (${syncState.lastSyncDuration}ms)`);
   } catch (err) {
     syncState.lastError = err.message;
-    console.error(`[SYNC] Error: ${err.message}`);
+    console.error(`[SYNC] Error: ${err.stack || err.message}`);
   } finally {
     syncState.isRunning = false;
   }

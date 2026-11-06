@@ -1182,6 +1182,54 @@ const MIGRATIONS_SQL = `
   CREATE INDEX IF NOT EXISTS idx_ncr_forms_ncr_no ON ncr_forms(ncr_no);
   CREATE INDEX IF NOT EXISTS idx_ncr_forms_status ON ncr_forms(status);
   CREATE INDEX IF NOT EXISTS idx_ncr_forms_creator ON ncr_forms(created_by_email);
+  -- Metadata lives outside form_data so the submitted document stays exact.
+  ALTER TABLE ncr_forms ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+  -- ── Data-only report forms ──────────────────────────────────────────
+  -- Incident / accident / criminal / dispatch reports are stored as the exact
+  -- form snapshot. No PDF is generated or uploaded on save.
+  CREATE SEQUENCE IF NOT EXISTS report_no_seq;
+  CREATE TABLE IF NOT EXISTS report_forms (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    report_no TEXT DEFAULT ('RPT-' || to_char(now(),'YYYY') || '-' || lpad(nextval('report_no_seq')::bigint::text, 4, '0')),
+    report_type TEXT NOT NULL,
+    alert_id TEXT,
+    alert_group_id INTEGER,
+    alert_group_key TEXT,
+    driver_id BIGINT,
+    driver_name TEXT,
+    vehicle_fleet_number TEXT,
+    vehicle_registration TEXT,
+    cost_center_id INTEGER,
+    form_data JSONB NOT NULL DEFAULT '{}'::jsonb,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    status TEXT DEFAULT 'SAVED',
+    created_by TEXT,
+    created_by_id TEXT,
+    created_by_email TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_report_forms_group_type
+    ON report_forms (alert_group_id, report_type) WHERE alert_group_id IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_report_forms_alert ON report_forms (alert_id);
+  CREATE INDEX IF NOT EXISTS idx_report_forms_driver ON report_forms (driver_id);
+  CREATE INDEX IF NOT EXISTS idx_report_forms_cc ON report_forms (cost_center_id);
+  CREATE INDEX IF NOT EXISTS idx_report_forms_created ON report_forms (created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_report_forms_type ON report_forms (report_type);
+
+  CREATE TABLE IF NOT EXISTS report_evidence (
+    id SERIAL PRIMARY KEY,
+    report_form_id UUID NOT NULL REFERENCES report_forms(id) ON DELETE CASCADE,
+    alert_id TEXT,
+    file_url TEXT NOT NULL,
+    file_type TEXT,
+    channel INTEGER,
+    captured_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  );
+  CREATE INDEX IF NOT EXISTS idx_report_evidence_form ON report_evidence (report_form_id);
+  CREATE INDEX IF NOT EXISTS idx_report_evidence_alert ON report_evidence (alert_id);
 
   -- One evidence archive per alert group (the "apply all media" ZIP). The
   -- build downloads every clip + screenshot, zips them and uploads the ZIP;
@@ -1660,6 +1708,11 @@ const MIGRATIONS_SQL = `
   -- thousands of rows and driver_scoring/fleet_vehicles are hit per group).
   CREATE INDEX IF NOT EXISTS idx_incidents_alert_group_key
     ON incidents (alert_group_key) WHERE alert_group_key IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_incidents_incident_date
+    ON incidents (incident_date DESC);
+  CREATE INDEX IF NOT EXISTS idx_ag_closed_report
+    ON alert_groups ((COALESCE(resolved_at, updated_at, last_alert_ts)) DESC, id DESC)
+    WHERE resolved = TRUE AND false_alert = FALSE;
   CREATE INDEX IF NOT EXISTS idx_driver_scoring_fleet_trim
     ON driver_scoring (UPPER(TRIM(fleet_number)));
   CREATE INDEX IF NOT EXISTS idx_fleet_vehicles_fleet_trim
