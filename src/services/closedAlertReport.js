@@ -301,6 +301,28 @@ async function getSnapshot(params = {}) {
     to: range.to,
     costCenterIds: params.costCenterIds,
   });
+
+  // Merge direct NCR counts into cost_centre_stats so cards and charts agree.
+  // The old stats[].ncrs came from closed-alert groups (broken by deletions).
+  const ncrMap = new Map(ncrCounts.map((r) => [Number(r.cost_center_id), Number(r.ncrs || 0)]));
+  for (const bucket of stats) {
+    bucket.ncrs = ncrMap.get(bucket.cc_id) ?? 0;
+    ncrMap.delete(bucket.cc_id);
+  }
+  // Add CCs that have NCRs but no closed alerts (e.g. "Unknown" with 34).
+  for (const [ccId, count] of ncrMap) {
+    const cc = (costCenters || []).find((c) => Number(c.id) === ccId);
+    stats.push({
+      cc_id: ccId,
+      cc_name: cc?.name || `CC ${ccId}`,
+      closed_alerts: 0,
+      alert_events: 0,
+      ncrs: count,
+      vehicles: 0,
+    });
+  }
+  stats.sort((a, b) => (b.ncrs - a.ncrs) || (b.closed_alerts - a.closed_alerts));
+
   const pageSize = Math.min(200, Math.max(1, Number(params.pageSize) || 50));
   const page = Math.max(1, Number(params.page) || 1);
   const total = rows.length;
