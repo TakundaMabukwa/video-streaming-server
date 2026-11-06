@@ -126,7 +126,7 @@ router.patch('/:formId', async (req, res) => {
     const formId = String(req.params.formId || '').trim();
     if (!formId) return res.status(400).json({ success: false, message: 'formId is required' });
     const body = req.body || {};
-    // Only allow editing OPEN incidents.
+    // Only block editing CLOSED incidents (RESOLVED and OPEN are editable).
     const check = await db.query(
       `SELECT nf.id, nf.incident_id, i.status FROM ncr_forms nf
        JOIN incidents i ON i.id = nf.incident_id WHERE nf.id = $1`,
@@ -134,8 +134,8 @@ router.patch('/:formId', async (req, res) => {
     );
     if (check.rows.length === 0) return res.status(404).json({ success: false, message: 'NCR not found' });
     const incidentStatus = String(check.rows[0].status || '').toUpperCase();
-    if (incidentStatus !== 'OPEN') {
-      return res.status(400).json({ success: false, message: `Cannot edit a ${incidentStatus} NCR` });
+    if (incidentStatus === 'CLOSED') {
+      return res.status(400).json({ success: false, message: 'Cannot edit a CLOSED NCR' });
     }
 
     // Build form_data patch from all incoming fields (excluding known non-form keys).
