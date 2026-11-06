@@ -90,6 +90,24 @@ router.post('/', async (req, res) => {
   }
 });
 
+// GET /ncr/register — NCR register list (ncr_forms JOIN incidents).
+// Independent of alert_groups so the register survives an alert-history clear.
+router.get('/register', async (req, res) => {
+  try {
+    const reportStats = require('../db/reportStats');
+    const { status, from, to, costCenterIds, q, pageSize, pageIndex } = req.query;
+    const data = await reportStats.getNcrRegister({
+      status, from, to, costCenterIds, q,
+      pageSize: parseInt(pageSize) || 50,
+      pageIndex: parseInt(pageIndex) || 1,
+    });
+    res.json({ success: true, ...data });
+  } catch (err) {
+    console.error('[NCR] Register error:', err.message);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 // GET /ncr/:formId — the stored document (read-only register view).
 router.get('/:formId', async (req, res) => {
   try {
@@ -97,6 +115,87 @@ router.get('/:formId', async (req, res) => {
     if (!form) return res.status(404).json({ success: false, message: 'NCR not found' });
     res.json({ success: true, form });
   } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// PATCH /ncr/:formId — edit form_data fields on an open NCR. Mirrors key
+// fields back to the incident register so both views stay in sync.
+router.patch('/:formId', async (req, res) => {
+  try {
+    const formId = String(req.params.formId || '').trim();
+    if (!formId) return res.status(400).json({ success: false, message: 'formId is required' });
+    const body = req.body || {};
+    // Only allow editing OPEN incidents.
+    const check = await db.query(
+      `SELECT nf.id, nf.incident_id, i.status FROM ncr_forms nf
+       JOIN incidents i ON i.id = nf.incident_id WHERE nf.id = $1`,
+      [formId]
+    );
+    if (check.rows.length === 0) return res.status(404).json({ success: false, message: 'NCR not found' });
+    const incidentStatus = String(check.rows[0].status || '').toUpperCase();
+    if (incidentStatus !== 'OPEN') {
+      return res.status(400).json({ success: false, message: `Cannot edit a ${incidentStatus} NCR` });
+    }
+
+    // Build form_data patch from all incoming fields (excluding known non-form keys).
+    const RESERVED = new Set(['id', 'incident_id', 'incidentId', 'formId', 'form_id', 'status', 'created_at', 'updated_at']);
+    const formPatch = {};
+    for (const [key, value] of Object.entries(body)) {
+      if (RESERVED.has(key)) continue;
+      formPatch[key] = value;
+    }
+
+    // Mirror key fields to the incident register.
+    const MIRROR = {
+      driverName: 'driver_name',
+      contactNumber: 'contact_number',
+      idNumber: 'id_number',
+      vehicleFleetNumber: 'fleet_number',
+      description: 'infringement_detail',
+      correctiveAction: 'action_taken',
+      outcome: 'outcome',
+      notes: 'notes',
+    };
+    const incPatch = {};
+    for (const [formKey, incKey] of Object.entries(MIRROR)) {
+      if (body[formKey] === undefined) continue;
+      const v = body[formKey];
+      incPatch[incKey] = typeof v === 'string' ? v.trim() || null : (v ?? null);
+    }
+    if (body.classifications !== undefined) {
+      const raw = Array.isArray(body.classifications) ? body.classifications : [];
+      incPatch.infringement = raw.filter(Boolean).join(', ') || null;
+    }
+
+    // Update form_data.
+    if (Object.keys(formPatch).length > 0) {
+      await db.query(
+        `UPDATE ncr_forms SET form_data = form_data || $2::jsonb, updated_at = NOW() WHERE id = $1`,
+        [formId, JSON.stringify(formPatch)]
+      );
+    }
+
+    // Update incident register.
+    if (Object.keys(incPatch).length > 0) {
+      const sets = [];
+      const params = [];
+      for (const [key, value] of Object.entries(incPatch)) {
+        params.push(value);
+        sets.push(`${key} = $${params.length}`);
+      }
+      params.push(check.rows[0].incident_id);
+      sets.push('updated_at = NOW()');
+      await db.query(
+        `UPDATE incidents SET ${sets.join(', ')} WHERE id = $${params.length}`,
+        params
+      );
+    }
+
+    const updated = await ncrService.getNcrForm(formId);
+    res.json({ success: true, form: updated });
+  } catch (error) {
+    console.error('[NCR] PATCH error:', error.message);
     res.status(500).json({ success: false, message: error.message });
   }
 });

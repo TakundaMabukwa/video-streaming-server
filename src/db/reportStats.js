@@ -191,11 +191,81 @@ async function deleteIncidentDocument(id) {
   return result.rows[0] || null;
 }
 
+// NCR register: every NCR form joined to its incident. Independent of
+// alert_groups so the register survives an alert-history clear. Filters are
+// applied in SQL so the total count stays consistent with the page.
+async function getNcrRegister({ status, from, to, costCenterIds, q, pageSize = 50, pageIndex = 1 } = {}) {
+  const conditions = [];
+  const params = [];
+  const limit = Math.min(Math.max(parseInt(pageSize) || 50, 1), 500);
+  const offset = (Math.max(parseInt(pageIndex) || 1, 1) - 1) * limit;
+
+  if (status) {
+    const statuses = String(status).split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+    if (statuses.length === 1) {
+      params.push(statuses[0]);
+      conditions.push(`i.status = $${params.length}`);
+    } else if (statuses.length > 1) {
+      params.push(statuses);
+      conditions.push(`i.status = ANY($${params.length}::text[])`);
+    }
+  }
+  if (from && to) {
+    params.push(from, to);
+    conditions.push(`i.incident_date BETWEEN $${params.length - 1} AND $${params.length}`);
+  } else if (from) {
+    params.push(from);
+    conditions.push(`i.incident_date >= $${params.length}`);
+  } else if (to) {
+    params.push(to);
+    conditions.push(`i.incident_date <= $${params.length}`);
+  }
+  const ccList = String(costCenterIds || '').split(',').map(s => s.trim()).filter(Boolean).map(Number).filter(n => Number.isFinite(n) && n > 0);
+  if (ccList.length > 0) {
+    params.push(ccList);
+    conditions.push(`i.cost_center_id = ANY($${params.length}::int[])`);
+  }
+  if (q) {
+    const like = `%${String(q).trim()}%`;
+    params.push(like);
+    conditions.push(`(nf.ncr_no ILIKE $${params.length} OR i.driver_name ILIKE $${params.length} OR i.fleet_number ILIKE $${params.length} OR i.incident_no ILIKE $${params.length})`);
+  }
+
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const countResult = await query(
+    `SELECT COUNT(*)::int AS total FROM ncr_forms nf JOIN incidents i ON i.id = nf.incident_id ${where}`,
+    params
+  );
+  const result = await query(
+    `SELECT nf.id AS form_id, nf.ncr_no, nf.status AS form_status, nf.created_by_email,
+            nf.created_at AS form_created_at, nf.updated_at AS form_updated_at,
+            nf.form_data,
+            i.id AS incident_id, i.incident_no, i.status AS incident_status,
+            to_char(i.incident_date, 'YYYY-MM-DD') AS incident_date,
+            to_char(i.incident_time, 'HH24:MI') AS incident_time,
+            i.alert_id, i.alarm_type, i.source_type,
+            i.fleet_number, i.driver_name, i.contact_number,
+            i.infringement, i.infringement_detail, i.action_taken, i.outcome, i.notes,
+            i.cost_center_id, i.closure_type, i.resolved_by,
+            i.resolved_at, i.created_at AS incident_created_at,
+            cc.name AS cost_center_name
+       FROM ncr_forms nf
+       JOIN incidents i ON i.id = nf.incident_id
+       LEFT JOIN cost_centers cc ON cc.id = i.cost_center_id
+       ${where}
+      ORDER BY nf.created_at DESC
+      LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+    [...params, limit, offset]
+  );
+  return { rows: result.rows, total: countResult.rows[0].total, page: parseInt(pageIndex) || 1, pageSize: limit };
+}
+
 module.exports = {
   getAllIncidents,
   getAllClosedGroups,
   getClosedGroupsInRange,
   getAllNcrForms,
+  getNcrRegister,
   getCostCenters,
   getIncidentDocuments,
   insertIncidentDocument,
