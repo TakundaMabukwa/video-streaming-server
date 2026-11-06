@@ -203,15 +203,15 @@ async function getNcrRegister({ status, from, to, costCenterIds, q, pageSize = 5
   if (status) {
     const raw = String(status).trim().toUpperCase();
     if (raw === 'NOT_CLOSED') {
-      conditions.push(`i.status IS DISTINCT FROM 'CLOSED'`);
+      conditions.push(`nf.status IS DISTINCT FROM 'CLOSED'`);
     } else {
       const statuses = raw.split(',').map(s => s.trim()).filter(Boolean);
       if (statuses.length === 1) {
         params.push(statuses[0]);
-        conditions.push(`i.status = $${params.length}`);
+        conditions.push(`nf.status = $${params.length}`);
       } else if (statuses.length > 1) {
         params.push(statuses);
-        conditions.push(`i.status = ANY($${params.length}::text[])`);
+        conditions.push(`nf.status = ANY($${params.length}::text[])`);
       }
     }
   }
@@ -245,7 +245,7 @@ async function getNcrRegister({ status, from, to, costCenterIds, q, pageSize = 5
     `SELECT nf.id AS form_id, nf.ncr_no, nf.status AS form_status, nf.created_by_email,
             nf.created_at AS form_created_at, nf.updated_at AS form_updated_at,
             nf.form_data,
-            i.id AS incident_id, i.incident_no, i.status AS incident_status,
+            i.id AS incident_id, i.incident_no, nf.status AS incident_status,
             to_char(i.incident_date, 'YYYY-MM-DD') AS incident_date,
             to_char(i.incident_time, 'HH24:MI') AS incident_time,
             i.alert_id, i.alarm_type, i.source_type,

@@ -126,15 +126,15 @@ router.patch('/:formId', async (req, res) => {
     const formId = String(req.params.formId || '').trim();
     if (!formId) return res.status(400).json({ success: false, message: 'formId is required' });
     const body = req.body || {};
-    // Only block editing CLOSED incidents (RESOLVED and OPEN are editable).
+    // Only block editing CLOSED NCRs (OPEN and REVIEW are editable).
     const check = await db.query(
-      `SELECT nf.id, nf.incident_id, i.status FROM ncr_forms nf
+      `SELECT nf.id, nf.incident_id, nf.status FROM ncr_forms nf
        JOIN incidents i ON i.id = nf.incident_id WHERE nf.id = $1`,
       [formId]
     );
     if (check.rows.length === 0) return res.status(404).json({ success: false, message: 'NCR not found' });
-    const incidentStatus = String(check.rows[0].status || '').toUpperCase();
-    if (incidentStatus === 'CLOSED') {
+    const formStatus = String(check.rows[0].status || '').toUpperCase();
+    if (formStatus === 'CLOSED') {
       return res.status(400).json({ success: false, message: 'Cannot edit a CLOSED NCR' });
     }
 
@@ -173,6 +173,16 @@ router.patch('/:formId', async (req, res) => {
       await db.query(
         `UPDATE ncr_forms SET form_data = form_data || $2::jsonb, updated_at = NOW() WHERE id = $1`,
         [formId, JSON.stringify(formPatch)]
+      );
+    }
+
+    // Update workflow status (OPEN / REVIEW / CLOSED) on the NCR form.
+    const VALID_STATUSES = new Set(['OPEN', 'REVIEW', 'CLOSED']);
+    const newStatus = String(body.status || '').toUpperCase();
+    if (VALID_STATUSES.has(newStatus) && newStatus !== formStatus) {
+      await db.query(
+        `UPDATE ncr_forms SET status = $2, updated_at = NOW() WHERE id = $1`,
+        [formId, newStatus]
       );
     }
 
