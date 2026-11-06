@@ -201,13 +201,18 @@ async function getNcrRegister({ status, from, to, costCenterIds, q, pageSize = 5
   const offset = (Math.max(parseInt(pageIndex) || 1, 1) - 1) * limit;
 
   if (status) {
-    const statuses = String(status).split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
-    if (statuses.length === 1) {
-      params.push(statuses[0]);
-      conditions.push(`i.status = $${params.length}`);
-    } else if (statuses.length > 1) {
-      params.push(statuses);
-      conditions.push(`i.status = ANY($${params.length}::text[])`);
+    const raw = String(status).trim().toUpperCase();
+    if (raw === 'NOT_CLOSED') {
+      conditions.push(`i.status IS DISTINCT FROM 'CLOSED'`);
+    } else {
+      const statuses = raw.split(',').map(s => s.trim()).filter(Boolean);
+      if (statuses.length === 1) {
+        params.push(statuses[0]);
+        conditions.push(`i.status = $${params.length}`);
+      } else if (statuses.length > 1) {
+        params.push(statuses);
+        conditions.push(`i.status = ANY($${params.length}::text[])`);
+      }
     }
   }
   if (from && to) {
