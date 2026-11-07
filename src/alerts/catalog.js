@@ -119,6 +119,16 @@ function isSelfMonitoringZoneAlert(input = {}) {
   return SELF_MONITORING_ZONE_CODES.has(signalCode) || SELF_MONITORING_ZONE_NAMES.has(alarmType);
 }
 
+// High-risk entering is notification-owned by the DeviceStatusInfo poller.
+// Geotab feeds for this exact alert are archived only — they must never push
+// the zone notification themselves (unlike the poller path, which still does).
+function isHighRiskEntryAlert(def) {
+  if (!def) return false;
+  const code = String(def.signalCode || def.signal_code || '').trim().toLowerCase();
+  const name = String(def.name || '').trim().toLowerCase();
+  return code === ZONE_ENTRY_CODE.toLowerCase() || name === 'entering high risk area';
+}
+
 function isGeotabSpeedingDefinition(def) {
   if (!def) return false;
   const name = String(def.name || '').trim().toLowerCase();
@@ -168,6 +178,7 @@ module.exports = {
   FATIGUE_THRESHOLDS,
   isPollerOwnedAlert,
   isSelfMonitoringZoneAlert,
+  isHighRiskEntryAlert,
   SELF_MONITORING_ZONE_NAMES,
   SELF_MONITORING_ZONE_CODES,
   isGeotabSpeedingDefinition,

@@ -3,7 +3,7 @@ const https = require('https');
 const { fetchVehiclesFromSupabase } = require('../helpers/supabaseClient');
 const { getTelematicsNameMap } = require('../db/alert_definitions');
 const { matchAlertDefinition } = require('../helpers/alertMatching');
-const { isPollerOwnedAlert, isSelfMonitoringZoneAlert, SPEED_85_CODE, SPEED_90_CODE, geotabSpeedingPolicy } = require('../helpers/pollerOwnedAlerts');
+const { isPollerOwnedAlert, isSelfMonitoringZoneAlert, isHighRiskEntryAlert, SPEED_85_CODE, SPEED_90_CODE, geotabSpeedingPolicy } = require('../helpers/pollerOwnedAlerts');
 const zoneNotifications = require('./zoneNotifications');
 const overrides = require('./vehicleAlertOverrides');
 const { processAlertDeduction } = require('./driverScoringService');
@@ -970,6 +970,11 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
       // DeviceStatusInfo poller owns speeding. Other poller-owned types are
       // archived only as well.
       if (archiveOnlySpeeding) continue;
+
+      // High-risk entering notifications are owned by the DeviceStatusInfo
+      // poller. The Geotab exception event is archived above (history/dedup)
+      // but must not create the zone notification itself.
+      if (isHighRiskEntryAlert(matchedDef)) continue;
 
       if (isSelfMonitoringZoneAlert({ signalCode: matchedDef.signalCode || eventCode, alarmType: matchedDef.name })) {
         const isSignalLoss = /signal loss/i.test(String(matchedDef.name || eventName || ''));

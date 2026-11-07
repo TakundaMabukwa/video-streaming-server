@@ -21,6 +21,15 @@ check('classifies signal loss', catalog.isSelfMonitoringZoneAlert({ signalCode: 
 check('classifies by alarm name', catalog.isSelfMonitoringZoneAlert({ alarmType: 'Entering Signal Loss Area' }));
 check('does not classify stop alert', !catalog.isSelfMonitoringZoneAlert({ signalCode: catalog.ZONE_STOP_IMMEDIATE_CODE }));
 
+check('high-risk entry by code is Geotab archive-only', catalog.isHighRiskEntryAlert({ signalCode: catalog.ZONE_ENTRY_CODE }));
+check('high-risk entry by name is Geotab archive-only', catalog.isHighRiskEntryAlert({ name: 'Entering High Risk Area' }));
+check('no-go entry is not high-risk archive-only', !catalog.isHighRiskEntryAlert({ name: 'Entering No-Go Zone', signalCode: catalog.NOGO_ENTRY_CODE }));
+check('no-stopping entry is not high-risk archive-only', !catalog.isHighRiskEntryAlert({ name: 'Entering No Stopping Zone', signalCode: catalog.NO_STOP_ENTRY_CODE }));
+check('approaching is not high-risk archive-only', !catalog.isHighRiskEntryAlert({ signalCode: catalog.ZONE_APPROACHING_CODE }));
+check('signal loss is not high-risk archive-only', !catalog.isHighRiskEntryAlert({ signalCode: catalog.SIGNAL_LOSS_ENTRY_CODE }));
+check('stop alert is not high-risk archive-only', !catalog.isHighRiskEntryAlert({ signalCode: catalog.ZONE_STOP_IMMEDIATE_CODE }));
+check('null def is not high-risk archive-only', !catalog.isHighRiskEntryAlert(null));
+
 const first = zoneNotifications.upsert({
   fleet_number: 'B29',
   kind: 'approaching',
