@@ -90,6 +90,41 @@ router.post('/', async (req, res) => {
   }
 });
 
+// POST /ncr/standalone — a blank NCR created from the Drivers page.
+// No alert group: the incident row is the register anchor.
+router.post('/standalone', async (req, res) => {
+  try {
+    const { form, evidence } = req.body || {};
+    const actor = actorFromRequest(req);
+    if (!actor) {
+      return res.status(422).json({
+        success: false,
+        message:
+          'Your session has no email address, so the NCR cannot be attributed to you. Please sign in again with an account that has an email.',
+      });
+    }
+
+    const result = await ncrService.createStandaloneNcr({
+      form: form || {},
+      evidence: Array.isArray(evidence) ? evidence : [],
+      actor,
+    });
+    if (!result.ok) {
+      return res.status(result.status || 400).json({ success: false, message: result.error });
+    }
+    res.json({
+      success: true,
+      ncrFormId: result.ncrFormId,
+      incidentId: result.incidentId,
+      ncrNo: result.ncrNo,
+      creatorEmail: result.creatorEmail,
+    });
+  } catch (error) {
+    console.error('[NCR] standalone create failed:', error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // GET /ncr/register — NCR register list (ncr_forms JOIN incidents).
 // Independent of alert_groups so the register survives an alert-history clear.
 router.get('/register', async (req, res) => {

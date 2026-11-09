@@ -200,36 +200,51 @@ async function getNcrRegister({ status, from, to, costCenterIds, q, pageSize = 5
   const limit = Math.min(Math.max(parseInt(pageSize) || 50, 1), 500);
   const offset = (Math.max(parseInt(pageIndex) || 1, 1) - 1) * limit;
 
+  // Workflow mapping:
+  //   REVIEW -> Review
+  //   CLOSED -> Closed
+  //   everything else, including RESOLVED/SAVED -> Open
+  const normalizedStatusSql = `CASE
+    WHEN UPPER(TRIM(nf.status)) = 'REVIEW' THEN 'REVIEW'
+    WHEN UPPER(TRIM(nf.status)) = 'CLOSED' THEN 'CLOSED'
+    ELSE 'OPEN'
+  END`;
+
   if (status) {
     const raw = String(status).trim().toUpperCase();
-    if (raw === 'NOT_CLOSED') {
-      conditions.push(`nf.status IS DISTINCT FROM 'CLOSED'`);
-    } else {
-      const statuses = raw.split(',').map(s => s.trim()).filter(Boolean);
-      if (statuses.length === 1) {
-        params.push(statuses[0]);
-        conditions.push(`nf.status = $${params.length}`);
-      } else if (statuses.length > 1) {
-        params.push(statuses);
-        conditions.push(`nf.status = ANY($${params.length}::text[])`);
-      }
+    if (raw === 'OPEN') {
+      conditions.push(`${normalizedStatusSql} = 'OPEN'`);
+    } else if (raw === 'REVIEW') {
+      conditions.push(`${normalizedStatusSql} = 'REVIEW'`);
+    } else if (raw === 'CLOSED') {
+      conditions.push(`${normalizedStatusSql} = 'CLOSED'`);
+    } else if (raw === 'NOT_CLOSED') {
+      conditions.push(`${normalizedStatusSql} <> 'CLOSED'`);
+    } else if (raw) {
+      params.push(raw);
+      conditions.push(`UPPER(TRIM(nf.status)) = $${params.length}`);
     }
   }
+
+  const createdDateSql = `(nf.created_at AT TIME ZONE 'Africa/Johannesburg')::date`;
   if (from && to) {
     params.push(from, to);
-    conditions.push(`i.incident_date BETWEEN $${params.length - 1} AND $${params.length}`);
+    conditions.push(`${createdDateSql} BETWEEN $${params.length - 1}::date AND $${params.length}::date`);
   } else if (from) {
     params.push(from);
-    conditions.push(`i.incident_date >= $${params.length}`);
+    conditions.push(`${createdDateSql} >= $${params.length}::date`);
   } else if (to) {
     params.push(to);
-    conditions.push(`i.incident_date <= $${params.length}`);
+    conditions.push(`${createdDateSql} <= $${params.length}::date`);
   }
+
   const ccList = String(costCenterIds || '').split(',').map(s => s.trim()).filter(Boolean).map(Number).filter(n => Number.isFinite(n) && n > 0);
   if (ccList.length > 0) {
     params.push(ccList);
-    conditions.push(`i.cost_center_id = ANY($${params.length}::int[])`);
+    // Vehicle cost centre is authoritative; fall back to the incident's value.
+    conditions.push(`COALESCE(fv.cost_center_id, i.cost_center_id) = ANY($${params.length}::int[])`);
   }
+
   if (q) {
     const like = `%${String(q).trim()}%`;
     params.push(like);
@@ -237,28 +252,41 @@ async function getNcrRegister({ status, from, to, costCenterIds, q, pageSize = 5
   }
 
   const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const fleetCostCenterJoin = `LEFT JOIN LATERAL (
+    SELECT cost_center_id
+      FROM fleet_vehicles
+     WHERE UPPER(TRIM(fleet_number)) = UPPER(TRIM(i.fleet_number))
+     ORDER BY cost_center_id NULLS LAST
+     LIMIT 1
+  ) fv ON TRUE`;
+
   const countResult = await query(
-    `SELECT COUNT(*)::int AS total FROM ncr_forms nf JOIN incidents i ON i.id = nf.incident_id ${where}`,
+    `SELECT COUNT(*)::int AS total
+       FROM ncr_forms nf
+       JOIN incidents i ON i.id = nf.incident_id
+       ${fleetCostCenterJoin}
+       ${where}`,
     params
   );
+
   const result = await query(
     `SELECT nf.id AS form_id, nf.ncr_no, nf.status AS form_status, nf.created_by_email,
             nf.created_at AS form_created_at, nf.updated_at AS form_updated_at,
             nf.form_data,
-            i.id AS incident_id, i.incident_no, nf.status AS incident_status,
+            i.id AS incident_id, i.incident_no, ${normalizedStatusSql} AS incident_status,
             to_char(i.incident_date, 'YYYY-MM-DD') AS incident_date,
             to_char(i.incident_time, 'HH24:MI') AS incident_time,
             i.alert_id, i.alarm_type, i.source_type,
             i.fleet_number, i.driver_name, i.contact_number,
             i.infringement, i.infringement_detail, i.action_taken, i.outcome, i.notes,
-            COALESCE(i.cost_center_id, fv.cost_center_id) AS cost_center_id,
+            COALESCE(fv.cost_center_id, i.cost_center_id) AS cost_center_id,
             i.closure_type, i.resolved_by,
             i.resolved_at, i.created_at AS incident_created_at,
-            COALESCE(cc.name, fv_cc.name) AS cost_center_name
+            COALESCE(fv_cc.name, cc.name) AS cost_center_name
        FROM ncr_forms nf
        JOIN incidents i ON i.id = nf.incident_id
        LEFT JOIN cost_centers cc ON cc.id = i.cost_center_id
-       LEFT JOIN fleet_vehicles fv ON fv.fleet_number = i.fleet_number
+       ${fleetCostCenterJoin}
        LEFT JOIN cost_centers fv_cc ON fv_cc.id = fv.cost_center_id
        ${where}
       ORDER BY nf.created_at DESC

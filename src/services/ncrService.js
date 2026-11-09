@@ -215,6 +215,110 @@ async function createNcrFromAlert(opts = {}) {
   };
 }
 
+/**
+ * Persist a standalone NCR created from the Drivers page. It has no alert
+ * group: the incident row is the register anchor and ncr_forms carries the
+ * exact submitted document.
+ */
+async function createStandaloneNcr({ form = {}, evidence = [], actor = null } = {}) {
+  const actorEmail = String(actor?.email || '').trim();
+  const actorId = actor?.id ? String(actor.id) : null;
+  if (!actorEmail) {
+    return {
+      ok: false,
+      status: 422,
+      error: 'The signed-in account has no email address, so the NCR cannot be attributed. Sign in with an account that has an email.',
+    };
+  }
+
+  const formData = form && typeof form === 'object' && !Array.isArray(form)
+    ? JSON.parse(JSON.stringify(form))
+    : {};
+
+  const driverName = String(formData.driverName || '').trim();
+  const fleetNumber = String(formData.vehicleFleetNumber || formData.fleetNumber || '').trim();
+  const registrationNumber = String(formData.vehicleRegistration || formData.registrationNumber || '').trim();
+
+  if (!driverName) return { ok: false, status: 400, error: 'Driver is required' };
+  if (!fleetNumber || !registrationNumber) {
+    return { ok: false, status: 400, error: 'Vehicle fleet number and registration are required' };
+  }
+
+  let costCenterId = Number(formData.costCenterId);
+  if (!Number.isFinite(costCenterId) || costCenterId <= 0) costCenterId = null;
+
+  const now = new Date().toISOString();
+  const incident = await db.upsertIncidentFromAlert({
+    alertId: null,
+    alertGroupKey: null,
+    alarmType: 'NCR',
+    sourceType: 'manual',
+    deviceId: null,
+    fleetNumber,
+    costCenterId,
+    filledBy: actorEmail,
+    status: 'OPEN',
+    controller: actorEmail,
+    driver_name: driverName,
+    contact_number: formData.contactNumber || null,
+    id_number: formData.idNumber || null,
+    division: [formData.department, formData.section].filter(Boolean).join(' - ') || null,
+    infringement: Array.isArray(formData.classifications) ? formData.classifications.filter(Boolean).join(', ') || null : null,
+    infringement_detail: formData.description || null,
+    action_taken: formData.correctiveAction || null,
+    outcome: formData.outcome || formData.preventiveAction || null,
+    notes: formData.notes || null,
+    filled_at: now,
+  });
+  if (!incident) return { ok: false, error: 'Could not create the incident register row' };
+
+  const ncrNo = formData.ncrNo || `NCR-${Date.now()}`;
+  const metadata = {
+    savedAt: now,
+    source: 'standalone',
+    createdByEmail: actorEmail,
+    createdById: actorId,
+    submittedCostCenterId: costCenterId,
+    fleetNumber,
+    registrationNumber,
+  };
+
+  const inserted = await db.query(
+    `INSERT INTO ncr_forms
+       (incident_id, ncr_no, alert_id, alert_group_id, alert_group_key, form_data, metadata, status,
+        created_by, created_by_id, created_by_email)
+     VALUES ($1, $2, NULL, NULL, NULL, $3::jsonb, $4::jsonb, 'SAVED', $5, $6, $7)
+     RETURNING id, incident_id, ncr_no, status`,
+    [incident.id, ncrNo, JSON.stringify(formData), JSON.stringify(metadata), actorEmail, actorId, actorEmail]
+  );
+  const ncrFormId = inserted.rows[0]?.id;
+  if (!ncrFormId) return { ok: false, error: 'Could not store the NCR form' };
+
+  for (const item of evidence || []) {
+    const url = String(item?.url || '').trim();
+    if (!url) continue;
+    await db.query(
+      `INSERT INTO ncr_evidence (ncr_form_id, alert_id, file_url, file_type, channel, captured_at)
+       VALUES ($1, NULL, $2, $3, $4, $5)`,
+      [
+        ncrFormId,
+        url,
+        item.type || item.fileType || null,
+        Number.isFinite(Number(item.channel)) ? Number(item.channel) : null,
+        item.capturedAt || null,
+      ]
+    ).catch(() => {});
+  }
+
+  return {
+    ok: true,
+    ncrFormId,
+    incidentId: incident.id,
+    ncrNo: inserted.rows[0]?.ncr_no || ncrNo,
+    creatorEmail: actorEmail,
+  };
+}
+
 /** The stored document for the register (read-only view). */
 async function getNcrForm(formId) {
   const { rows } = await db.query(
@@ -295,4 +399,4 @@ async function attachDocument(formId, documentPath) {
   return rows[0];
 }
 
-module.exports = { createNcrFromAlert, getNcrForm, getNcrFormByIncident, attachDocument, ALERT_FORM_KEYS };
+module.exports = { createNcrFromAlert, createStandaloneNcr, getNcrForm, getNcrFormByIncident, attachDocument, ALERT_FORM_KEYS };

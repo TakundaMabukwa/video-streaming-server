@@ -96,6 +96,7 @@ async function requireAuth(req, res, next) {
     req.user = cached.user;
     req.userRole = cached.role;
     req.userCostCenterIds = cached.ccIds;
+    req.userPermissions = cached.permissions || [];
     return next();
   }
 
@@ -109,7 +110,7 @@ async function requireAuth(req, res, next) {
     // Verify user exists in our users table
     const { data: userRecord, error: userError } = await supabase
       .from('users')
-      .select('id, role')
+      .select('id, role, permissions')
       .eq('id', user.id)
       .single();
 
@@ -123,12 +124,14 @@ async function requireAuth(req, res, next) {
       user,
       role: userRecord.role,
       ccIds,
+      permissions: Array.isArray(userRecord.permissions) ? userRecord.permissions : [],
       // Never outlive the JWT itself.
       expiresAt: Math.min(Date.now() + AUTH_CACHE_TTL, exp || Infinity),
     });
     req.user = user;
     req.userRole = userRecord.role;
     req.userCostCenterIds = ccIds;
+    req.userPermissions = Array.isArray(userRecord.permissions) ? userRecord.permissions : [];
     next();
   } catch (err) {
     console.error('[AUTH] Error:', err.message);

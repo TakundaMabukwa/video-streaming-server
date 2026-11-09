@@ -458,6 +458,33 @@ async function syncFleetVehicleCostCenters(vehicles) {
   return changed;
 }
 
+// Explicit, single-fleet cost-centre update used by the Vehicles page API.
+// Unlike syncFleetVehicleCostCenters this DOES allow null (unassign) and
+// returns the updated rows so the caller can confirm what changed.
+async function updateFleetVehicleCostCenter({ fleetNumber, costCenterId, costCenter }) {
+  const result = await query(
+    `UPDATE fleet_vehicles
+     SET cost_center = $2, cost_center_id = $3, last_synced = NOW(), updated_at = NOW()
+     WHERE UPPER(TRIM(fleet_number)) = UPPER(TRIM($1))
+     RETURNING fleet_number, registration_number, cost_center, cost_center_id`,
+    [fleetNumber, costCenter ?? null, costCenterId ?? null]
+  );
+  return result.rows;
+}
+
+// Insert a single vehicle into the local fleet registry. Used when a vehicle is
+// added from the dashboard: Supabase is the dashboard source of truth, while
+// this table is what alerts/reporting resolve against.
+async function insertFleetVehicle({ fleetNumber, registrationNumber, costCenterId, costCenter }) {
+  const result = await query(
+    `INSERT INTO fleet_vehicles (fleet_number, registration_number, cost_center, cost_center_id, last_synced)
+     VALUES ($1, $2, $3, $4, NOW())
+     RETURNING fleet_number, registration_number, cost_center, cost_center_id`,
+    [fleetNumber, registrationNumber, costCenter ?? null, costCenterId ?? null]
+  );
+  return result.rows[0] || null;
+}
+
 async function getFleetVehicleByFleet(fleetNumber) {
   const result = await query(
     'SELECT * FROM fleet_vehicles WHERE fleet_number = $1 LIMIT 1',
@@ -986,6 +1013,8 @@ module.exports = {
   upsertFleetVehicles,
   upsertNewFleetVehicles,
   syncFleetVehicleCostCenters,
+  updateFleetVehicleCostCenter,
+  insertFleetVehicle,
   getFleetVehicleByFleet,
   getFleetVehicleByReg,
   getAllFleetVehicles,
