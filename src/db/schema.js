@@ -973,6 +973,29 @@ const MIGRATIONS_SQL = `
   CREATE INDEX IF NOT EXISTS idx_driving_sessions_active ON driving_sessions(driving_ended_at) WHERE driving_ended_at IS NULL;
   CREATE INDEX IF NOT EXISTS idx_driving_sessions_cc ON driving_sessions(cost_center_id);
 
+  -- Soltrack engine-on sessions: the fatigue clock is engine-on time, not
+  -- Geotab's driving-state clock. A short ignition/engine flicker resumes the
+  -- same session so the counter is never reset by repeated ignition events.
+  CREATE TABLE IF NOT EXISTS soltrack_engine_sessions (
+    id SERIAL PRIMARY KEY,
+    device_id TEXT NOT NULL,
+    fleet_number TEXT,
+    registration_number TEXT,
+    cost_center_id INTEGER,
+    engine_on_at TIMESTAMPTZ NOT NULL,
+    last_on_at TIMESTAMPTZ NOT NULL,
+    last_off_at TIMESTAMPTZ,
+    engine_off_at TIMESTAMPTZ,
+    accumulated_on_seconds BIGINT NOT NULL DEFAULT 0,
+    fatigue_alerted_thresholds TEXT NOT NULL DEFAULT '[]',
+    last_evaluated_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  );
+  CREATE INDEX IF NOT EXISTS idx_soltrack_engine_device ON soltrack_engine_sessions(device_id);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_soltrack_engine_open
+    ON soltrack_engine_sessions(device_id) WHERE engine_off_at IS NULL;
+
   -- Rest periods: every observed isDriving=false interval, with the duration
   -- and whether it qualified as a fatigue re-arm break (>= 5 minutes).
   CREATE TABLE IF NOT EXISTS vehicle_rest_periods (
@@ -1177,11 +1200,23 @@ const MIGRATIONS_SQL = `
   ALTER TABLE ncr_forms ADD COLUMN IF NOT EXISTS archive_url TEXT;
   ALTER TABLE ncr_forms ADD COLUMN IF NOT EXISTS archive_status TEXT;
   ALTER TABLE ncr_forms ADD COLUMN IF NOT EXISTS archive_error TEXT;
+  -- The moment the NCR workflow moved to CLOSED. updated_at cannot be used for
+  -- this: it changes on every edit/review. RESOLVED/SAVED stay open.
+  ALTER TABLE ncr_forms ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ;
   CREATE UNIQUE INDEX IF NOT EXISTS idx_ncr_forms_incident ON ncr_forms(incident_id);
   CREATE INDEX IF NOT EXISTS idx_ncr_forms_group ON ncr_forms(alert_group_id);
   CREATE INDEX IF NOT EXISTS idx_ncr_forms_ncr_no ON ncr_forms(ncr_no);
   CREATE INDEX IF NOT EXISTS idx_ncr_forms_status ON ncr_forms(status);
   CREATE INDEX IF NOT EXISTS idx_ncr_forms_creator ON ncr_forms(created_by_email);
+  CREATE INDEX IF NOT EXISTS idx_ncr_forms_closed_at ON ncr_forms(closed_at);
+  -- Backfill closed NCRs written before closed_at existed. Guarded by
+  -- closed_at IS NULL so it is a no-op on every subsequent startup.
+  UPDATE ncr_forms nf
+     SET closed_at = COALESCE(i.resolved_at, nf.updated_at, NOW())
+    FROM incidents i
+   WHERE i.id = nf.incident_id
+     AND UPPER(TRIM(nf.status)) = 'CLOSED'
+     AND nf.closed_at IS NULL;
   -- Metadata lives outside form_data so the submitted document stays exact.
   ALTER TABLE ncr_forms ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
 

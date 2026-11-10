@@ -174,7 +174,7 @@ router.patch('/:formId', async (req, res) => {
     }
 
     // Build form_data patch from all incoming fields (excluding known non-form keys).
-    const RESERVED = new Set(['id', 'incident_id', 'incidentId', 'formId', 'form_id', 'status', 'created_at', 'updated_at']);
+    const RESERVED = new Set(['id', 'incident_id', 'incidentId', 'formId', 'form_id', 'status', 'created_at', 'updated_at', 'closed_at']);
     const formPatch = {};
     for (const [key, value] of Object.entries(body)) {
       if (RESERVED.has(key)) continue;
@@ -216,7 +216,14 @@ router.patch('/:formId', async (req, res) => {
     const newStatus = String(body.status || '').toUpperCase();
     if (VALID_STATUSES.has(newStatus) && newStatus !== formStatus) {
       await db.query(
-        `UPDATE ncr_forms SET status = $2, updated_at = NOW() WHERE id = $1`,
+        `UPDATE ncr_forms
+            SET status = $2::text,
+                closed_at = CASE
+                  WHEN $2::text = 'CLOSED' THEN COALESCE(closed_at, NOW())
+                  ELSE NULL
+                END,
+                updated_at = NOW()
+          WHERE id = $1`,
         [formId, newStatus]
       );
     }

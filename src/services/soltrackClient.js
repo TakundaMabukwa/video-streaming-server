@@ -2,7 +2,9 @@ const { WebSocket } = require('ws');
 const db = require('../db');
 const { getTelematicsNameMap } = require('../db/alert_definitions');
 const { matchAlertDefinition } = require('../helpers/alertMatching');
-const { checkZoneBreaches } = require('./geotabPolling');
+const { batchInsertTelemetryHistory } = require('../db/telemetryHistory');
+const soltrackZoneService = require('./soltrackZoneService');
+const soltrackEngineSessionService = require('./soltrackEngineSessionService');
 const { escalateSeverity } = require('../helpers/transform');
 const sseHub = require('../live/sseHub');
 
@@ -12,19 +14,52 @@ let reconnectDelay = 5000;
 let stopping = false;
 let wsBroadcast = null;
 let seq = 0;
+let alertSeq = 0;
 
 // In-memory fleet dictionary (refresh interval + after midnight sync).
-// Normalized key -> { fleetNumber, ccId }
+// Normalized FLEET number -> { fleetNumber, registrationNumber, ccId, mettaxDeviceId }
 const fleetDict = new Map();
 let dictTimer = null;
 const DICT_TTL = 15 * 60 * 1000;
 
-// lastLogged[normalizedReg] -> true, logs each unknown reg once per process
+// lastLogged[normalizedFleet] -> true, logs each unknown fleet once per process
 const lastLogged = new Map();
+const UNKNOWN_LOG_LIMIT = 20;
+let unknownLogged = 0;
 
-// Frame throughput counters for a periodic summary line
-const stats = { msgs: 0, frames: 0, unknown: 0, matched: 0, noMatch: 0 };
+const stats = {
+  msgs: 0,
+  frames: 0,
+  unknown: 0,
+  matched: 0,
+  noMatch: 0,
+  positionsFlushed: 0,
+  historyRows: 0,
+  alertsQueued: 0,
+};
 let statsTimer = null;
+
+// High-volume Soltrack protection:
+// - positions coalesce in memory and flush in batches (one DB connection)
+// - matched alerts are processed serially so the pool is never flooded
+const POSITION_FLUSH_MS = 1000;
+const POSITION_BATCH_SIZE = 200;
+const HISTORY_BATCH_SIZE = 500;
+const HISTORY_QUEUE_MAX = 20000;
+const ZONE_CHECK_MIN_MS = 15000;
+const ENGINE_CHECK_MIN_MS = 15000;
+const ALERT_QUEUE_WARN_AT = 5000;
+const positionBuffer = new Map();
+const historyQueue = [];
+const historyKeys = new Set();
+let flushTimer = null;
+let flushInFlight = false;
+let historyFlushInFlight = false;
+let lastHistoryErrorAt = 0;
+const alertQueue = [];
+let alertWorker = null;
+const lastZoneCheck = new Map();
+const lastEngineCheck = new Map();
 
 function setWsBroadcast(fn) { wsBroadcast = fn; }
 
@@ -32,36 +67,40 @@ function normalizeReg(reg) {
   return String(reg || '').trim().replace(/\s+/g, '').toUpperCase();
 }
 
-// Load all fleet_vehicles into memory once, then refresh on an interval.
+// Load all fleet vehicles into memory once, then refresh on an interval.
 // Frame-time vehicle resolution never touches the DB.
 async function loadFleetDict() {
   let rows;
   try {
     rows = (await db.query(
-      `SELECT fleet_number, registration_number, cost_center_id, mettax_device_id FROM fleet_vehicles
-       WHERE fleet_number IS NOT NULL AND fleet_number <> ''`
+      `SELECT fleet_number, registration_number, cost_center_id, mettax_device_id
+         FROM fleet_vehicles
+        WHERE fleet_number IS NOT NULL AND fleet_number <> ''`
     )).rows;
   } catch (err) {
     console.error('[SOLTRACK] Fleet dict load error:', err.message);
     return;
   }
   const next = new Map();
-  const fleets = new Set();
   for (const r of rows) {
-    if (!r || !r.fleet_number) continue;
-    fleets.add(r.fleet_number);
-    const entry = { fleetNumber: r.fleet_number, ccId: r.cost_center_id == null ? null : r.cost_center_id, mettaxDeviceId: r.mettax_device_id || null };
-    if (r.registration_number) next.set(normalizeReg(r.registration_number), entry);
-    next.set(normalizeReg(r.fleet_number), entry);
+    if (!r || !r.fleet_number || !r.registration_number) continue;
+    const key = normalizeReg(r.registration_number);
+    if (!key) continue;
+    next.set(key, {
+      fleetNumber: r.fleet_number,
+      registrationNumber: r.registration_number || null,
+      ccId: r.cost_center_id == null ? null : r.cost_center_id,
+      mettaxDeviceId: r.mettax_device_id || null,
+    });
   }
   fleetDict.clear();
-  for (const [k, v] of next) fleetDict.set(k, { ...v });
-  console.log(`[SOLTRACK] Fleet dict refreshed: ${fleetDict.size} keys for ${fleets.size} vehicles`);
+  for (const [k, v] of next) fleetDict.set(k, v);
+  console.log(`[SOLTRACK] Fleet dict refreshed: ${fleetDict.size} registration keys`);
 }
 
-// Pure in-memory resolution: reg may be a plate (registration_number) or a fleet code.
-function resolveVehicle(reg) {
-  const key = normalizeReg(reg);
+// Pure in-memory resolution: the frame's first field is the FLEET number.
+function resolveVehicle(fleet) {
+  const key = normalizeReg(fleet);
   if (!key) return null;
   return fleetDict.get(key) || null;
 }
@@ -69,7 +108,7 @@ function resolveVehicle(reg) {
 /**
  * Parse a single Soltrack frame.
  * Layout (pipe-delimited, wrapped in ^...^):
- *   [0]=reg [1]=speed [2]=lat [3]=lon [4]=locTime [5]=mileage [6]=ip
+ *   [0]=reg/fleet [1]=speed [2]=lat [3]=lon [4]=locTime [5]=mileage [6]=ip
  *   [7]=status [8]=diagnostics [9]=item/device name [10]=geoZone [11]=driver
  */
 function parseFrame(line) {
@@ -135,6 +174,282 @@ async function logUnknownVehicle(reg, frame) {
   }
 }
 
+async function flushPositions() {
+  if (flushInFlight || positionBuffer.size === 0) return;
+  flushInFlight = true;
+  const rows = Array.from(positionBuffer.values());
+  positionBuffer.clear();
+  try {
+    for (let i = 0; i < rows.length; i += POSITION_BATCH_SIZE) {
+      await db.batchUpsertVehicleStatus(rows.slice(i, i + POSITION_BATCH_SIZE));
+    }
+    stats.positionsFlushed += rows.length;
+  } catch (err) {
+    console.error('[SOLTRACK] Position batch flush failed:', err.message);
+  } finally {
+    flushInFlight = false;
+    if (positionBuffer.size > 0) setImmediate(() => { void flushPositions(); });
+  }
+}
+
+function historyKey(row) {
+  return `${row.device_id}|${row.event_time}`;
+}
+
+function queueTelemetryHistory({ fleetNumber, registration, lat, lon, eventTime }) {
+  if (!fleetNumber || !Number.isFinite(lat) || !Number.isFinite(lon)) return;
+  const row = {
+    device_id: fleetNumber,
+    fleet_number: fleetNumber,
+    registration: registration || null,
+    lat,
+    lon,
+    event_time: eventTime.toISOString(),
+  };
+  const key = historyKey(row);
+  if (historyKeys.has(key)) return;
+
+  historyKeys.add(key);
+  historyQueue.push(row);
+
+  if (historyQueue.length > HISTORY_QUEUE_MAX) {
+    const dropped = historyQueue.splice(0, historyQueue.length - HISTORY_QUEUE_MAX);
+    for (const item of dropped) historyKeys.delete(historyKey(item));
+    console.warn(`[SOLTRACK] History queue dropped ${dropped.length} rows`);
+  }
+
+  if (historyQueue.length >= HISTORY_BATCH_SIZE) void flushTelemetryHistory();
+}
+
+async function flushTelemetryHistory() {
+  if (historyFlushInFlight || historyQueue.length === 0) return;
+  historyFlushInFlight = true;
+  try {
+    while (historyQueue.length > 0) {
+      const rows = historyQueue.splice(0, HISTORY_BATCH_SIZE);
+      try {
+        const inserted = await batchInsertTelemetryHistory(rows);
+        stats.historyRows += inserted;
+      } finally {
+        for (const row of rows) historyKeys.delete(historyKey(row));
+      }
+    }
+  } catch (err) {
+    const now = Date.now();
+    if (now - lastHistoryErrorAt > 60000) {
+      lastHistoryErrorAt = now;
+      console.error('[SOLTRACK] Telemetry history flush failed:', err.message);
+    }
+  } finally {
+    historyFlushInFlight = false;
+    if (historyQueue.length > 0) setImmediate(() => { void flushTelemetryHistory(); });
+  }
+}
+
+function kickAlertWorker() {
+  if (alertWorker) return;
+  alertWorker = (async () => {
+    while (alertQueue.length > 0) {
+      const item = alertQueue.shift();
+      try {
+        await processSoltrackAlert(item);
+      } catch (err) {
+        console.error('[SOLTRACK] Alert processing failed:', err.message);
+      }
+    }
+  })().finally(() => {
+    alertWorker = null;
+    if (alertQueue.length > 0) kickAlertWorker();
+  });
+}
+
+function enqueueAlert(item) {
+  alertQueue.push(item);
+  stats.alertsQueued++;
+  if (alertQueue.length === ALERT_QUEUE_WARN_AT || alertQueue.length % ALERT_QUEUE_WARN_AT === 0) {
+    console.warn(`[SOLTRACK] Alert queue backlog: ${alertQueue.length}`);
+  }
+  kickAlertWorker();
+}
+
+async function processSoltrackAlert({ frame, vehicle, plate, eventTime, speed, lat, lon, seqNo }) {
+  const { fleetNumber, ccId, mettaxDeviceId } = vehicle;
+  await soltrackEngineSessionService.handleEngineStatus({
+    fleetNumber,
+    registration: plate,
+    costCenterId: ccId,
+    status: frame.status,
+    eventTime,
+    speed,
+    lat,
+    lon,
+  }).catch((err) => {
+    console.error('[SOLTRACK] Engine status handling failed:', err.message);
+  });
+
+  const nameMap = await getTelematicsNameMap(ccId ? [ccId] : []).catch(() => ({}));
+  const matchedDef = matchAlertDefinition(
+    frame.status,
+    nameMap.nameMap || {},
+    nameMap.signalCodeMap || {}
+  );
+
+  if (!matchedDef) {
+    stats.noMatch++;
+    console.log(`[SOLTRACK] Status "${frame.status}" has no matching definition for fleet ${fleetNumber} (cc=${ccId || 'global'})`);
+    return;
+  }
+
+  const alertId = `stl-${fleetNumber}-${Date.now()}-${++alertSeq || seqNo}`;
+  const deviceName = `${fleetNumber}${plate ? ' - ' + plate : ''}`;
+  const alarmText = `${frame.status}${frame.geoZone ? ' in zone ' + frame.geoZone : ''}`;
+  const severity = String(matchedDef.severity || 'MEDIUM').toUpperCase();
+
+  const alertPayload = {
+    id: alertId,
+    alertId,
+    deviceId: fleetNumber,
+    deviceName,
+    alarmType: matchedDef.name,
+    alarmText,
+    alarmTs: eventTime,
+    lat,
+    lon,
+    speed: speed ?? null,
+    severity,
+    fleetNumber,
+    sourceType: 'telematics',
+    sourceDeviceId: plate,
+    mettaxDeviceId,
+  };
+
+  // Raw alert history (same store as video/MetTax alerts).
+  await db.ensureMemberRow({ ...alertPayload, groupId: null });
+
+  const alertCombos = require('./alertCombos');
+  const comboResult = await alertCombos.handleDetection({
+    alertId,
+    deviceId: fleetNumber,
+    deviceName,
+    alarmType: matchedDef.name,
+    alarmText,
+    alarmTs: eventTime,
+    lat,
+    lon,
+    speed: speed ?? null,
+    severity: String(matchedDef.severity || 'MEDIUM').toLowerCase(),
+    fleetNumber,
+    sourceType: 'telematics',
+    costCenterId: ccId,
+    sourceDeviceId: plate,
+    mettaxDeviceId,
+  });
+
+  let groupRows = comboResult.groupRows;
+  if (comboResult.action === 'pass') {
+    const created = await db.upsertAlertGroup({
+      ...alertPayload,
+      severity: String(matchedDef.severity || 'MEDIUM').toLowerCase(),
+      registration: plate,
+      costCenterId: ccId,
+    });
+    groupRows = created ? [created] : [];
+  }
+
+  const groupRow = groupRows[0] || null;
+  if (groupRow) {
+    // Link the raw alert to the raised/bumped group. ON CONFLICT fills the
+    // group id without overwriting the original member data.
+    await db.ensureMemberRow({ ...alertPayload, groupId: groupRow.id });
+  }
+
+  await db.query(
+    `INSERT INTO telematics_events (device_id, vehicle_id, license_plate, fleet_number, plate,
+      event_type, event_code, severity, latitude, longitude, speed, description, driver_name, zone_name, raw_data, event_time,
+      source_device_id, mettax_device_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+     ON CONFLICT DO NOTHING`,
+    [
+      fleetNumber, fleetNumber, plate, fleetNumber, plate,
+      matchedDef.name, null, severity,
+      lat, lon, speed,
+      frame.status, frame.driver || null, frame.geoZone || null,
+      JSON.stringify(frame), eventTime, plate, mettaxDeviceId,
+    ]
+  );
+
+  if (wsBroadcast) {
+    try {
+      const groupCount = Number(groupRow?.count || 1) || 1;
+      const baseSeverity = String(groupRow?.severity || matchedDef.severity || 'MEDIUM').toLowerCase();
+      const escalatedSeverity = escalateSeverity(baseSeverity, groupCount);
+      const groupId = groupRow?.id != null ? String(groupRow.id) : '';
+      if (groupId) {
+        wsBroadcast('new-alert', {
+          alert: {
+            id: groupId,
+            alert_id: groupId,
+            last_alert_id: alertId,
+            alarmId: alertId,
+            alarm_id: alertId,
+            device_id: fleetNumber,
+            deviceId: fleetNumber,
+            vehicleId: fleetNumber,
+            device_name: deviceName,
+            deviceName,
+            alert_type: matchedDef.name,
+            alarm_type: matchedDef.name,
+            type: matchedDef.name,
+            title: matchedDef.name,
+            alarmText,
+            timestamp: new Date(eventTime).toISOString(),
+            alarmTs: new Date(eventTime).toISOString(),
+            last_occurrence: new Date(eventTime).toISOString(),
+            source_type: 'telematics',
+            severity: escalatedSeverity,
+            priority: escalatedSeverity,
+            base_severity: baseSeverity,
+            escalated: escalatedSeverity !== baseSeverity,
+            status: 'new',
+            resolved: false,
+            count: groupCount,
+            group_key: groupRow?.group_key || `${fleetNumber}:${matchedDef.name}`.toLowerCase(),
+            lat,
+            lon,
+            fleet_number: fleetNumber,
+            vehicle_registration: plate,
+          },
+        });
+      }
+    } catch (_) { /* never block ingest on WS */ }
+
+    try {
+      wsBroadcast('new_event', {
+        id: alertId,
+        deviceId: fleetNumber,
+        fleetNumber,
+        licensePlate: plate,
+        eventType: matchedDef.name,
+        eventCode: null,
+        severity,
+        latitude: lat,
+        longitude: lon,
+        speed,
+        distance: null,
+        durationSeconds: null,
+        driverName: frame.driver || null,
+        description: frame.status,
+        zoneName: frame.geoZone || null,
+        eventTime: eventTime.toISOString(),
+        source: 'soltrack',
+      });
+    } catch (_) {}
+  }
+
+  console.log(`[SOLTRACK] Alert created: ${alertId} (${matchedDef.name}) for fleet ${fleetNumber} reg ${plate} status="${frame.status}"`);
+  stats.matched++;
+}
+
 async function handleFrame(frame) {
   stats.frames++;
   const vehicle = resolveVehicle(frame.reg);
@@ -142,217 +457,99 @@ async function handleFrame(frame) {
     stats.unknown++;
     if (!lastLogged.has(normalizeReg(frame.reg))) {
       lastLogged.set(normalizeReg(frame.reg), true);
-      console.log(`[SOLTRACK] Skipping unknown vehicle reg=${frame.reg}`);
+      if (unknownLogged < UNKNOWN_LOG_LIMIT) {
+        unknownLogged++;
+        console.log(`[SOLTRACK] Skipping unknown fleet=${frame.reg}`);
+      }
     }
     await logUnknownVehicle(frame.reg, frame);
     return { matched: false, reason: 'unknown_vehicle' };
   }
 
-  const { fleetNumber, ccId, mettaxDeviceId } = vehicle;
-  const plate = frame.reg;
+  const { fleetNumber, registrationNumber, ccId, mettaxDeviceId } = vehicle;
+  const plate = registrationNumber || frame.reg;
   const eventTime = parseEventTime(frame.locTime);
   const speed = frame.speed || 0;
-  const nowSeq = ++seq;
+  const lat = Number.isFinite(frame.lat) ? frame.lat : null;
+  const lon = Number.isFinite(frame.lon) ? frame.lon : null;
+  const seqNo = ++seq;
 
-  // ── 1. Realtime status (position broadcast + vehicle_status upsert) ──
+  if (lat != null && lon != null) {
+    queueTelemetryHistory({ fleetNumber, registration: plate, lat, lon, eventTime });
+  }
+
   const position = {
     device_id: fleetNumber,
     plate,
     license_plate: plate,
     fleet_number: fleetNumber,
     speed,
-    latitude: frame.lat,
-    longitude: frame.lon,
+    lat,
+    lon,
+    latitude: lat,
+    longitude: lon,
+    bearing: null,
+    observed_at: eventTime.toISOString(),
     last_log_time: eventTime.toISOString(),
+    is_online: true,
+    is_driving: speed > 0,
+    source: 'soltrack',
     current_zone: frame.geoZone || null,
     driver: frame.driver || null,
-    source: 'soltrack',
+    sequence: seqNo,
+    received_at: Date.now(),
   };
-  if (wsBroadcast) {
-    try { wsBroadcast('vehicle_position', position); } catch (_) {}
-  }
-  try { sseHub.publishTelemetry(position); } catch (_) {}
-  try {
-    await db.upsertVehicleStatus(fleetNumber, {
-      plate,
-      licensePlate: plate,
-      fleetNumber,
-      speed,
-      latitude: frame.lat,
-      longitude: frame.lon,
-      lastLogTime: eventTime.toISOString(),
-    });
-  } catch (err) {
-    console.error('[SOLTRACK] vehicle_status upsert error:', err.message);
+
+  const existing = positionBuffer.get(fleetNumber);
+  const isNewer = !existing || new Date(position.last_log_time) >= new Date(existing.last_log_time);
+  if (isNewer) {
+    positionBuffer.set(fleetNumber, position);
+    if (positionBuffer.size >= 1000) void flushPositions();
+    if (wsBroadcast) {
+      try { wsBroadcast('vehicle_position', position); } catch (_) {}
+    }
+    try { sseHub.publishTelemetry(position); } catch (_) {}
   }
 
-  // ── 2. CC-aware status -> alert definition match (name only, no multicode) ──
+  if (lat != null && lon != null) {
+    const last = lastZoneCheck.get(fleetNumber) || 0;
+    if (Date.now() - last >= ZONE_CHECK_MIN_MS) {
+      lastZoneCheck.set(fleetNumber, Date.now());
+      soltrackZoneService.checkVehicleZones({
+        fleetNumber,
+        registration: plate,
+        lat,
+        lon,
+        speed,
+        eventTime,
+      }).catch(err => {
+        console.error('[SOLTRACK] Zone breach check error:', err.message);
+      });
+    }
+  }
+
+  if (lat != null && lon != null) {
+    const lastEngine = lastEngineCheck.get(fleetNumber) || 0;
+    if (Date.now() - lastEngine >= ENGINE_CHECK_MIN_MS) {
+      lastEngineCheck.set(fleetNumber, Date.now());
+      soltrackEngineSessionService.evaluateEngineThresholds({
+        fleetNumber,
+        registration: plate,
+        lat,
+        lon,
+        speed,
+        eventTime,
+      }).catch(err => {
+        console.error('[SOLTRACK] Engine threshold check error:', err.message);
+      });
+    }
+  }
+
   if (frame.status) {
-    const nameMap = await getTelematicsNameMap(ccId ? [ccId] : []).catch(() => ({}));
-    const matchedDef = matchAlertDefinition(frame.status, nameMap.nameMap || {}, nameMap.signalCodeMap || {});
-
-    if (matchedDef) {
-      const alertId = `stl-${fleetNumber}-${Date.now()}-${nowSeq}`;
-      const deviceName = `${fleetNumber}${plate ? ' - ' + plate : ''}`;
-      const alarmText = `${frame.status}${frame.geoZone ? ' in zone ' + frame.geoZone : ''}`;
-      const severity = String(matchedDef.severity || 'MEDIUM').toUpperCase();
-
-      try {
-        // No per-event row in `alerts` — alert_groups is the store, and the
-        // event archive is telematics_events (written below).
-        // A member of an enabled AND-combination group is held back until the
-        // whole set fires for this vehicle; then one merged group is raised.
-        const alertCombos = require('./alertCombos');
-        const comboResult = await alertCombos.handleDetection({
-          alertId,
-          deviceId: fleetNumber,
-          deviceName,
-          alarmType: matchedDef.name,
-          alarmText,
-          alarmTs: eventTime,
-          lat: frame.lat,
-          lon: frame.lon,
-          speed: speed ?? null,
-          severity: String(matchedDef.severity || 'MEDIUM').toLowerCase(),
-          fleetNumber,
-          sourceType: 'telematics',
-          costCenterId: ccId,
-          sourceDeviceId: plate,
-          mettaxDeviceId,
-        });
-        let groupRows = comboResult.groupRows;
-        if (comboResult.action === 'pass') {
-          const created = await db.upsertAlertGroup({
-            deviceId: fleetNumber,
-            deviceName,
-            alarmType: matchedDef.name,
-            alarmText,
-            alertId,
-            alarmTs: eventTime,
-            lat: frame.lat,
-            lon: frame.lon,
-            speed: speed ?? null,
-            sourceType: 'telematics',
-            severity: String(matchedDef.severity || 'MEDIUM').toLowerCase(),
-            sourceDeviceId: plate,
-            mettaxDeviceId,
-          });
-          groupRows = created ? [created] : [];
-        }
-        const groupRow = groupRows[0] || null;
-        const isComboRow = comboResult.action === 'raised' && groupRow && groupRow.combo_name != null;
-        const broadcastType = isComboRow ? String(groupRow.alarm_type || matchedDef.name) : matchedDef.name;
-        const broadcastSeverity = isComboRow
-          ? String(groupRow.severity || matchedDef.severity || 'MEDIUM').toLowerCase()
-          : String(severity || 'medium').toLowerCase();
-
-        await db.query(
-          `INSERT INTO telematics_events (device_id, vehicle_id, license_plate, fleet_number, plate,
-            event_type, event_code, severity, latitude, longitude, speed, description, driver_name, zone_name, raw_data, event_time,
-            source_device_id, mettax_device_id)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
-           ON CONFLICT DO NOTHING`,
-          [
-            fleetNumber, fleetNumber, plate, fleetNumber, plate,
-            matchedDef.name, null, severity,
-            frame.lat, frame.lon, speed,
-            frame.status, frame.driver || null, frame.geoZone || null,
-            JSON.stringify(frame), eventTime, plate, mettaxDeviceId,
-          ]
-        );
-
-        if (wsBroadcast) {
-          try {
-            const groupCount = Number(groupRow?.count || 1) || 1;
-            const baseSeverity = broadcastSeverity;
-            const escalatedSeverity = escalateSeverity(baseSeverity, groupCount);
-            // Resolve targets alert_groups.id only — never the stl- event key.
-            const groupId = groupRow?.id != null ? String(groupRow.id) : '';
-            if (groupId) {
-            wsBroadcast('new-alert', {
-              alert: {
-                id: groupId,
-                alert_id: groupId,
-                last_alert_id: alertId,
-                alarmId: alertId,
-                alarm_id: alertId,
-                device_id: fleetNumber,
-                deviceId: fleetNumber,
-                vehicleId: fleetNumber,
-                device_name: deviceName,
-                deviceName,
-                alert_type: broadcastType,
-                alarm_type: broadcastType,
-                type: broadcastType,
-                title: broadcastType,
-                alarmText: isComboRow ? `${broadcastType} — ${matchedDef.name} combined` : alarmText,
-                timestamp: new Date(eventTime).toISOString(),
-                alarmTs: new Date(eventTime).toISOString(),
-                last_occurrence: new Date(eventTime).toISOString(),
-                source_type: 'telematics',
-                severity: escalatedSeverity,
-                priority: escalatedSeverity,
-                base_severity: baseSeverity,
-                escalated: escalatedSeverity !== baseSeverity,
-                status: 'new',
-                resolved: false,
-                count: groupCount,
-                combo: isComboRow ? groupRow.combo_name : undefined,
-                group_key: groupRow?.group_key || `${fleetNumber}:${broadcastType}`.toLowerCase(),
-                lat: frame.lat,
-                lon: frame.lon,
-                fleet_number: fleetNumber,
-                vehicle_registration: plate,
-              },
-            });
-            }
-          } catch (_) { /* never block ingest on WS */ }
-          try {
-            wsBroadcast('new_event', {
-              id: alertId,
-              deviceId: fleetNumber,
-              fleetNumber,
-              licensePlate: plate,
-              eventType: matchedDef.name,
-              eventCode: null,
-              severity,
-              latitude: frame.lat,
-              longitude: frame.lon,
-              speed,
-              distance: null,
-              durationSeconds: null,
-              driverName: frame.driver || null,
-              description: frame.status,
-              zoneName: frame.geoZone || null,
-              eventTime: eventTime.toISOString(),
-              source: 'soltrack',
-            });
-          } catch (_) {}
-        }
-
-        console.log(`[SOLTRACK] Alert created: ${alertId} (${matchedDef.name}) for fleet ${fleetNumber} reg ${plate} status="${frame.status}"`);
-        stats.matched++;
-        return { matched: true, alertId };
-      } catch (err) {
-        console.error('[SOLTRACK] Failed to store alert:', err.message);
-        return { matched: true, error: err.message };
-      }
-    }
-
-    console.log(`[SOLTRACK] Status "${frame.status}" has no matching definition for fleet ${fleetNumber} (cc=${ccId || 'global'})`);
-    stats.noMatch++;
+    enqueueAlert({ frame, vehicle, plate, eventTime, speed, lat, lon, seqNo });
   }
 
-  // ── 3. High-risk geozone detection (persists + broadcasts zone_breach) ──
-  if (frame.lat && frame.lon) {
-    try {
-      await checkZoneBreaches(fleetNumber, frame.lat, frame.lon, speed, fleetNumber, plate);
-    } catch (err) {
-      console.error('[SOLTRACK] Zone breach check error:', err.message);
-    }
-  }
-
-  return { matched: false };
+  return { matched: false, buffered: true };
 }
 
 function handleRawMessage(raw) {
@@ -378,16 +575,21 @@ function start() {
     return;
   }
   stopping = false;
-  loadFleetDict();
+  loadFleetDict()
+    .catch(() => {})
+    .finally(() => {
+      if (!stopping) connect(url);
+    });
   if (dictTimer) clearInterval(dictTimer);
   dictTimer = setInterval(loadFleetDict, DICT_TTL);
   if (statsTimer) clearInterval(statsTimer);
   statsTimer = setInterval(() => {
     const s = stats;
-    console.log(`[SOLTRACK] 60s: ${s.msgs} msgs, ${s.frames} frames, ${s.matched} matched, ${s.noMatch} no-match, ${s.unknown} unknown`);
-    Object.assign(s, { msgs: 0, frames: 0, matched: 0, noMatch: 0, unknown: 0 });
+    console.log(`[SOLTRACK] 60s: ${s.msgs} msgs, ${s.frames} frames, ${s.matched} matched, ${s.noMatch} no-match, ${s.unknown} unknown, ${s.positionsFlushed} positions flushed, ${s.historyRows} history rows, ${alertQueue.length} queued`);
+    Object.assign(s, { msgs: 0, frames: 0, matched: 0, noMatch: 0, unknown: 0, positionsFlushed: 0, historyRows: 0, alertsQueued: 0 });
   }, 60 * 1000);
-  connect(url);
+  if (flushTimer) clearInterval(flushTimer);
+  flushTimer = setInterval(() => { void flushPositions(); void flushTelemetryHistory(); }, POSITION_FLUSH_MS);
 }
 
 function connect(url) {
@@ -431,8 +633,21 @@ function stop() {
   stopping = true;
   if (dictTimer) { clearInterval(dictTimer); dictTimer = null; }
   if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
+  if (flushTimer) { clearInterval(flushTimer); flushTimer = null; }
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   if (ws) { try { ws.close(); } catch (_) {} ws = null; }
+  void flushTelemetryHistory();
 }
 
-module.exports = { start, stop, setWsBroadcast, handleFrame, parseFrame, normalizeReg, refreshFleetDict: loadFleetDict, resolveVehicle };
+module.exports = {
+  start,
+  stop,
+  setWsBroadcast,
+  handleFrame,
+  parseFrame,
+  normalizeReg,
+  refreshFleetDict: loadFleetDict,
+  resolveVehicle,
+  flushPositions,
+  flushTelemetryHistory,
+};

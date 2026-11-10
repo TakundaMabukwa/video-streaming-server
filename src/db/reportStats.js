@@ -272,6 +272,7 @@ async function getNcrRegister({ status, from, to, costCenterIds, q, pageSize = 5
   const result = await query(
     `SELECT nf.id AS form_id, nf.ncr_no, nf.status AS form_status, nf.created_by_email,
             nf.created_at AS form_created_at, nf.updated_at AS form_updated_at,
+            nf.closed_at,
             nf.form_data,
             i.id AS incident_id, i.incident_no, ${normalizedStatusSql} AS incident_status,
             to_char(i.incident_date, 'YYYY-MM-DD') AS incident_date,
@@ -293,7 +294,39 @@ async function getNcrRegister({ status, from, to, costCenterIds, q, pageSize = 5
       LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
     [...params, limit, offset]
   );
-  return { rows: result.rows, total: countResult.rows[0].total, page: parseInt(pageIndex) || 1, pageSize: limit };
+
+  const rows = result.rows;
+  if (rows.length > 0) {
+    const formIds = [...new Set(rows.map((row) => row.form_id).filter(Boolean))];
+    const incidentIds = [...new Set(rows.map((row) => row.incident_id).filter(Boolean))];
+    const documents = await query(
+      `SELECT id, ncr_form_id, incident_id, name
+         FROM ncr_documents
+        WHERE ncr_form_id = ANY($1::uuid[])
+           OR (ncr_form_id IS NULL AND incident_id = ANY($2::uuid[]))
+        ORDER BY created_at ASC, name ASC`,
+      [formIds, incidentIds]
+    );
+
+    const byForm = new Map();
+    const byIncident = new Map();
+    for (const doc of documents.rows) {
+      const name = String(doc.name || '').trim();
+      if (!name) continue;
+      const bucket = doc.ncr_form_id ? byForm : byIncident;
+      const key = doc.ncr_form_id || doc.incident_id;
+      if (!key) continue;
+      if (!bucket.has(key)) bucket.set(key, []);
+      bucket.get(key).push(name);
+    }
+
+    for (const row of rows) {
+      const names = byForm.get(row.form_id) || byIncident.get(row.incident_id) || [];
+      row.attached_docs = [...new Set(names)];
+    }
+  }
+
+  return { rows, total: countResult.rows[0].total, page: parseInt(pageIndex) || 1, pageSize: limit };
 }
 
 module.exports = {

@@ -353,6 +353,7 @@ async function getNcrForm(formId) {
     created_by_email: form.created_by_email,
     created_at: form.created_at,
     updated_at: form.updated_at,
+    closed_at: form.closed_at || null,
     archive_url: form.archive_url || null,
     archive_status: form.archive_status || null,
     archive_error: form.archive_error || null,

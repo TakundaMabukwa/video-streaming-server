@@ -719,6 +719,43 @@ async function upsertVehicleStatus(deviceId, data) {
   ).catch(() => {});
 }
 
+// Batched telemetry write for high-volume feeds (Soltrack). One pool
+// connection per flush instead of one per frame.
+async function batchUpsertVehicleStatus(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) return 0;
+  const result = await query(
+    `INSERT INTO vehicle_status
+       (device_id, plate, license_plate, fleet_number, speed, latitude, longitude,
+        bearing, last_log_time, last_update, is_online, is_driving)
+     SELECT x.device_id, x.plate, x.license_plate, x.fleet_number, x.speed,
+            x.latitude, x.longitude, x.bearing, x.last_log_time, NOW(),
+            x.is_online, x.is_driving
+       FROM jsonb_to_recordset($1::jsonb) AS x(
+         device_id text, plate text, license_plate text, fleet_number text,
+         speed double precision, latitude double precision, longitude double precision,
+         bearing double precision, last_log_time timestamptz,
+         is_online boolean, is_driving boolean
+       )
+     ON CONFLICT (device_id) DO UPDATE SET
+       plate = COALESCE(EXCLUDED.plate, vehicle_status.plate),
+       license_plate = COALESCE(EXCLUDED.license_plate, vehicle_status.license_plate),
+       fleet_number = COALESCE(EXCLUDED.fleet_number, vehicle_status.fleet_number),
+       speed = COALESCE(EXCLUDED.speed, vehicle_status.speed),
+       latitude = COALESCE(EXCLUDED.latitude, vehicle_status.latitude),
+       longitude = COALESCE(EXCLUDED.longitude, vehicle_status.longitude),
+       bearing = COALESCE(EXCLUDED.bearing, vehicle_status.bearing),
+       last_log_time = COALESCE(EXCLUDED.last_log_time, vehicle_status.last_log_time),
+       is_online = COALESCE(EXCLUDED.is_online, vehicle_status.is_online),
+       is_driving = COALESCE(EXCLUDED.is_driving, vehicle_status.is_driving),
+       last_update = NOW()
+     WHERE vehicle_status.last_log_time IS NULL
+        OR EXCLUDED.last_log_time IS NULL
+        OR EXCLUDED.last_log_time >= vehicle_status.last_log_time`,
+    [JSON.stringify(rows)]
+  );
+  return result.rowCount || 0;
+}
+
 async function getVehicleStatus(deviceId) {
   const result = await query('SELECT * FROM vehicle_status WHERE device_id = $1', [deviceId]);
   return result.rows[0] || null;
@@ -1030,6 +1067,7 @@ module.exports = {
   getVehicleLogRecords,
   getLatestLogRecord,
   upsertVehicleStatus,
+  batchUpsertVehicleStatus,
   getVehicleStatus,
   getAllVehicleStatus,
   insertZoneEntry,

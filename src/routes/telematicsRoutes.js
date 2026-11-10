@@ -439,7 +439,9 @@ async function zoneCachesRefresh() {
   // Lazy require: mirror the pollers' own pattern, avoids load-order coupling.
   const deviceStatusPoller = require('../services/deviceStatusPoller');
   const geotabPolling = require('../services/geotabPolling');
+  const soltrackZoneService = require('../services/soltrackZoneService');
   deviceStatusPoller.invalidateZonesCache();
+  soltrackZoneService.invalidateZonesCache();
   await geotabPolling.refreshZoneCaches();
 }
 

@@ -57,6 +57,27 @@ function asInt(value) {
   return Number.isFinite(n) ? n : null;
 }
 
+// Documents are uploadable only while the NCR is still being worked. Once it
+// is in REVIEW or CLOSED the attached paperwork is part of the record and
+// must stay read-only.
+async function incidentNcrLock(incidentId) {
+  const { rows } = await db.query(
+    `SELECT id, status FROM ncr_forms
+      WHERE incident_id = $1
+      ORDER BY created_at DESC
+      LIMIT 1`,
+    [incidentId]
+  );
+  if (rows.length === 0) return { formId: null, status: null, locked: false };
+  const status = String(rows[0].status || '').trim().toUpperCase();
+  return { formId: rows[0].id, status, locked: status === 'REVIEW' || status === 'CLOSED' };
+}
+
+function lockedNcrMessage(status) {
+  const label = status === 'REVIEW' ? 'review' : 'closed';
+  return `Documents on a ${label} NCR are read-only`;
+}
+
 // ── GET /eps/reports/closed-alerts/snapshot ─────────────────────────────
 // Closed-alerts-only report. Scoped by SAST calendar dates, summarized on the
 // server and returned as aggregates + one page.
@@ -612,6 +633,8 @@ router.post('/incidents/:id/documents/upload-url', async (req, res) => {
     }
     const incident = await db.getIncident(incidentId);
     if (!incident) return res.status(404).json({ success: false, message: 'Incident not found' });
+    const ncrLock = await incidentNcrLock(incidentId);
+    if (ncrLock.locked) return res.status(409).json({ success: false, message: lockedNcrMessage(ncrLock.status) });
 
     const rawName = String(req.body?.name || 'document');
     const safeBase = rawName.replace(/[^a-zA-Z0-9._-]/g, '_').slice(-80) || 'document';
@@ -646,6 +669,8 @@ router.post('/incidents/:id/documents', async (req, res) => {
 
     const incident = await db.getIncident(incidentId);
     if (!incident) return res.status(404).json({ success: false, message: 'Incident not found' });
+    const ncrLock = await incidentNcrLock(incidentId);
+    if (ncrLock.locked) return res.status(409).json({ success: false, message: lockedNcrMessage(ncrLock.status) });
 
     let storagePath = String(req.body?.storage_path || '').trim();
     let fileName = String(req.body?.name || '').trim() || 'document';
@@ -677,11 +702,7 @@ router.post('/incidents/:id/documents', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Invalid document path' });
     }
 
-    const forms = await db.query(
-      `SELECT id FROM ncr_forms WHERE incident_id = $1 ORDER BY created_at DESC LIMIT 1`,
-      [incidentId]
-    );
-    const ncrFormId = forms.rows[0]?.id || null;
+    const ncrFormId = ncrLock.formId;
 
     const row = await reportStats.insertIncidentDocument({
       incident_id: incidentId,
@@ -709,9 +730,14 @@ router.get('/incidents/:id/documents', async (req, res) => {
     const incidentId = String(req.params.id || '').trim();
     if (!incidentId) return res.status(400).json({ success: false, message: 'Incident id required' });
     const rows = await reportStats.getIncidentDocuments(incidentId);
+    const wantsDownload = ['1', 'true'].includes(String(req.query.download || '').toLowerCase());
     const documents = [];
     for (const row of rows) {
-      const url = await storage.createPrivateDocumentUrl(row.storage_path);
+      const url = await storage.createPrivateDocumentUrl(
+        row.storage_path,
+        undefined,
+        wantsDownload ? row.name : null
+      );
       documents.push({ ...row, url });
     }
     res.json({ success: true, documents, expires_in: storage.SIGNED_URL_TTL_SECONDS });
@@ -724,7 +750,26 @@ router.get('/incidents/:id/documents', async (req, res) => {
 // ── DELETE /eps/reports/incidents/:id/documents/:docId ───────────────────
 router.delete('/incidents/:id/documents/:docId', async (req, res) => {
   try {
-    const removed = await reportStats.deleteIncidentDocument(String(req.params.docId || '').trim());
+    const docId = String(req.params.docId || '').trim();
+    const doc = await db.query(
+      `SELECT id, incident_id, ncr_form_id FROM ncr_documents WHERE id = $1`,
+      [docId]
+    );
+    if (doc.rows.length === 0) return res.status(404).json({ success: false, message: 'Document not found' });
+
+    let status = null;
+    if (doc.rows[0].ncr_form_id) {
+      const form = await db.query(`SELECT status FROM ncr_forms WHERE id = $1`, [doc.rows[0].ncr_form_id]);
+      status = String(form.rows[0]?.status || '').trim().toUpperCase() || null;
+    } else if (doc.rows[0].incident_id) {
+      const ncrLock = await incidentNcrLock(doc.rows[0].incident_id);
+      status = ncrLock.status;
+    }
+    if (status === 'REVIEW' || status === 'CLOSED') {
+      return res.status(409).json({ success: false, message: lockedNcrMessage(status) });
+    }
+
+    const removed = await reportStats.deleteIncidentDocument(docId);
     if (!removed) return res.status(404).json({ success: false, message: 'Document not found' });
     res.json({ success: true, removed: true });
   } catch (err) {

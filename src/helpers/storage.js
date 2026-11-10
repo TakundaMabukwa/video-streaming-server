@@ -82,11 +82,11 @@ async function uploadPrivateDocument(buffer, fileName, contentType) {
   return fileName;
 }
 
-async function createPrivateDocumentUrl(storagePath, ttlSeconds = SIGNED_URL_TTL_SECONDS) {
+async function createPrivateDocumentUrl(storagePath, ttlSeconds = SIGNED_URL_TTL_SECONDS, downloadName = null) {
   if (!supabase) return null;
   const { data, error } = await supabase.storage
     .from(NCR_DOCUMENTS_BUCKET)
-    .createSignedUrl(storagePath, ttlSeconds);
+    .createSignedUrl(storagePath, ttlSeconds, downloadName ? { download: downloadName } : undefined);
   if (error) {
     console.error('[Storage] Signed URL failed:', error.message);
     return null;
