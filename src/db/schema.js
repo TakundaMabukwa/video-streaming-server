@@ -140,6 +140,10 @@ const MIGRATIONS_SQL = `
   -- Only backfills alarm types that STILL EXIST as active alert_definitions;
   -- a definition deleted in Alert Config must never be resurrected here on a
   -- later boot (the legacy alerts archive still holds its old rows).
+  CREATE TABLE IF NOT EXISTS schema_migrations (
+    key TEXT PRIMARY KEY,
+    applied_at TIMESTAMPTZ DEFAULT NOW()
+  );
   INSERT INTO alert_groups (group_key, device_id, device_name, alarm_type, alarm_text, count, last_alert_id, last_alert_ts, lat, lon, status, resolved, false_alert, notes, documents, source_type, created_at, updated_at)
   SELECT
     LOWER(CONCAT(a.device_id, ':', a.alarm_type)) AS group_key,
@@ -179,6 +183,12 @@ const MIGRATIONS_SQL = `
       )
     )
   WHERE NOT EXISTS (
+    SELECT 1 FROM schema_migrations WHERE key = 'alert_groups_backfill_v1'
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM alert_groups
+  )
+  AND NOT EXISTS (
     -- Never resurrect a twin next to a live group: if the device+type already
     -- has an open, genuine group, the backfill skips it (this also keeps the
     -- one-live-group unique index satisfiable on every boot).
@@ -193,6 +203,8 @@ const MIGRATIONS_SQL = `
   AND a.combo_state IS DISTINCT FROM 'pending'
   GROUP BY a.device_id, a.device_name, a.alarm_type, a.alarm_text, a.source_type
   ON CONFLICT (group_key) DO NOTHING;
+  INSERT INTO schema_migrations (key) VALUES ('alert_groups_backfill_v1')
+    ON CONFLICT (key) DO NOTHING;
 
   -- Add resolved_at / resolved_by columns to alert_groups
   ALTER TABLE alert_groups ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ;
