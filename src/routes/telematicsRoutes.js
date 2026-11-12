@@ -650,14 +650,66 @@ router.get('/route', async (req, res) => {
   }
 });
 
-// ── Priority Zones (high-risk + no-go first) ──
+// ── Priority Zones (all risk types) ──
 
 router.get('/zones-priority', async (req, res) => {
   try {
-    const allZones = await db.getGeotabZones();
-    const priority = allZones.filter(z => z.is_high_risk || z.is_no_go);
-    const rest = allZones.filter(z => !z.is_high_risk && !z.is_no_go);
-    res.json({ success: true, priority, rest, total: allZones.length });
+    // Same set the in-zone risk checks use: high-risk OR no-go OR no-stopping.
+    const priority = await db.getHighRiskZones();
+    res.json({ success: true, priority, total: priority.length });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// Escape LIKE/ILIKE wildcards so a user search for "%" or "_" is literal.
+function escapeLike(value) {
+  return String(value).replace(/[\\%_]/g, (m) => `\\${m}`);
+}
+
+// ── Client Zones (everything not in the risk set) ──
+// Server-side pagination + search because this table holds thousands of zones.
+// Search matches name OR comment (the Notes column).
+router.get('/zones-clients', async (req, res) => {
+  try {
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const pageSize = Math.min(Math.max(parseInt(req.query.pageSize, 10) || 50, 1), 200);
+    const search = String(req.query.search || '').trim();
+
+    const where = [
+      'is_deleted IS NOT TRUE',
+      'is_high_risk IS NOT TRUE',
+      'is_no_go IS NOT TRUE',
+      'is_no_stopping IS NOT TRUE',
+    ];
+    const params = [];
+
+    if (search) {
+      params.push(`%${escapeLike(search)}%`);
+      where.push(`(name ILIKE $${params.length} OR comment ILIKE $${params.length})`);
+    }
+
+    const whereSql = where.join(' AND ');
+
+    const countResult = await db.query(
+      `SELECT COUNT(*)::int AS total FROM geotab_zones WHERE ${whereSql}`,
+      params
+    );
+    const total = countResult.rows[0]?.total || 0;
+    const totalPages = Math.max(Math.ceil(total / pageSize), 1);
+    const offset = (page - 1) * pageSize;
+
+    const result = await db.query(
+      `SELECT id, name, points, comment, is_high_risk, is_no_go, is_no_stopping,
+              zone_types, last_synced, locally_modified
+       FROM geotab_zones
+       WHERE ${whereSql}
+       ORDER BY name
+       LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+      [...params, pageSize, offset]
+    );
+
+    res.json({ success: true, data: result.rows, total, page, pageSize, totalPages });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
