@@ -130,11 +130,15 @@ router.post('/standalone', async (req, res) => {
 router.get('/register', async (req, res) => {
   try {
     const reportStats = require('../db/reportStats');
-    const { status, from, to, costCenterIds, q, pageSize, pageIndex } = req.query;
+    const { status, from, to, costCenterIds, q, pageSize } = req.query;
+    // Accept both names: `pageIndex` is the canonical param, but the NCR tab
+    // historically sent `page`. Without the alias every request fell back to
+    // page 1, so the register's Next button returned the same rows forever.
+    const pageIndex = parseInt(req.query.pageIndex ?? req.query.page, 10) || 1;
     const data = await reportStats.getNcrRegister({
       status, from, to, costCenterIds, q,
       pageSize: parseInt(pageSize) || 50,
-      pageIndex: parseInt(pageIndex) || 1,
+      pageIndex,
     });
     res.json({ success: true, ...data });
   } catch (err) {

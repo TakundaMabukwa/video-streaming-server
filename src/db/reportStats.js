@@ -197,7 +197,9 @@ async function deleteIncidentDocument(id) {
 async function getNcrRegister({ status, from, to, costCenterIds, q, pageSize = 50, pageIndex = 1 } = {}) {
   const conditions = [];
   const params = [];
-  const limit = Math.min(Math.max(parseInt(pageSize) || 50, 1), 500);
+  // Export callers ask for a large page to pull the whole register in one go;
+  // keep the clamp high enough that it is not silently truncated.
+  const limit = Math.min(Math.max(parseInt(pageSize) || 50, 1), 5000);
   const offset = (Math.max(parseInt(pageIndex) || 1, 1) - 1) * limit;
 
   // Workflow mapping:
@@ -242,7 +244,11 @@ async function getNcrRegister({ status, from, to, costCenterIds, q, pageSize = 5
   if (ccList.length > 0) {
     params.push(ccList);
     // Vehicle cost centre is authoritative; fall back to the incident's value.
-    conditions.push(`COALESCE(fv.cost_center_id, i.cost_center_id) = ANY($${params.length}::int[])`);
+    // Unassigned rows (no fleet match AND no incident cost centre) are kept:
+    // they belong to no cost centre, so excluding them made the register look
+    // incomplete even when every cost centre was selected.
+    conditions.push(`(COALESCE(fv.cost_center_id, i.cost_center_id) = ANY($${params.length}::int[])
+                      OR COALESCE(fv.cost_center_id, i.cost_center_id) IS NULL)`);
   }
 
   if (q) {
@@ -290,7 +296,7 @@ async function getNcrRegister({ status, from, to, costCenterIds, q, pageSize = 5
        ${fleetCostCenterJoin}
        LEFT JOIN cost_centers fv_cc ON fv_cc.id = fv.cost_center_id
        ${where}
-      ORDER BY nf.created_at DESC
+      ORDER BY nf.created_at DESC, nf.id DESC
       LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
     [...params, limit, offset]
   );
