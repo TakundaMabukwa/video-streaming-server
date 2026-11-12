@@ -1766,10 +1766,26 @@ const MIGRATIONS_SQL = `
     ON fleet_vehicles (UPPER(TRIM(fleet_number)));
 `;
 
+const SCHEMA_VERSION_KEY = 'schema_v_2026_11_12';
+
 async function initializeDatabase() {
   await query(SCHEMA_SQL);
   console.log('[DB] Schema initialized successfully');
+
+  const marker = await query(
+    'SELECT key FROM schema_migrations WHERE key = $1 LIMIT 1',
+    [SCHEMA_VERSION_KEY]
+  ).catch(() => ({ rows: [] }));
+  if (marker.rows.length > 0) {
+    console.log('[DB] Schema already current; migrations skipped');
+    return;
+  }
+
   await query(MIGRATIONS_SQL);
+  await query(
+    'INSERT INTO schema_migrations (key) VALUES ($1) ON CONFLICT (key) DO NOTHING',
+    [SCHEMA_VERSION_KEY]
+  );
   console.log('[DB] Migrations applied successfully');
 }
 
