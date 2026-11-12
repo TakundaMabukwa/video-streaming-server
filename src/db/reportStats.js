@@ -202,6 +202,31 @@ async function getNcrRegister({ status, from, to, costCenterIds, q, pageSize = 5
   const limit = Math.min(Math.max(parseInt(pageSize) || 50, 1), 5000);
   const offset = (Math.max(parseInt(pageIndex) || 1, 1) - 1) * limit;
 
+  // Cost-centre resolution, most authoritative source first:
+  //   1. the vehicle's row in fleet_vehicles
+  //   2. the cost centre stored on the incident
+  //   3. the cost centre captured on the NCR form itself
+  // Step 3 matters because plenty of NCRs are raised against fleet codes that
+  // have no row in fleet_vehicles (e.g. TTW095, PLS246, TTW082). Without it
+  // those rows show no cost centre even though the person filling in the form
+  // picked one. cost_centers names are unique, so a name lookup is safe.
+  const fleetCostCenterJoin = `LEFT JOIN LATERAL (
+    SELECT cost_center_id
+      FROM fleet_vehicles
+     WHERE UPPER(TRIM(fleet_number)) = UPPER(TRIM(i.fleet_number))
+     ORDER BY cost_center_id NULLS LAST
+     LIMIT 1
+  ) fv ON TRUE`;
+
+  const ncrFormCostCenterJoin = `LEFT JOIN cost_centers form_cc_by_id
+       ON form_cc_by_id.id::text = nf.form_data->>'costCenterId'
+      LEFT JOIN cost_centers form_cc_by_name
+       ON lower(trim(form_cc_by_name.name)) = lower(trim(nf.form_data->>'costCenterName'))`;
+
+  const costCenterIdSql = `COALESCE(fv.cost_center_id, i.cost_center_id, form_cc_by_id.id, form_cc_by_name.id)`;
+  const costCenterNameSql = `COALESCE(fv_cc.name, cc.name, form_cc_by_id.name,
+                                   NULLIF(TRIM(nf.form_data->>'costCenterName'), ''))`;
+
   // Workflow mapping:
   //   REVIEW -> Review
   //   CLOSED -> Closed
@@ -243,12 +268,11 @@ async function getNcrRegister({ status, from, to, costCenterIds, q, pageSize = 5
   const ccList = String(costCenterIds || '').split(',').map(s => s.trim()).filter(Boolean).map(Number).filter(n => Number.isFinite(n) && n > 0);
   if (ccList.length > 0) {
     params.push(ccList);
-    // Vehicle cost centre is authoritative; fall back to the incident's value.
-    // Unassigned rows (no fleet match AND no incident cost centre) are kept:
-    // they belong to no cost centre, so excluding them made the register look
-    // incomplete even when every cost centre was selected.
-    conditions.push(`(COALESCE(fv.cost_center_id, i.cost_center_id) = ANY($${params.length}::int[])
-                      OR COALESCE(fv.cost_center_id, i.cost_center_id) IS NULL)`);
+    // Unassigned rows (no vehicle, no incident cost centre, nothing usable on
+    // the form) are kept: they belong to no cost centre, so excluding them made
+    // the register look incomplete even when every cost centre was selected.
+    conditions.push(`(${costCenterIdSql} = ANY($${params.length}::int[])
+                      OR ${costCenterIdSql} IS NULL)`);
   }
 
   if (q) {
@@ -258,19 +282,13 @@ async function getNcrRegister({ status, from, to, costCenterIds, q, pageSize = 5
   }
 
   const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
-  const fleetCostCenterJoin = `LEFT JOIN LATERAL (
-    SELECT cost_center_id
-      FROM fleet_vehicles
-     WHERE UPPER(TRIM(fleet_number)) = UPPER(TRIM(i.fleet_number))
-     ORDER BY cost_center_id NULLS LAST
-     LIMIT 1
-  ) fv ON TRUE`;
 
   const countResult = await query(
     `SELECT COUNT(*)::int AS total
        FROM ncr_forms nf
        JOIN incidents i ON i.id = nf.incident_id
        ${fleetCostCenterJoin}
+       ${ncrFormCostCenterJoin}
        ${where}`,
     params
   );
@@ -286,15 +304,16 @@ async function getNcrRegister({ status, from, to, costCenterIds, q, pageSize = 5
             i.alert_id, i.alarm_type, i.source_type,
             i.fleet_number, i.driver_name, i.contact_number,
             i.infringement, i.infringement_detail, i.action_taken, i.outcome, i.notes,
-            COALESCE(fv.cost_center_id, i.cost_center_id) AS cost_center_id,
+            ${costCenterIdSql} AS cost_center_id,
             i.closure_type, i.resolved_by,
             i.resolved_at, i.created_at AS incident_created_at,
-            COALESCE(fv_cc.name, cc.name) AS cost_center_name
+            ${costCenterNameSql} AS cost_center_name
        FROM ncr_forms nf
        JOIN incidents i ON i.id = nf.incident_id
        LEFT JOIN cost_centers cc ON cc.id = i.cost_center_id
        ${fleetCostCenterJoin}
        LEFT JOIN cost_centers fv_cc ON fv_cc.id = fv.cost_center_id
+       ${ncrFormCostCenterJoin}
        ${where}
       ORDER BY nf.created_at DESC, nf.id DESC
       LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
