@@ -211,7 +211,7 @@ async function getNcrRegister({ status, from, to, costCenterIds, q, pageSize = 5
   // those rows show no cost centre even though the person filling in the form
   // picked one. cost_centers names are unique, so a name lookup is safe.
   const fleetCostCenterJoin = `LEFT JOIN LATERAL (
-    SELECT cost_center_id
+    SELECT cost_center_id, TRUE AS matched
       FROM fleet_vehicles
      WHERE UPPER(TRIM(fleet_number)) = UPPER(TRIM(i.fleet_number))
      ORDER BY cost_center_id NULLS LAST
@@ -303,6 +303,7 @@ async function getNcrRegister({ status, from, to, costCenterIds, q, pageSize = 5
             to_char(i.incident_time, 'HH24:MI') AS incident_time,
             i.alert_id, i.alarm_type, i.source_type,
             i.fleet_number, i.driver_name, i.contact_number,
+            COALESCE(fv.matched, FALSE) AS vehicle_in_system,
             i.infringement, i.infringement_detail, i.action_taken, i.outcome, i.notes,
             ${costCenterIdSql} AS cost_center_id,
             i.closure_type, i.resolved_by,
