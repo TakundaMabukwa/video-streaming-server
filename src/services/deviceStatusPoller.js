@@ -451,11 +451,18 @@ async function emitDeviceStatusAlert({ deviceId, fleetNumber, licensePlate, sign
       ? await findVehicleCostCenterId(canonicalId).catch(() => null)
       : identity.costCenterId;
     const authz = require('../alerts/authorization');
-    const def = await authz.resolveDefinitionForVehicle({ costCenterId: ccId, signalCode }).catch(() => null);
+    const individualDef = await authz.resolveDefinitionForVehicle({ costCenterId: ccId, signalCode }).catch(() => null);
+    const memberDef = individualDef
+      || await authz.resolveComboMemberForVehicle({ costCenterId: ccId, signalCode }).catch(() => null);
+    const def = individualDef || memberDef;
     if (!def) {
       logDropOnce(`def:${signalCode}:${ccId}`, `[DEVSTATUS] dropped ${signalCode} for ${canonicalId}: no active definition for cost centre ${ccId}`);
       return null;
     }
+    // When the type is group-only (individual channel off), the individual
+    // alert_groups row is not raised — upsertAlertGroup returns null below
+    // because canRaiseAlert (individual gate) is false. The combo gate still
+    // runs against the staged detection.
 
     const deviceName = fleetNumber
       ? `${fleetNumber}${licensePlate ? ' - ' + licensePlate : ''}`

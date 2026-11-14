@@ -1013,7 +1013,13 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
         });
       }
 
-      if (!matchedDef || isUnknownDevice) {
+      if (isUnknownDevice) {
+        continue;
+      }
+      if (!matchedDef) {
+        continue;
+      }
+      if (matchedDef.individual === false && matchedDef.member === false) {
         continue;
       }
 

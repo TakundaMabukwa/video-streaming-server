@@ -1819,6 +1819,13 @@ const TELEMATICS_DEDUPE_SQL = `
   END $$;
 `;
 
+const SPLIT_GATES_SQL = `
+  ALTER TABLE alert_definitions ADD COLUMN IF NOT EXISTS individual_active BOOLEAN NOT NULL DEFAULT TRUE;
+  ALTER TABLE alert_definitions ADD COLUMN IF NOT EXISTS member_active BOOLEAN NOT NULL DEFAULT TRUE;
+  ALTER TABLE alert_definition_overrides ADD COLUMN IF NOT EXISTS individual_active BOOLEAN NOT NULL DEFAULT TRUE;
+  ALTER TABLE alert_definition_overrides ADD COLUMN IF NOT EXISTS member_active BOOLEAN NOT NULL DEFAULT TRUE;
+`;
+
 async function initializeDatabase() {
   await query(SCHEMA_SQL);
   console.log('[DB] Schema initialized successfully');
@@ -1842,6 +1849,12 @@ async function initializeDatabase() {
   // dedupe key even though their schema version marker is already current.
   await query(TELEMATICS_DEDUPE_SQL);
   console.log('[DB] Provider-stable telematics dedupe ensured');
+
+  // Always-run, idempotent: split gates (individual vs combo-member channels).
+  // Runs on every boot so production databases with an existing schema_migrations
+  // marker still pick up the new columns (the marker skips MIGRATIONS_SQL).
+  await query(SPLIT_GATES_SQL);
+  console.log('[DB] Split gates (individual/member) ensured');
 }
 
 module.exports = { initializeDatabase };

@@ -430,7 +430,7 @@ async function gateVideoRecordsByCostCenter(records) {
     byDevice.get(did).push(r);
   }
 
-  const globalVideoMap = await getVideoSeverityMap([]).catch(() => ({}));
+  const globalVideoMap = await getVideoSeverityMap([], 'any').catch(() => ({}));
   const ccVideoMaps = {};
   const kept = [];
   let gatedOut = 0;
@@ -442,7 +442,7 @@ async function gateVideoRecordsByCostCenter(records) {
       const fleet = await resolveFleetNumber({ deviceId: did, vehicleRegistration: recs[0]?.deviceName }).catch(() => null);
       const ccId = fleet ? await findVehicleCostCenterId(fleet).catch(() => null) : null;
       if (ccId) {
-        if (!ccVideoMaps[ccId]) ccVideoMaps[ccId] = await getVideoSeverityMap([ccId]).catch(() => ({}));
+        if (!ccVideoMaps[ccId]) ccVideoMaps[ccId] = await getVideoSeverityMap([ccId], 'any').catch(() => ({}));
         allowed = ccVideoMaps[ccId];
       }
     } catch { /* fall back to global map */ }

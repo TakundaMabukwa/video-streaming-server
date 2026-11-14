@@ -299,6 +299,11 @@ async function processSoltrackAlert({ frame, vehicle, plate, eventTime, speed, l
     console.log(`[SOLTRACK] Status "${frame.status}" has no matching definition for fleet ${fleetNumber} (cc=${ccId || 'global'})`);
     return;
   }
+  if (matchedDef.individual === false && matchedDef.member === false) {
+    stats.noMatch++;
+    console.log(`[SOLTRACK] Status "${frame.status}" is disabled in both channels for fleet ${fleetNumber} (cc=${ccId || 'global'})`);
+    return;
+  }
 
   const alertId = `stl-${fleetNumber}-${Date.now()}-${++alertSeq || seqNo}`;
   const deviceName = `${fleetNumber}${plate ? ' - ' + plate : ''}`;

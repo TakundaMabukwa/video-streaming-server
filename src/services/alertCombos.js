@@ -180,6 +180,14 @@ async function handleDetection(ctx) {
     return { action: 'pass', groupRows: [] };
   }
 
+  // Split gate: a type with member_active=false may never stage as a combo
+  // member, even if it is still allowed to raise individual cards.
+  try {
+    const { canUseAsComboMember } = require('../alerts/authorization');
+    const memberOk = await canUseAsComboMember({ costCenterId: ctx.costCenterId, name: alarmType });
+    if (!memberOk) return { action: 'pass', groupRows: [] };
+  } catch (_) { /* never block detection on the gate */ }
+
   const groupRows = [];
   let staged = false;
 

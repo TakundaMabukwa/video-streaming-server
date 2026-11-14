@@ -52,7 +52,7 @@ function buildMap(rows) {
 // - When empty (vehicle matches no cost center), the map contains the active
 //   global definitions. Global is ONLY for CC-less vehicles.
 
-async function getVideoSeverityMap(costCenterIds) {
+async function getVideoSeverityMap(costCenterIds, mode = 'individual') {
   const key = cacheKeyFor(costCenterIds);
 
   if (key === 'global') {
@@ -60,9 +60,15 @@ async function getVideoSeverityMap(costCenterIds) {
     if (cachedMap && now - cacheTime < CACHE_TTL_MS) return cachedMap;
 
     try {
+      const modeFilter = mode === 'member'
+        ? 'AND COALESCE(member_active, TRUE) = TRUE'
+        : mode === 'any'
+          ? 'AND (COALESCE(individual_active, TRUE) OR COALESCE(member_active, TRUE))'
+          : 'AND COALESCE(individual_active, TRUE) = TRUE';
       const result = await db.query(
         `SELECT signal_code, name, severity FROM alert_definitions
-         WHERE category = 'video' AND is_active = true AND is_global = TRUE`
+         WHERE category = 'video' AND is_active = true AND is_global = TRUE
+           ${modeFilter}`
       );
       cachedMap = buildMap(result.rows);
       cacheTime = now;
@@ -87,8 +93,14 @@ async function getVideoSeverityMap(costCenterIds) {
        INNER JOIN alert_definition_overrides o
          ON o.alert_definition_id = d.id AND o.cost_center_id = ANY($1::int[])
        WHERE d.category = 'video' AND d.is_active = true
-         AND o.is_active IS DISTINCT FROM false`,
-      [costCenterIds]
+         AND o.is_active IS DISTINCT FROM false
+         AND (CASE $2
+                WHEN 'member' THEN (COALESCE(d.member_active, TRUE) AND COALESCE(o.member_active, TRUE))
+                WHEN 'any'     THEN (COALESCE(d.individual_active, TRUE) OR COALESCE(d.member_active, TRUE)
+                                      OR COALESCE(o.individual_active, TRUE) OR COALESCE(o.member_active, TRUE))
+                ELSE (COALESCE(d.individual_active, TRUE) AND COALESCE(o.individual_active, TRUE))
+              END)`,
+      [costCenterIds, mode]
     );
     const map = buildMap(result.rows);
     ccCache.set(key, { map, ts: now });
@@ -99,7 +111,7 @@ async function getVideoSeverityMap(costCenterIds) {
   }
 }
 
-async function getTelematicsSeverityMap(costCenterIds) {
+async function getTelematicsSeverityMap(costCenterIds, mode = 'individual') {
   const key = cacheKeyFor(costCenterIds);
 
   if (key === 'global') {
@@ -107,9 +119,15 @@ async function getTelematicsSeverityMap(costCenterIds) {
     if (cachedTelematicsMap && now - telematicsCacheTime < CACHE_TTL_MS) return cachedTelematicsMap;
 
     try {
+      const modeFilter = mode === 'member'
+        ? 'AND COALESCE(member_active, TRUE) = TRUE'
+        : mode === 'any'
+          ? 'AND (COALESCE(individual_active, TRUE) OR COALESCE(member_active, TRUE))'
+          : 'AND COALESCE(individual_active, TRUE) = TRUE';
       const result = await db.query(
         `SELECT signal_code, name, severity FROM alert_definitions
-         WHERE category = 'telematics' AND is_active = true AND is_global = TRUE`
+         WHERE category = 'telematics' AND is_active = true AND is_global = TRUE
+           ${modeFilter}`
       );
       cachedTelematicsMap = buildMap(result.rows);
       telematicsCacheTime = now;
@@ -134,8 +152,14 @@ async function getTelematicsSeverityMap(costCenterIds) {
        INNER JOIN alert_definition_overrides o
          ON o.alert_definition_id = d.id AND o.cost_center_id = ANY($1::int[])
        WHERE d.category = 'telematics' AND d.is_active = true
-         AND o.is_active IS DISTINCT FROM false`,
-      [costCenterIds]
+         AND o.is_active IS DISTINCT FROM false
+         AND (CASE $2
+                WHEN 'member' THEN (COALESCE(d.member_active, TRUE) AND COALESCE(o.member_active, TRUE))
+                WHEN 'any'     THEN (COALESCE(d.individual_active, TRUE) OR COALESCE(d.member_active, TRUE)
+                                      OR COALESCE(o.individual_active, TRUE) OR COALESCE(o.member_active, TRUE))
+                ELSE (COALESCE(d.individual_active, TRUE) AND COALESCE(o.individual_active, TRUE))
+              END)`,
+      [costCenterIds, mode]
     );
     const map = buildMap(result.rows);
     ccTelematicsCache.set(key, { map, ts: now });
@@ -173,7 +197,9 @@ async function getPerCCSeverityMaps(ccIds, categories = ['video', 'telematics'])
        INNER JOIN alert_definition_overrides o
          ON o.alert_definition_id = d.id AND o.cost_center_id = ANY($1::int[])
        WHERE d.category = ANY($2::text[]) AND d.is_active = true
-         AND o.is_active IS DISTINCT FROM false`,
+         AND o.is_active IS DISTINCT FROM false
+         AND d.individual_active IS DISTINCT FROM false
+         AND o.individual_active IS DISTINCT FROM false`,
       [ccIds, cats]
     );
 
@@ -221,15 +247,25 @@ async function getTelematicsNameMap(costCenterIds) {
 
     try {
       const result = await db.query(
-        `SELECT name, signal_code, severity FROM alert_definitions d
+        `SELECT name, signal_code, severity,
+                COALESCE(individual_active, TRUE) AS individual_active,
+                COALESCE(member_active, TRUE) AS member_active
+           FROM alert_definitions d
          WHERE category = 'telematics' AND is_active = true AND name IS NOT NULL AND name != ''
            AND signal_code IS DISTINCT FROM 'exceptionEvent'
-           AND d.is_global = TRUE`
+           AND d.is_global = TRUE
+           AND (COALESCE(individual_active, TRUE) OR COALESCE(member_active, TRUE))`
       );
       const map = {};
       const signalCodeMap = {};
       for (const row of result.rows) {
-        const entry = { name: row.name, signalCode: row.signal_code, severity: (row.severity || 'MEDIUM').toLowerCase() };
+        const entry = {
+          name: row.name,
+          signalCode: row.signal_code,
+          severity: (row.severity || 'MEDIUM').toLowerCase(),
+          individual: row.individual_active === true,
+          member: row.member_active === true,
+        };
         map[row.name.toLowerCase()] = entry;
         if (row.signal_code) signalCodeMap[row.signal_code.toLowerCase()] = entry;
       }
@@ -248,13 +284,20 @@ async function getTelematicsNameMap(costCenterIds) {
 
   try {
 const result = await db.query(
-        `SELECT d.name, d.signal_code, d.severity, o.severity AS override_severity
+        `SELECT d.name, d.signal_code, d.severity,
+                o.severity AS override_severity,
+                d.individual_active AS d_individual_active,
+                d.member_active AS d_member_active,
+                o.individual_active AS o_individual_active,
+                o.member_active AS o_member_active
          FROM alert_definitions d
          INNER JOIN alert_definition_overrides o
            ON o.alert_definition_id = d.id AND o.cost_center_id = ANY($1::int[])
          WHERE d.category = 'telematics' AND d.is_active = true AND d.name IS NOT NULL AND d.name != ''
            AND d.signal_code IS DISTINCT FROM 'exceptionEvent'
-           AND o.is_active IS DISTINCT FROM false`,
+           AND o.is_active IS DISTINCT FROM false
+           AND (COALESCE(d.individual_active, TRUE) OR COALESCE(d.member_active, TRUE))
+           AND (COALESCE(o.individual_active, TRUE) OR COALESCE(o.member_active, TRUE))`,
         [costCenterIds]
       );
       const map = {};
@@ -264,6 +307,8 @@ const result = await db.query(
           name: row.name,
           signalCode: row.signal_code,
           severity: (row.override_severity || row.severity || 'MEDIUM').toLowerCase(),
+          individual: (row.d_individual_active !== false) && (row.o_individual_active !== false),
+          member: (row.d_member_active !== false) && (row.o_member_active !== false),
         };
         map[row.name.toLowerCase()] = entry;
         if (row.signal_code) signalCodeMap[row.signal_code.toLowerCase()] = entry;
@@ -293,7 +338,8 @@ async function getTelematicsNameSeverityMap(costCenterIds) {
         `SELECT name, signal_code, severity FROM alert_definitions d
          WHERE category = 'telematics' AND is_active = true AND name IS NOT NULL AND name != ''
            AND signal_code IS DISTINCT FROM 'exceptionEvent'
-           AND d.is_global = TRUE`
+           AND d.is_global = TRUE
+           AND d.individual_active IS DISTINCT FROM false`
       );
       const map = {};
       for (const row of result.rows) {
@@ -322,7 +368,9 @@ const result = await db.query(
            ON o.alert_definition_id = d.id AND o.cost_center_id = ANY($1::int[])
          WHERE d.category = 'telematics' AND d.is_active = true AND d.name IS NOT NULL AND d.name != ''
            AND d.signal_code IS DISTINCT FROM 'exceptionEvent'
-           AND o.is_active IS DISTINCT FROM false`,
+           AND o.is_active IS DISTINCT FROM false
+           AND d.individual_active IS DISTINCT FROM false
+           AND o.individual_active IS DISTINCT FROM false`,
         [costCenterIds]
       );
       const map = {};
