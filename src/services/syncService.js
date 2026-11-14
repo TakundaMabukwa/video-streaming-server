@@ -482,6 +482,58 @@ async function normalizeVideoAlarmTypes(records) {
   return records;
 }
 
+/**
+ * Combo gate for the video sync path.
+ *
+ * Stages every fresh detection against the AND-combination groups that apply to
+ * its vehicle and returns the merged group rows that completed. Additive by
+ * design: the records themselves are NOT filtered out here — the caller keeps
+ * the normal batch group upsert, so each detection also raises its own
+ * individual card. Enabling a combo never suppresses the underlying alert.
+ */
+async function applyVideoComboGate(records) {
+  const comboRaisedGroups = [];
+  if (!records || records.length === 0) return comboRaisedGroups;
+
+  try {
+    const alertCombos = require('./alertCombos');
+    const combosActive = await alertCombos.listEnabledCombos(null).catch(() => []);
+    if (combosActive.length === 0) return comboRaisedGroups;
+
+    const ccByDevice = new Map();
+    for (const r of records) {
+      const did = String(r.deviceId || '');
+      if (!ccByDevice.has(did)) {
+        let ccId = null;
+        try {
+          const fleet = await resolveFleetNumber({ deviceId: did, vehicleRegistration: r.deviceName }).catch(() => null);
+          ccId = fleet ? await findVehicleCostCenterId(fleet).catch(() => null) : null;
+        } catch (_) { ccId = null; }
+        ccByDevice.set(did, ccId);
+      }
+      const comboResult = await alertCombos.handleDetection({
+        alertId: r.id,
+        deviceId: did,
+        deviceName: r.deviceName,
+        alarmType: r.alarmType,
+        alarmText: r.alarmText,
+        alarmTs: parseApiTimestamp(r.alarmTs),
+        lat: r.lat,
+        lon: r.lon,
+        speed: r.speed ?? null,
+        severity: r.severity,
+        fleetNumber: did,
+        sourceType: 'video',
+        costCenterId: ccByDevice.get(did),
+      });
+      for (const g of comboResult.groupRows || []) comboRaisedGroups.push(g);
+    }
+  } catch (comboErr) {
+    console.error('[SYNC] combo gate error (processing unfiltered):', comboErr.message);
+  }
+  return comboRaisedGroups;
+}
+
 async function syncAlerts(deviceIds, startTime, endTime) {
   // Skycamx rejects alarmPage requests for more than 100 devices in one call
   // ("The number of devices queried at once cannot exceed 100"). Chunking is
@@ -584,55 +636,12 @@ async function syncAlerts(deviceIds, startTime, endTime) {
         severity: resolveBaseSeverity(r.alarmType, videoSeverityMap),
       })));
 
-      // Combo gate: a member of an enabled AND-combination group is held back
-      // here. The detection row is already stored above (so its media and
-      // footage work exactly as before), but it gets NO alert_groups row until
-      // every member has fired for the device inside the combo's window.
-      // Anything not claimed by a combo keeps the normal batch group upsert.
-      const comboRaisedGroups = [];
-      if (newRecords.length > 0) {
-        try {
-          const alertCombos = require('./alertCombos');
-          const combosActive = await alertCombos.listEnabledCombos(null).catch(() => []);
-          if (combosActive.length > 0) {
-            const ccByDevice = new Map();
-            const comboHeld = new Set();
-            for (const r of newRecords) {
-              const did = String(r.deviceId || '');
-              if (!ccByDevice.has(did)) {
-                let ccId = null;
-                try {
-                  const fleet = await resolveFleetNumber({ deviceId: did, vehicleRegistration: r.deviceName }).catch(() => null);
-                  ccId = fleet ? await findVehicleCostCenterId(fleet).catch(() => null) : null;
-                } catch (_) { ccId = null; }
-                ccByDevice.set(did, ccId);
-              }
-              const comboResult = await alertCombos.handleDetection({
-                alertId: r.id,
-                deviceId: did,
-                deviceName: r.deviceName,
-                alarmType: r.alarmType,
-                alarmText: r.alarmText,
-                alarmTs: parseApiTimestamp(r.alarmTs),
-                lat: r.lat,
-                lon: r.lon,
-                speed: r.speed ?? null,
-                severity: r.severity,
-                fleetNumber: did,
-                sourceType: 'video',
-                costCenterId: ccByDevice.get(did),
-              });
-              if (comboResult.action !== 'pass') comboHeld.add(r.id);
-              for (const g of comboResult.groupRows) comboRaisedGroups.push(g);
-            }
-            if (comboHeld.size > 0) {
-              newRecords = newRecords.filter(r => !comboHeld.has(r.id));
-            }
-          }
-        } catch (comboErr) {
-          console.error('[SYNC] combo gate error (processing unfiltered):', comboErr.message);
-        }
-      }
+      // Combo gate: stage every detection against its AND-combination groups
+      // and collect merged cards from the ones that complete. Additive — the
+      // records stay in `newRecords`, so each detection also takes the normal
+      // batch group upsert below and raises its own individual card. Enabling a
+      // combo must never remove the underlying alert from the board.
+      const comboRaisedGroups = await applyVideoComboGate(newRecords);
 
       // Push new video alerts over WS as fast as possible so the frontend
       // receives them without waiting for its own polling cycle.
@@ -762,8 +771,9 @@ async function syncAlerts(deviceIds, startTime, endTime) {
         }
       }
 
-      // A completed combo has no per-record entry above (its detections were
-      // held back), so broadcast each merged group explicitly.
+      // A completed combo's merged group is not a per-record entry above (its
+      // members each broadcast their own individual card), so broadcast each
+      // merged group explicitly on top of them.
       if (wsBroadcast && comboRaisedGroups.length > 0) {
         for (const g of comboRaisedGroups) {
           try {
@@ -987,4 +997,5 @@ module.exports = {
   partitionCooledRecords,
   filterMediaToWindow,
   parseWindowMs,
+  applyVideoComboGate,
 };

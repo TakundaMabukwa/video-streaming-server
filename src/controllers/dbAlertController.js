@@ -741,6 +741,7 @@ async function getAlertMembers(req, res) {
               resolved, false_alert, resolved_by, resolved_at, alert_group_id, created_at
        FROM alerts
        WHERE alert_group_id = $1
+         AND combo_state IS DISTINCT FROM 'pending'
        ORDER BY alarm_ts DESC NULLS LAST, created_at DESC
        LIMIT $2`,
       [gid, lim + 1]

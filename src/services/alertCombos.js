@@ -1,13 +1,19 @@
 // Alert combos: AND-combination triggers built on alert_group_configs.
 //
-// A group config with combo_enabled = TRUE stops being a passive grouping. Its
-// member alert types are held back individually and only surface as ONE merged
-// alert once EVERY member has fired for the same vehicle inside the group's
-// window. Members are linked through alerts.alert_group_id exactly like a single
-// alert, so the board, timeline, media, NCR and closure all work unchanged.
+// A group config with combo_enabled = TRUE adds one merged alert on top of the
+// normal per-alert path: once EVERY member has fired for the same vehicle inside
+// the group's window, the combo raises one merged card. The individual member
+// alerts still fire exactly as they would without the combo — combos are
+// additive, never suppressive. Members are linked through alerts.alert_group_id
+// exactly like a single alert, so the board, timeline, media, NCR and closure
+// all work unchanged.
+//
+// While a combo is still waiting on its other members, the staged members stay
+// combo_state='pending' so they are hidden from the combo card's member list /
+// timeline until the combo completes or the window expires.
 //
 // Scope follows the same STRICT COST-CENTRE RULE as alert_definitions.js: a
-// vehicle in a cost centre only sees a combo when an active
+// vehicle in a cost centre only gets a combo card when an active
 // alert_group_config_overrides row puts that group in the CC's set; a vehicle
 // with no cost centre uses the global group.
 
@@ -151,14 +157,15 @@ async function findCombosForMember(alarmType, costCenterId) {
  *        lat, lon, speed, severity, fleetNumber, sourceType, costCenterId }
  *
  * Returns one of:
- *   { action: 'pass',   groupRows: [] }  -> not part of any combo; caller runs
- *                                          the normal upsertAlertGroup path.
- *   { action: 'staged', groupRows: [] }  -> held back; a combo is still waiting
- *                                          for its other members. Nothing is
- *                                          shown on the board.
+ *   { action: 'pass',   groupRows: [] }  -> not part of any combo.
+ *   { action: 'staged', groupRows: [] }  -> a combo is still waiting for its
+ *                                          other members; only its merged card
+ *                                          is deferred. The caller must still
+ *                                          raise the individual alert.
  *   { action: 'raised', groupRows: [..] } -> one or more combos completed and
  *                                          their merged groups already exist.
- *                                          groupRows are ready to broadcast.
+ *                                          The caller raises the individual
+ *                                          alert as well as these rows.
  */
 async function handleDetection(ctx) {
   const deviceId = String(ctx.deviceId || '').trim();

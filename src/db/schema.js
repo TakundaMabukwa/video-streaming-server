@@ -127,8 +127,9 @@ const MIGRATIONS_SQL = `
   ALTER TABLE alerts ADD COLUMN IF NOT EXISTS notes TEXT;
   ALTER TABLE alerts ADD COLUMN IF NOT EXISTS documents JSONB DEFAULT '[]'::jsonb;
 
-  -- combo_state marks a detection that is being held back by an enabled
-  -- AND-combination alert group. Declared here (not just in the migrations
+  -- combo_state marks a detection staged by an enabled AND-combination alert
+  -- group. 'pending' hides the row from member lists only; the detection's
+  -- individual card is still raised. Declared here (not just in the migrations
   -- block) because the backfill below reads it.
   ALTER TABLE alerts ADD COLUMN IF NOT EXISTS combo_state TEXT;
 
@@ -198,8 +199,8 @@ const MIGRATIONS_SQL = `
       AND COALESCE(g.source_type, 'video') = COALESCE(a.source_type, 'video')
       AND g.resolved = FALSE AND g.false_alert = FALSE
   )
-  -- A detection held back by a combo must never be backfilled into a group on
-  -- a restart: it only becomes an alert once the whole set fires.
+  -- A detection still pending in a combo must never be backfilled into a group
+  -- on a restart: it is owned by the combo until that completes or expires.
   AND a.combo_state IS DISTINCT FROM 'pending'
   GROUP BY a.device_id, a.device_name, a.alarm_type, a.alarm_text, a.source_type
   ON CONFLICT (group_key) DO NOTHING;
@@ -229,10 +230,10 @@ const MIGRATIONS_SQL = `
     severity TEXT NOT NULL DEFAULT 'MEDIUM',
     description TEXT DEFAULT '',
     is_active BOOLEAN DEFAULT TRUE,
-    -- COMBO MODE: when combo_enabled is true this group stops being a passive
-    -- grouping and becomes an AND-combination trigger — its member alerts are
-    -- held back individually and only surface as ONE merged alert once every
-    -- member has fired for the same vehicle inside combo_window_seconds.
+    -- COMBO MODE: when combo_enabled is true this group becomes an
+    -- AND-combination trigger — it adds ONE merged alert once every member has
+    -- fired for the same vehicle inside combo_window_seconds. Additive: the
+    -- individual member alerts are still raised independently.
     -- Default TRUE: a group of two or more alert types is a combination unless
     -- an operator deliberately switches it off. A single-member group can never
     -- complete, so the API forces it off (see alertConfigController).
@@ -252,10 +253,11 @@ const MIGRATIONS_SQL = `
     UNIQUE(group_config_id, alert_definition_id)
   );
 
-  -- Combo staging: one row per (combo, detection) held back until the combo
-  -- completes. A detection can be staged in several combos at once, so this is
-  -- a join table rather than a column on alerts. alerts.alert_group_id stays
-  -- NULL while a row is pending — that is what keeps partials off the board.
+  -- Combo staging: one row per (combo, detection) so a merged card can be
+  -- assembled once the window completes. Additive by design — the detection's
+  -- own individual card is raised independently. While the row is pending,
+  -- alerts.combo_state='pending' only hides the member from combo member lists
+  -- / timelines; it does not hide the individual card.
   CREATE TABLE IF NOT EXISTS alert_combo_events (
     id SERIAL PRIMARY KEY,
     combo_group_config_id INTEGER NOT NULL REFERENCES alert_group_configs(id) ON DELETE CASCADE,
@@ -1636,10 +1638,10 @@ const MIGRATIONS_SQL = `
   ALTER TABLE alert_group_configs ALTER COLUMN combo_enabled SET DEFAULT TRUE;
   ALTER TABLE alert_group_configs ADD COLUMN IF NOT EXISTS combo_window_seconds INTEGER NOT NULL DEFAULT 300;
 
-  -- alerts.combo_state marks a detection row that is being held back by a combo.
-  -- 'pending' rows are filtered out of every list so a partial never surfaces;
-  -- it is cleared to NULL the moment the detection is linked to a group, which
-  -- makes it a normal row again.
+  -- alerts.combo_state marks a detection row that is staged by a combo.
+  -- 'pending' rows are filtered out of member lists / timelines so a partial
+  -- never surfaces there; the individual card is raised regardless. It is
+  -- cleared to NULL the moment the combo completes or its window expires.
   ALTER TABLE alerts ADD COLUMN IF NOT EXISTS combo_state TEXT;
   CREATE INDEX IF NOT EXISTS idx_alerts_combo_state ON alerts(combo_state) WHERE combo_state = 'pending';
 
@@ -1768,6 +1770,55 @@ const MIGRATIONS_SQL = `
 
 const SCHEMA_VERSION_KEY = 'schema_v_2026_11_12';
 
+// Provider-stable telematics dedupe — runs on EVERY boot and is idempotent.
+// The legacy unique key uses device_id (the RESOLVED fleet number), so a fleet
+// rename re-keyed stored records and replayed them as new alerts.
+// source_device_id is the raw Geotab id and never changes. Guarded so it is
+// safe on databases where the table/column does not exist yet (fresh installs
+// create them in MIGRATIONS_SQL, which runs before this).
+const TELEMATICS_DEDUPE_SQL = `
+  DO $$
+  BEGIN
+    IF to_regclass('public.telematics_events') IS NOT NULL
+       AND to_regclass('public.idx_telematics_events_src_key') IS NULL
+       AND EXISTS (
+         SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'telematics_events'
+           AND column_name = 'source_device_id'
+       ) THEN
+      DELETE FROM telematics_events t
+      USING (
+        SELECT id FROM (
+          SELECT id, row_number() OVER (
+            PARTITION BY source_device_id, event_code, event_time
+            ORDER BY id
+          ) AS rn
+          FROM telematics_events
+          WHERE source_device_id IS NOT NULL
+        ) ranked
+        WHERE ranked.rn > 1
+      ) keep
+      WHERE t.id = keep.id;
+    END IF;
+  END $$;
+
+  DO $$
+  BEGIN
+    IF to_regclass('public.telematics_events') IS NOT NULL
+       AND EXISTS (
+         SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'telematics_events'
+           AND column_name = 'source_device_id'
+       ) THEN
+      EXECUTE 'CREATE UNIQUE INDEX IF NOT EXISTS idx_telematics_events_src_key
+               ON public.telematics_events (source_device_id, event_code, event_time)
+               WHERE source_device_id IS NOT NULL';
+    END IF;
+  END $$;
+`;
+
 async function initializeDatabase() {
   await query(SCHEMA_SQL);
   console.log('[DB] Schema initialized successfully');
@@ -1778,15 +1829,19 @@ async function initializeDatabase() {
   ).catch(() => ({ rows: [] }));
   if (marker.rows.length > 0) {
     console.log('[DB] Schema already current; migrations skipped');
-    return;
+  } else {
+    await query(MIGRATIONS_SQL);
+    await query(
+      'INSERT INTO schema_migrations (key) VALUES ($1) ON CONFLICT (key) DO NOTHING',
+      [SCHEMA_VERSION_KEY]
+    );
+    console.log('[DB] Migrations applied successfully');
   }
 
-  await query(MIGRATIONS_SQL);
-  await query(
-    'INSERT INTO schema_migrations (key) VALUES ($1) ON CONFLICT (key) DO NOTHING',
-    [SCHEMA_VERSION_KEY]
-  );
-  console.log('[DB] Migrations applied successfully');
+  // Always-run, idempotent: keeps existing databases on the provider-stable
+  // dedupe key even though their schema version marker is already current.
+  await query(TELEMATICS_DEDUPE_SQL);
+  console.log('[DB] Provider-stable telematics dedupe ensured');
 }
 
 module.exports = { initializeDatabase };

@@ -1,9 +1,10 @@
 // Combo groups: AND-combination alert triggers.
 //
-// A group config with combo_enabled = TRUE stops behaving as a passive grouping.
-// Its member alert types are held back individually (staged in alert_combo_events)
-// and only surface as ONE merged alert_groups row once EVERY member has fired
-// for the same vehicle inside the group's window.
+// A group config with combo_enabled = TRUE adds a merged alert_groups row once
+// EVERY member has fired for the same vehicle inside the group's window. The
+// individual member alerts are raised independently by the caller — combo
+// staging is additive and never suppresses them (staged rows live in
+// alert_combo_events and are retired on completion or expiry).
 //
 // Members are linked to the merged group via alerts.alert_group_id, which is
 // exactly how a single alert links its members today — so the board, the
@@ -62,8 +63,9 @@ async function listPendingForComboDevice(comboId, deviceId, windowSeconds) {
   return result.rows;
 }
 
-// Marks every alert row held back by a combo as pending so no list can surface
-// it. Rows already linked to a group are never touched.
+// Marks every alert row staged by a combo as pending so member lists / timelines
+// withhold it until the combo completes or expires. Rows already linked to a
+// group are never touched, and the row's individual card is unaffected.
 async function markAlertsPending(alertIds) {
   const ids = (alertIds || []).filter(Boolean);
   if (ids.length === 0) return;

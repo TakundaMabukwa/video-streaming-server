@@ -560,10 +560,9 @@ async function emitDeviceStatusAlert({ deviceId, fleetNumber, licensePlate, sign
       if (feedDup.rows.length > 0) return null;
     }
 
-    // Combo gate: when this alert type is a member of an enabled AND-combination
-    // group it is held back (stored, evidence captured, nothing on the board)
-    // until every member has fired for this vehicle inside the group's window.
-    // 'pass' means no combo claims it, so the normal path runs unchanged.
+    // Combo gate: stage this detection for any enabled AND-combination group it
+    // belongs to. Additive — the individual alert below is raised regardless;
+    // a completed combo only adds its merged card on top.
     const alertCombos = require('./alertCombos');
     const comboResult = await alertCombos.handleDetection({
       alertId,
@@ -584,36 +583,38 @@ async function emitDeviceStatusAlert({ deviceId, fleetNumber, licensePlate, sign
       durationSeconds: durationSeconds ?? null,
     });
 
-    let groupRows = comboResult.groupRows;
-    if (comboResult.action === 'pass') {
-      const created = await db.upsertAlertGroup({
-        deviceId: canonicalId,
-        sourceDeviceId: sourceId,
-        geotabDeviceId: identity?.geotabDeviceId || sourceId,
-        mettaxDeviceId: identity?.mettaxDeviceId || null,
-        deviceName,
-        alarmType: def.name,
-        alarmText: alarmText || def.name,
-        alertId,
-        alarmTs,
-        lat: lat ?? null,
-        lon: lon ?? null,
-        speed: speed ?? null,
-        sourceType: 'telematics',
-        severity: String(def.severity || 'MEDIUM').toLowerCase(),
-        fleetNumber: fleetNumber || null,
-        registration: licensePlate || null,
-        distanceKm: distanceKm ?? null,
-        durationSeconds: durationSeconds ?? null,
-      });
-      groupRows = created ? [created] : [];
-    }
+    // Additive combos: the individual card is raised unconditionally; a
+    // completed combo only appends its merged card. Neither suppresses the other.
+    const individual = await db.upsertAlertGroup({
+      deviceId: canonicalId,
+      sourceDeviceId: sourceId,
+      geotabDeviceId: identity?.geotabDeviceId || sourceId,
+      mettaxDeviceId: identity?.mettaxDeviceId || null,
+      deviceName,
+      alarmType: def.name,
+      alarmText: alarmText || def.name,
+      alertId,
+      alarmTs,
+      lat: lat ?? null,
+      lon: lon ?? null,
+      speed: speed ?? null,
+      sourceType: 'telematics',
+      severity: String(def.severity || 'MEDIUM').toLowerCase(),
+      fleetNumber: fleetNumber || null,
+      registration: licensePlate || null,
+      distanceKm: distanceKm ?? null,
+      durationSeconds: durationSeconds ?? null,
+    });
+    const groupRows = [
+      ...(individual ? [individual] : []),
+      ...(comboResult.groupRows || []),
+    ];
 
     // Archive per-event source row for history (alert_groups is the store).
-    // A combo-held detection is archived here too (it happened, it just has no
-    // group yet). The pre-existing behaviour for a suppressed/unregistered
-    // vehicle is unchanged: nothing is archived when no combo claimed it and
-    // no group was created.
+    // A combo-staged detection is archived here too (it happened, whether or
+    // not the combo completed). The pre-existing behaviour for a suppressed/
+    // unregistered vehicle is unchanged: nothing is archived when no group was
+    // created and no combo claimed it.
     if (groupRows.length > 0 || comboResult.action !== 'pass') {
       await db.query(
         `INSERT INTO telematics_events (device_id, vehicle_id, license_plate, fleet_number, plate,
@@ -634,8 +635,9 @@ async function emitDeviceStatusAlert({ deviceId, fleetNumber, licensePlate, sign
       ).catch(() => {});
     }
 
-    // Nothing on the board: either the vehicle is not registered, or a combo is
-    // still waiting for its other members.
+    // Nothing on the board: the vehicle is not registered or the alert is
+    // suppressed/on cooldown. A combo still waiting on other members no longer
+    // empties this list — the individual card above is already raised.
     if (groupRows.length === 0) return null;
 
     for (const groupRow of groupRows) {

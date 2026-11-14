@@ -139,6 +139,7 @@ async function getGroupMembers(groupId, { limit = 500 } = {}) {
             resolved_by, resolved_at, notes, created_at
        FROM alerts
       WHERE alert_group_id = $1
+        AND combo_state IS DISTINCT FROM 'pending'
       ORDER BY alarm_ts DESC NULLS LAST, created_at DESC, id DESC
       LIMIT $2`,
     [gid, lim + 1]
@@ -197,8 +198,9 @@ async function getAlertsPaginated({ pageSize = 50, pageIndex = 1, deviceIds, ala
     paramIndex++;
   }
 
-  // A detection held back by an enabled combo is not an alert yet — it only
-  // becomes visible once the whole set fires and it is linked to a group.
+  // While a combo is still waiting for its other members this detection is
+  // withheld from member lists / timelines. Its individual board card is
+  // already raised; the row is released when the combo completes or expires.
   conditions.push(`combo_state IS DISTINCT FROM 'pending'`);
 
   const where = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';

@@ -115,6 +115,16 @@ async function fetchRuleName(credentials, ruleId) {
 const MAX_FEED_PUMP_PAGES = 500;
 const MAX_DIAGNOSTICS_PER_POLL = 5000;
 
+// Geotab's ExceptionEvent feed is modification-ordered, not event-time-ordered:
+// editing/closing a record re-publishes it with its ORIGINAL activeFrom. Such a
+// record must be archived (history stays complete) but must never become a new
+// alert. Mirrors the video sync freshness cap (SYNC_MAX_ALERT_AGE_MINUTES).
+const GEOTAB_MAX_EVENT_AGE_MINUTES = (() => {
+  const env = Number(process.env.GEOTAB_MAX_EVENT_AGE_MINUTES);
+  const n = Number.isFinite(env) && env > 0 ? Math.floor(env) : 120;
+  return Math.min(Math.max(n, 5), 1440);
+})();
+
 // ── Geotab feed-version helpers (versions are 16-char zero-padded hex) ──
 
 function hexToBig(hex) {
@@ -727,6 +737,8 @@ async function syncGeotabEvents() {
     let totalInserted = 0;
     let totalUnknownDevice = 0;
     let totalAlerted = 0;
+    let totalStaleArchived = 0;
+    let totalDedupedSourceKey = 0;
     let pages = 0;
 
     // Bounded + paced drain: max 5 pages per 15s cycle AND 300ms between
@@ -763,6 +775,8 @@ async function syncGeotabEvents() {
       totalInserted += outcome.inserted;
       totalUnknownDevice += outcome.unknownDevice;
       totalAlerted += outcome.alerted;
+      totalStaleArchived += outcome.staleArchived || 0;
+      totalDedupedSourceKey += outcome.dedupedSourceKey || 0;
 
       // Only advance the cursor AFTER the full page is processed successfully,
       // so a crash never loses events.
@@ -776,7 +790,7 @@ async function syncGeotabEvents() {
       }
     }
 
-    console.log(`[GEOTAB] Stored ${totalInserted} telematics events (${totalUnknownDevice} unknown devices, ${totalAlerted} alerts matched)`);
+    console.log(`[GEOTAB] Stored ${totalInserted} telematics events (${totalUnknownDevice} unknown devices, ${totalAlerted} alerts matched, ${totalStaleArchived} stale archived, ${totalDedupedSourceKey} deduped by provider id)`);
   } catch (error) {
     console.error('[GEOTAB] Failed to sync events:', error.message);
   } finally {
@@ -789,6 +803,8 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
   let unknownDevice = 0;
   let alerted = 0;
   let suppressed = 0;
+  let staleArchived = 0;
+  let dedupedSourceKey = 0;
 
   for (let i = 0; i < events.length; i++) {
     const event = events[i];
@@ -849,6 +865,9 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
       }
 
       const eventTime = event.activeFrom || event.lastModifiedDateTime || new Date();
+      // Fix 1: a re-published old record is archived below but never alerted on.
+      const eventAgeMs = Date.now() - new Date(eventTime).getTime();
+      const isStaleRecord = Number.isFinite(eventAgeMs) && eventAgeMs > GEOTAB_MAX_EVENT_AGE_MINUTES * 60 * 1000;
 
       // Resolve canonical fleet identity and the effective CC before writing.
       const identityMod = require('../vehicles/identity');
@@ -885,6 +904,25 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
         continue;
       }
 
+      // Fix 2: dedupe on the provider's own identity (raw Geotab device id),
+      // never on the resolved fleet. A fleet rename must not replay history,
+      // and a re-published record must not be inserted twice. The partial
+      // unique index idx_telematics_events_src_key is the race backstop.
+      if (sourceId && eventCode) {
+        try {
+          const dup = await db.query(
+            `SELECT 1 FROM telematics_events
+             WHERE source_device_id = $1 AND event_code = $2 AND event_time = $3
+             LIMIT 1`,
+            [sourceId, eventCode, new Date(eventTime).toISOString()]
+          );
+          if (dup.rows.length > 0) {
+            dedupedSourceKey++;
+            continue;
+          }
+        } catch (_) { /* never block ingest on the dedupe probe */ }
+      }
+
       // Store telematics events even for unknown devices — device_id is known,
       // so the event must never be silently dropped.
       const insertResult = await db.query(
@@ -894,7 +932,12 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
           address, driver_name, description, distance, duration_seconds, zone_name, raw_data, event_time,
           source_device_id, geotab_device_id, mettax_device_id)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
-         ON CONFLICT (device_id, event_code, event_time) DO NOTHING
+         -- Target-less DO NOTHING covers both dedupe keys: the legacy
+         -- (device_id, event_code, event_time) index and the provider-stable
+         -- partial index idx_telematics_events_src_key on
+         -- (source_device_id, event_code, event_time). The only other unique
+         -- index on this table is the serial primary key.
+         ON CONFLICT DO NOTHING
          RETURNING id`,
         [
           canonicalId,
@@ -923,11 +966,19 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
       );
 
       if (insertResult.rows.length === 0) {
-        // Duplicate (unique index on device+event+time) — nothing new to alert on.
+        // Duplicate under either dedupe key (legacy device-based or
+        // provider-stable) — nothing new to alert on.
         continue;
       }
       inserted++;
       if (isUnknownDevice) unknownDevice++;
+
+      // Fix 1: stale re-published record — archive only. No alert group, no
+      // member row, no broadcast, no deduction, no NCR.
+      if (isStaleRecord) {
+        staleArchived++;
+        continue;
+      }
 
       // Process automatic deduction (NCR = no path) — fire-and-forget so the
       // FOR UPDATE lock in driver_scoring never blocks the ingest loop.
@@ -1026,7 +1077,8 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
 
       // No per-event row in `alerts` — alert_groups is the store, and the
       // per-event archive is telematics_events (history reads it directly).
-      // A member of an enabled combo is held back until the whole set fires.
+      // The individual card is always raised; combo staging only defers the
+      // merged card until the whole set fires.
       const groupRows = await emitTelematicsAlert({
         deviceId: canonicalId,
         sourceDeviceId: sourceId,
@@ -1047,7 +1099,10 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
         distanceKm: distance,
         durationSeconds,
         onRaised: (groupRow, comboResult) => {
-          if (groupRows.length === 0) return;
+          // onRaised only fires for rows that were actually raised, so there is
+          // no empty-list case here. (Referencing the outer `groupRows` const
+          // inside this callback threw a TDZ ReferenceError during its own
+          // initializer, which swallowed every "alert created" log/count.)
           alerted++;
           const isCombo = comboResult.action === 'raised' && groupRow.combo_name != null;
           const broadcastType = isCombo ? String(groupRow.alarm_type || matchedDef.name) : matchedDef.name;
@@ -1110,7 +1165,7 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
     }
   }
 
-  return { inserted, unknownDevice, alerted, suppressed };
+  return { inserted, unknownDevice, alerted, suppressed, staleArchived, dedupedSourceKey };
 }
 
 // ── Vehicle status from Skycamx (independent of Geotab) ──
@@ -1421,7 +1476,8 @@ async function createZoneEntryAlert({ deviceId, fleetNumber, licensePlate, lat, 
     const alarmText = `${defName} in zone ${zone.name}`;
 
     // No per-event row in `alerts` — alert_groups is the store.
-    // A member of an enabled combo is held back until the whole set fires.
+    // The individual card is always raised; combo staging only defers the
+    // merged card until the whole set fires.
     const groupRows = await emitTelematicsAlert({
       deviceId,
       deviceName,
@@ -1519,13 +1575,14 @@ async function createZoneEntryAlert({ deviceId, fleetNumber, licensePlate, lat, 
 
 // ── Combo-aware telematics alert emission ──
 //
-// A member of an enabled AND-combination group is held back (stored, evidence
-// captured, nothing on the board) until every member has fired for the vehicle
-// inside the group's window. When a combo completes, one merged group already
-// exists and is broadcast here. Anything not claimed by a combo takes the
-// unchanged single-alert path.
+// Additive: every detection always raises its own individual alert_groups row.
+// When the alert type is also a member of an enabled AND-combination group, the
+// detection is staged in the combo layer as well, and a completed combo raises
+// its merged group on top. One never replaces the other — enabling a combo must
+// not hide the underlying individual alert.
 //
-// Returns the list of alert_groups rows that now represent this detection.
+// Returns the list of alert_groups rows that now represent this detection:
+// [individual, ...completedComboGroups].
 async function emitTelematicsAlert({
   deviceId,
   deviceName,
@@ -1567,30 +1624,32 @@ async function emitTelematicsAlert({
     durationSeconds,
   });
 
-  let groupRows = comboResult.groupRows;
-  if (comboResult.action === 'pass') {
-    const created = await db.upsertAlertGroup({
-      deviceId,
-      deviceName,
-      alarmType,
-      alarmText,
-      alertId,
-      alarmTs,
-      lat,
-      lon,
-      speed: speed ?? null,
-      sourceType: 'telematics',
-      severity: memberSeverity,
-      fleetNumber: fleetNumber || null,
-      registration: registration || null,
-      sourceDeviceId,
-      geotabDeviceId,
-      mettaxDeviceId,
-      distanceKm,
-      durationSeconds,
-    });
-    groupRows = created ? [created] : [];
-  }
+  // Additive combos: the individual card is raised unconditionally; a completed
+  // combo only appends its merged card. Neither path suppresses the other.
+  const individual = await db.upsertAlertGroup({
+    deviceId,
+    deviceName,
+    alarmType,
+    alarmText,
+    alertId,
+    alarmTs,
+    lat,
+    lon,
+    speed: speed ?? null,
+    sourceType: 'telematics',
+    severity: memberSeverity,
+    fleetNumber: fleetNumber || null,
+    registration: registration || null,
+    sourceDeviceId,
+    geotabDeviceId,
+    mettaxDeviceId,
+    distanceKm,
+    durationSeconds,
+  });
+  const groupRows = [
+    ...(individual ? [individual] : []),
+    ...(comboResult.groupRows || []),
+  ];
 
   for (const groupRow of groupRows) {
     if (onRaised) onRaised(groupRow, comboResult);
@@ -1879,4 +1938,15 @@ function stopPolling() {
   } catch {}
 }
 
-module.exports = { startPolling, stopPolling, syncGeotabEvents, initialSync, setWsBroadcast, syncNewFleetVehicles, checkZoneBreaches, refreshZoneCaches };
+module.exports = {
+  startPolling,
+  stopPolling,
+  syncGeotabEvents,
+  initialSync,
+  setWsBroadcast,
+  syncNewFleetVehicles,
+  checkZoneBreaches,
+  refreshZoneCaches,
+  // Exposed for the local re-feed/rename simulation harness (test/simulate-refeed.js).
+  processGeotabEventBatch,
+};

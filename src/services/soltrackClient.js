@@ -345,16 +345,18 @@ async function processSoltrackAlert({ frame, vehicle, plate, eventTime, speed, l
     mettaxDeviceId,
   });
 
-  let groupRows = comboResult.groupRows;
-  if (comboResult.action === 'pass') {
-    const created = await db.upsertAlertGroup({
-      ...alertPayload,
-      severity: String(matchedDef.severity || 'MEDIUM').toLowerCase(),
-      registration: plate,
-      costCenterId: ccId,
-    });
-    groupRows = created ? [created] : [];
-  }
+  // Additive combos: the individual card is raised unconditionally; a completed
+  // combo only appends its merged card. Neither suppresses the other.
+  const individual = await db.upsertAlertGroup({
+    ...alertPayload,
+    severity: String(matchedDef.severity || 'MEDIUM').toLowerCase(),
+    registration: plate,
+    costCenterId: ccId,
+  });
+  const groupRows = [
+    ...(individual ? [individual] : []),
+    ...(comboResult.groupRows || []),
+  ];
 
   const groupRow = groupRows[0] || null;
   if (groupRow) {
@@ -379,12 +381,21 @@ async function processSoltrackAlert({ frame, vehicle, plate, eventTime, speed, l
   );
 
   if (wsBroadcast) {
-    try {
-      const groupCount = Number(groupRow?.count || 1) || 1;
-      const baseSeverity = String(groupRow?.severity || matchedDef.severity || 'MEDIUM').toLowerCase();
-      const escalatedSeverity = escalateSeverity(baseSeverity, groupCount);
-      const groupId = groupRow?.id != null ? String(groupRow.id) : '';
-      if (groupId) {
+    // Broadcast every card this detection produced: the individual one always,
+    // plus the merged combo card when it completed. Each carries its own type
+    // and count so the board renders them as separate alerts.
+    for (const g of groupRows) {
+      try {
+        const isCombo = g.combo_name != null;
+        const broadcastType = isCombo ? String(g.alarm_type || matchedDef.name) : matchedDef.name;
+        const broadcastText = isCombo
+          ? `${broadcastType} — ${matchedDef.name} combined`
+          : alarmText;
+        const groupCount = Number(g?.count || 1) || 1;
+        const baseSeverity = String(g?.severity || matchedDef.severity || 'MEDIUM').toLowerCase();
+        const escalatedSeverity = escalateSeverity(baseSeverity, groupCount);
+        const groupId = g?.id != null ? String(g.id) : '';
+        if (!groupId) continue;
         wsBroadcast('new-alert', {
           alert: {
             id: groupId,
@@ -397,11 +408,11 @@ async function processSoltrackAlert({ frame, vehicle, plate, eventTime, speed, l
             vehicleId: fleetNumber,
             device_name: deviceName,
             deviceName,
-            alert_type: matchedDef.name,
-            alarm_type: matchedDef.name,
-            type: matchedDef.name,
-            title: matchedDef.name,
-            alarmText,
+            alert_type: broadcastType,
+            alarm_type: broadcastType,
+            type: broadcastType,
+            title: broadcastType,
+            alarmText: broadcastText,
             timestamp: new Date(eventTime).toISOString(),
             alarmTs: new Date(eventTime).toISOString(),
             last_occurrence: new Date(eventTime).toISOString(),
@@ -413,15 +424,16 @@ async function processSoltrackAlert({ frame, vehicle, plate, eventTime, speed, l
             status: 'new',
             resolved: false,
             count: groupCount,
-            group_key: groupRow?.group_key || `${fleetNumber}:${matchedDef.name}`.toLowerCase(),
+            combo: isCombo ? g.combo_name : undefined,
+            group_key: g?.group_key || `${fleetNumber}:${broadcastType}`.toLowerCase(),
             lat,
             lon,
             fleet_number: fleetNumber,
             vehicle_registration: plate,
           },
         });
-      }
-    } catch (_) { /* never block ingest on WS */ }
+      } catch (_) { /* never block ingest on WS */ }
+    }
 
     try {
       wsBroadcast('new_event', {
