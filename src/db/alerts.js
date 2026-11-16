@@ -127,10 +127,18 @@ async function batchAlertExists(ids) {
 
 const { getMediaForAlert, getMediaByAlertIds } = require('./media');
 
-async function getGroupMembers(groupId, { limit = 500 } = {}) {
+async function getGroupMembers(groupId, { limit = 500, since = null } = {}) {
   const gid = Number(groupId);
   if (!Number.isInteger(gid) || gid < 1) return { rows: [], truncated: false };
   const lim = Math.min(Math.max(Number(limit) || 500, 1), 2000);
+  const params = [gid, lim + 1];
+  const conditions = ['alert_group_id = $1', "combo_state IS DISTINCT FROM 'pending'"];
+  if (since) {
+    // Strictly newer than the previous resolve boundary: members that fired
+    // at the same instant as the resolve belong to the previous incident.
+    conditions.push('alarm_ts > $3');
+    params.push(since);
+  }
   const result = await query(
     `SELECT id, alert_group_id, device_id, device_name, fleet_number,
             alarm_type, alarm_text, alarm_ts, alarm_ts_end,
@@ -138,11 +146,10 @@ async function getGroupMembers(groupId, { limit = 500 } = {}) {
             severity, source_type, status, resolved, false_alert,
             resolved_by, resolved_at, notes, created_at
        FROM alerts
-      WHERE alert_group_id = $1
-        AND combo_state IS DISTINCT FROM 'pending'
+      WHERE ${conditions.join(' AND ')}
       ORDER BY alarm_ts DESC NULLS LAST, created_at DESC, id DESC
       LIMIT $2`,
-    [gid, lim + 1]
+    params
   );
   const truncated = result.rows.length > lim;
   return { rows: truncated ? result.rows.slice(0, lim) : result.rows, truncated };

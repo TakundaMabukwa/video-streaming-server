@@ -76,10 +76,25 @@ async function getAlertGroupMembers(req, res) {
     const id = intId(req.params.id);
     if (!id) return res.status(400).json({ success: false, message: 'Numeric alert group id required' });
     const limit = Math.min(Math.max(parseInt(String(req.query?.limit || '500'), 10) || 500, 1), 2000);
-    const [memberResult, group] = await Promise.all([
-      db.getGroupMembers(id, { limit }),
-      db.getAlertGroupById(id),
-    ]);
+
+    // Last resolve boundary for this vehicle + alarm type: only members that
+    // belong to the current incident window (after the previous resolve) are
+    // returned. With no previous resolve, every member is returned.
+    const group = await db.getAlertGroupById(id);
+    let since = null;
+    if (group) {
+      const floor = await db.query(
+        `SELECT MAX(resolved_at) AS t
+           FROM alert_groups
+          WHERE device_id = $1
+            AND alarm_type = $2
+            AND resolved = TRUE
+            AND id <> $3`,
+        [group.device_id, group.alarm_type, id]
+      ).catch(() => ({ rows: [] }));
+      since = floor.rows[0]?.t || null;
+    }
+    const memberResult = await db.getGroupMembers(id, { limit, since });
     const members = memberResult.rows.map(memberAlert);
     return res.json({
       success: true,
