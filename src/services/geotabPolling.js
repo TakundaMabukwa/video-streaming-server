@@ -1034,24 +1034,8 @@ async function processGeotabEventBatch(events, { credentials, deviceMap }) {
       if (isHighRiskEntryAlert(matchedDef)) continue;
 
       if (isSelfMonitoringZoneAlert({ signalCode: matchedDef.signalCode || eventCode, alarmType: matchedDef.name })) {
-        const isSignalLoss = /signal loss/i.test(String(matchedDef.name || eventName || ''));
-        if (!isSignalLoss && zoneNameFromEvent) {
-          zoneNotifications.removeApproach(identity?.fleetNumber || fleetNumber || canonicalId, zoneNameFromEvent);
-        }
-        zoneNotifications.upsert({
-          fleet_number: identity?.fleetNumber || fleetNumber || canonicalId,
-          device_id: canonicalId,
-          plate: licensePlate || null,
-          cost_center_id: eventCC || null,
-          kind: isSignalLoss ? 'signal_loss' : 'entering',
-          alert_type: matchedDef.name,
-          zone_id: zoneNameFromEvent || null,
-          zone_name: zoneNameFromEvent || null,
-          severity: String(matchedDef.severity || 'MEDIUM').toLowerCase(),
-          lat: evtLat ?? null,
-          lon: evtLon ?? null,
-          speed: evtSpeed ?? null,
-        });
+        // Zone notifications are owned by the DeviceStatusInfo poller. Geotab
+        // still archives the event above; it must not emit the notification.
         continue;
       }
 
@@ -1460,21 +1444,8 @@ async function createZoneEntryAlert({ deviceId, fleetNumber, licensePlate, lat, 
     const matchedDef = (nameMap.nameMap || {})[defName.toLowerCase()];
     if (!matchedDef) return null; // not in this device's CC set — would be filtered from display anyway
 
-    zoneNotifications.removeApproach(fleetNumber || deviceId, zone.id);
-    zoneNotifications.upsert({
-      fleet_number: fleetNumber || deviceId,
-      device_id: deviceId,
-      plate: licensePlate || null,
-      cost_center_id: eventCC,
-      kind: 'entering',
-      alert_type: matchedDef.name,
-      zone_id: zone.id,
-      zone_name: zone.name,
-      severity: String(matchedDef.severity || 'MEDIUM').toLowerCase(),
-      lat: lat ?? null,
-      lon: lon ?? null,
-      speed: speed ?? null,
-    });
+    // Zone notifications are owned by the DeviceStatusInfo poller. Geotab still
+    // archives the event above; it must not emit the notification.
     return { notification_only: true };
 
     const alertId = `zone-${deviceId}-${zone.id}-${Date.now()}`;
