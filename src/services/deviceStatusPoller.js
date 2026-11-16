@@ -740,13 +740,10 @@ async function processZoneForDevice(deviceId, fleetNumber, licensePlate, lat, lo
     if (isInside) {
       currentZoneIds.push(z.id);
       insideZones.push(z);
-    } else if (crossedBoundary && !wasInside.has(z.id)) {
-      // Path crossed the boundary but the current fix is outside. Record the
-      // entry, but do NOT treat the vehicle as "inside" for stop tracking —
-      // that was creating false stop alerts for zones beside the road.
-      crossedZones.push(z);
-      console.log(`[ZONE] boundary crossing detected for ${fleetNumber || deviceId} -> ${z.name} (crossed, current outside)`);
     }
+    // A boundary crossing alone is NOT an entry: only actual containment
+    // (point-in-polygon) counts as "entering" a zone. Otherwise a vehicle
+    // passing beside a zone would be recorded as having entered it.
   }
 
   // ── Predictive Detection: bearing + 45s look-ahead ───────────────────
@@ -845,7 +842,7 @@ async function processZoneForDevice(deviceId, fleetNumber, licensePlate, lat, lo
   // New entries → recorded for every watched zone. An entry is only ever
   // blocked by an entry that is still open for the SAME zone, never by other
   // zones or by recent alerts.
-  for (const z of [...insideZones, ...crossedZones]) {
+  for (const z of insideZones) {
     if (wasInside.has(z.id)) continue;
     const riskLevel = z.is_no_go ? 'CRITICAL' : z.is_high_risk ? 'HIGH' : 'MEDIUM';
     const entry = await db.insertZoneEntry({
