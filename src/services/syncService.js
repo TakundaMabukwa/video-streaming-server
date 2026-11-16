@@ -497,23 +497,39 @@ async function applyVideoComboGate(records) {
 
   try {
     const alertCombos = require('./alertCombos');
+    const identityMod = require('../vehicles/identity');
     const combosActive = await alertCombos.listEnabledCombos(null).catch(() => []);
     if (combosActive.length === 0) return comboRaisedGroups;
 
-    const ccByDevice = new Map();
+    // Resolve each camera id to its fleet/CC once, and hand the fleet key to
+    // handleDetection so combo cards are canonical like every other write path.
+    // The raw camera id is kept as sourceDeviceId for provenance.
+    const infoByDevice = new Map();
     for (const r of records) {
       const did = String(r.deviceId || '');
-      if (!ccByDevice.has(did)) {
-        let ccId = null;
-        try {
-          const fleet = await resolveFleetNumber({ deviceId: did, vehicleRegistration: r.deviceName }).catch(() => null);
-          ccId = fleet ? await findVehicleCostCenterId(fleet).catch(() => null) : null;
-        } catch (_) { ccId = null; }
-        ccByDevice.set(did, ccId);
+      if (!did || infoByDevice.has(did)) continue;
+      let fleet = null;
+      let ccId = null;
+      try {
+        const identity = await identityMod.resolveVehicle({ deviceId: did, deviceName: r.deviceName });
+        fleet = identity?.fleetNumber || null;
+        ccId = identity?.costCenterId == null ? null : Number(identity.costCenterId);
+      } catch (_) { fleet = null; ccId = null; }
+      if (!fleet) {
+        try { fleet = await resolveFleetNumber({ deviceId: did, vehicleRegistration: r.deviceName }); } catch (_) {}
+        if (fleet && ccId == null) ccId = await findVehicleCostCenterId(fleet).catch(() => null);
       }
+      infoByDevice.set(did, { fleet, ccId });
+    }
+
+    for (const r of records) {
+      const did = String(r.deviceId || '');
+      const info = infoByDevice.get(did) || { fleet: null, ccId: null };
+      const deviceId = info.fleet || did;
       const comboResult = await alertCombos.handleDetection({
         alertId: r.id,
-        deviceId: did,
+        deviceId,
+        sourceDeviceId: did,
         deviceName: r.deviceName,
         alarmType: r.alarmType,
         alarmText: r.alarmText,
@@ -522,9 +538,9 @@ async function applyVideoComboGate(records) {
         lon: r.lon,
         speed: r.speed ?? null,
         severity: r.severity,
-        fleetNumber: did,
+        fleetNumber: info.fleet || null,
         sourceType: 'video',
-        costCenterId: ccByDevice.get(did),
+        costCenterId: info.ccId,
       });
       for (const g of comboResult.groupRows || []) comboRaisedGroups.push(g);
     }
