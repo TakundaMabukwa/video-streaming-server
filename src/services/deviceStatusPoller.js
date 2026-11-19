@@ -839,6 +839,32 @@ async function processZoneForDevice(deviceId, fleetNumber, licensePlate, lat, lo
     }
   }
 
+  // Refresh TTL for zones the vehicle is still inside, so "Active until exit"
+  // notifications do not expire while the vehicle remains in the zone. Only
+  // already-open entries are refreshed here; brand-new entries are handled by
+  // the emit below. No telematics_events / alert_groups rows are created.
+  for (const z of insideZones) {
+    if (!wasInside.has(z.id)) continue;
+    if (!(z.is_high_risk || z.is_no_go || z.is_no_stopping)) continue;
+    const zoneType = z.is_no_go ? 'no_go' : z.is_no_stopping ? 'no_stopping' : 'high_risk';
+    const zoneText = zoneType === 'no_go' ? 'No-Go Zone'
+      : zoneType === 'no_stopping' ? 'No Stopping Zone' : 'High Risk Area';
+    const severity = z.is_no_go ? 'critical' : z.is_no_stopping ? 'medium' : 'high';
+    zoneNotifications.upsert({
+      fleet_number: fleetNumber || deviceId,
+      device_id: deviceId,
+      plate: licensePlate || null,
+      kind: 'entering',
+      alert_type: `Entering ${zoneText}`,
+      zone_id: z.id,
+      zone_name: z.name,
+      severity,
+      lat: lat ?? null,
+      lon: lon ?? null,
+      speed: speed ?? null,
+    });
+  }
+
   // New entries → recorded for every watched zone. An entry is only ever
   // blocked by an entry that is still open for the SAME zone, never by other
   // zones or by recent alerts.
