@@ -849,7 +849,7 @@ async function processZoneForDevice(deviceId, fleetNumber, licensePlate, lat, lo
     const zoneType = z.is_no_go ? 'no_go' : z.is_no_stopping ? 'no_stopping' : 'high_risk';
     const zoneText = zoneType === 'no_go' ? 'No-Go Zone'
       : zoneType === 'no_stopping' ? 'No Stopping Zone' : 'High Risk Area';
-    const severity = z.is_no_go ? 'critical' : z.is_no_stopping ? 'medium' : 'high';
+    const severity = 'low';
     zoneNotifications.upsert({
       fleet_number: fleetNumber || deviceId,
       device_id: deviceId,
